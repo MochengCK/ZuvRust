@@ -1,0 +1,21 @@
+[package]
+name = "me-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZuvRust 通信层端点：zuvrust 可执行文件"
+
+[[bin]]
+name = "zuvrust"
+path = "src/main.rs"
+
+[dependencies]
+me-core = { workspace = true }
+me-container = { workspace = true }
+me-mux = { workspace = true }
+me-stream = { workspace = true }
+me-decode = { workspace = true }
+me-net = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }

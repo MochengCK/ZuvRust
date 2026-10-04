@@ -1,0 +1,231 @@
+name: CI
+
+# 触发：push 到 main、PR、手动。
+#
+# 这个工作流的**唯一目的**是"三个系统上都真的能编译、能跑测试"，并按平台产出
+# 可直接回填给宿主的二进制。为什么非要有它：
+#
+# 引擎此前只在 macOS x86_64 上开发过，于是大量 `#[cfg(target_arch = "x86_64")]`
+# 之外的代码路径**从来没被编译过** —— aarch64（Apple Silicon、Linux arm64）的
+# SIMD 桩漏了 7 个函数，整个 `me-decode` 编译不过，而本地（Intel Mac）永远发现不了。
+# 现在四个运行器各管一段，本地测不到的路径由它们兜住：
+#   · macos-latest  → Apple Silicon（aarch64）原生编译 + 跑测试
+#   · macos-13      → Intel Mac 原生（宿主桌面端的主力场景；Intel 上没有 AV1 硬解）
+#   · ubuntu-latest → Linux x86_64 原生
+#   · windows-latest→ Windows x86_64-msvc 原生（ring 需要 nasm，镜像里自带）
+# 另有 linux-arm64 一个**交叉构建**（x64 runner 跑不了 aarch64，所以那条只验证
+# "编得过、产物架构对"，不跑测试）。darwin-x86_64 交给 macos-13 原生构建 ——
+# 交叉编译只能证明"编得过"，证明不了"在 Intel Mac 上真跑得起来"。
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 测试：三个系统各跑一遍全量 `cargo test --workspace`。
+  # 测试自造数据（不依赖仓库外的样片），所以干净 clone 就能跑。
+  # ---------------------------------------------------------------------------
+  test:
+    name: Test ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            name: linux-x86_64
+          - os: windows-latest
+            name: windows-x86_64
+          - os: macos-latest
+            name: macos-arm64
+          # `macos-13` 是 Intel Mac。**必须有它**：`macos-latest` 是 Apple Silicon，
+          # 而宿主的桌面端在 Intel Mac 上是主力场景（AV1 硬解在那边不存在，
+          # VideoToolbox 的行为也不同）。只跑 arm64 的话，"Intel Mac 上能不能用"
+          # 就是未知数 —— 而这正是"确保三平台完美运行"里最容易漏的一格。
+          - os: macos-13
+            name: macos-x86_64
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # `cli_contract` 单独点出来跑一遍（`cargo test --workspace` 也会跑它），
+      # 原因是它**才是"三平台适配"这件事本身的门禁**：其余测试验的是业务逻辑，
+      # 只有它验的是"宿主与引擎之间的接口在**这个平台**上还成立" ——
+      # 退出码、日志是否上色、stderr 是否 UTF-8、路径能不能带空格与中文、
+      # 文件句柄有没有泄漏。逻辑测试在三个平台上都过、接口在某平台上悄悄坏掉的
+      # 情况，正是这批测试存在的理由。
+      - name: CLI 契约测试（宿主接口的门禁）
+        shell: bash
+        run: cargo test -p me-cli --test cli_contract -- --nocapture
+
+      - name: cargo test（全量：单元 + 集成）
+        shell: bash
+        run: cargo test --workspace
+
+      - name: 冒烟：产物能起来吗（`--version` 走的就是宿主的探测路径）
+        shell: bash
+        run: |
+          EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
+          cargo build --bin zuvrust
+          "target/debug/zuvrust$EXT" --version
+          "target/debug/zuvrust$EXT" version --json
+
+  # ---------------------------------------------------------------------------
+  # 构建：按平台产出 `zuvrust`。命名与宿主的回填目录一一对应：
+  #   darwin-x86_64  → extra/darwin/x64/engine/zuvrust
+  #   darwin-arm64   → extra/darwin/arm64/engine/zuvrust
+  #   linux-x86_64   → extra/linux/x64/engine/zuvrust
+  #   linux-arm64    → extra/linux/arm64/engine/zuvrust（musl 静态）
+  #   windows-x86_64 → extra/win32/x64/engine/zuvrust.exe
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build zuvrust-${{ matrix.artifact }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Intel 产物用 Intel 运行器原生构建：交叉编译只能证明"编得过"，
+          # 证明不了"在 Intel Mac 上跑得起来"（SIMD 桩、VideoToolbox 探测都不同）。
+          - os: macos-13
+            artifact: darwin-x86_64
+            target: ""
+          - os: macos-latest
+            artifact: darwin-arm64
+            target: ""
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+            target: ""
+          - os: ubuntu-latest
+            artifact: linux-arm64
+            target: aarch64-unknown-linux-musl
+          - os: windows-latest
+            artifact: windows-x86_64
+            target: ""
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.artifact }}
+
+      # 本机原生构建：macOS Intel(macos-13) / macOS arm64 / Linux x64 / Windows x64。
+      # 判据是"target 为空"= 用运行器自己的架构；唯一 target 非空的是 linux-arm64，
+      # 它走下面的 zigbuild 步骤。
+      - name: Build（本机目标：macOS Intel/arm64、Linux x64、Windows x64）
+        if: matrix.target == ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
+          cargo build --release --bin zuvrust
+          BIN="target/release/zuvrust$EXT"
+          file "$BIN"
+          "$BIN" --version
+          "$BIN" version --json
+
+      # linux-arm64：x64 runner 跑不了 aarch64，且 ring 需要交叉 C 工具链 →
+      # 用 cargo-zigbuild（zig 兼任 C 编译器与链接器）。只验证编得过与产物架构。
+      - name: "Cross build linux-arm64（musl 静态，x64 runner 无法冒烟运行）"
+        if: matrix.artifact == 'linux-arm64'
+        shell: bash
+        run: |
+          set -euo pipefail
+          VENV="$RUNNER_TEMP/zigbuild-venv"
+          python3 -m venv "$VENV"
+          "$VENV/bin/pip" install --quiet cargo-zigbuild
+          export PATH="$VENV/bin:$PATH"
+          cargo zigbuild --release --bin zuvrust --target "${{ matrix.target }}"
+          file "target/${{ matrix.target }}/release/zuvrust"
+
+      - name: Package
+        shell: bash
+        run: |
+          set -euo pipefail
+          EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
+          if [ -n "${{ matrix.target }}" ]; then
+            BIN="target/${{ matrix.target }}/release/zuvrust$EXT"
+          else
+            BIN="target/release/zuvrust$EXT"
+          fi
+          mkdir -p "pkg/zuvrust-${{ matrix.artifact }}"
+          cp "$BIN" "pkg/zuvrust-${{ matrix.artifact }}/zuvrust$EXT"
+          cp LICENSE README.md "pkg/zuvrust-${{ matrix.artifact }}/"
+          tar -C "pkg/zuvrust-${{ matrix.artifact }}" \
+            -czf "zuvrust-${{ matrix.artifact }}.tar.gz" "zuvrust$EXT" LICENSE README.md
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-${{ matrix.artifact }}
+          path: zuvrust-*.tar.gz
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 发布：按代码版本号管理草稿 Release（不自动发布）。
+  # 与 XferRust 的约定一致：产物与说明每次覆盖草稿，确认无误后再手动点 Publish。
+  # 说明暂用 GitHub 自动生成（引擎还没有 RELEASE_*.md 模板）。
+  # ---------------------------------------------------------------------------
+  release:
+    name: Release (草稿/不覆盖已发布)
+    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
+    needs: [test, build]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts/
+          merge-multiple: true
+
+      - name: Create or update release draft
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          VERSION="$(sed -n 's/^version = "\([0-9.]*\)"/\1/p' Cargo.toml | head -1)"
+          [ -n "$VERSION" ] || { echo "无法从 Cargo.toml 提取版本号"; exit 1; }
+          TAG="v${VERSION}"
+          echo "当前代码版本: ${TAG}"
+          ls -1 artifacts/*.tar.gz
+
+          IS_DRAFT="$(gh release view "$TAG" --json isDraft --jq .isDraft 2>/dev/null || true)"
+          if [ "$IS_DRAFT" = "false" ]; then
+            echo ">>> ${TAG} 已发布 → 不覆盖，跳过"
+            exit 0
+          fi
+
+          if [ "$IS_DRAFT" = "true" ]; then
+            echo ">>> 草稿 ${TAG} 已存在 → 覆盖产物"
+            gh release upload "$TAG" artifacts/*.tar.gz --clobber
+          else
+            echo ">>> 无 ${TAG} Release → 首次创建为草稿"
+            gh release create "$TAG" artifacts/*.tar.gz \
+              --title "v${VERSION}" --draft --generate-notes
+          fi

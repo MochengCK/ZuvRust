@@ -1,0 +1,10 @@
+[package]
+name = "me-decode"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZuvRust 解码层：把压缩采样解成帧（硬解优先，自研软解兜底）"
+
+[dependencies]
+me-core = { workspace = true }
+tracing = { workspace = true }

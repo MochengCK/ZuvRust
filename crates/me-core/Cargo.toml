@@ -1,0 +1,10 @@
+[package]
+name = "me-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZuvRust 基础类型：时间基、轨道、采样、字节读写"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }

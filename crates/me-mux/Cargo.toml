@@ -1,0 +1,11 @@
+[package]
+name = "me-mux"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "合并层：多轨交织与 MPEG-TS / fMP4 封装"
+
+[dependencies]
+me-core = { workspace = true }
+me-container = { workspace = true }
+serde = { workspace = true }

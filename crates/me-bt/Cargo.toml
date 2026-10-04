@@ -1,0 +1,14 @@
+[package]
+name = "me-bt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "BT 层：bencode / 元信息 / tracker / peer / 按播放位置优先的片选择"
+
+[dependencies]
+me-core = { workspace = true }
+sha1 = { workspace = true }
+getrandom = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,17 @@
+[package]
+name = "me-stream"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "流层：把来源（文件 / HTTP / HLS / DASH）的字节接进容器，提供边下边播的缓冲与寻址"
+
+[dependencies]
+serde_json = { workspace = true }
+# 只依赖这四层。刻意**不依赖 me-mux 与 me-bt**：
+# - me-mux 是"把多条流合并成一个文件"，那是写方向的事，播放路径用不到；
+# - me-bt 是预留层（按产品决定，BT 下载由独立下载引擎 XferRust 负责），
+#   依赖它会让"播放依赖下载实现"这个假耦合留在依赖图里。
+me-core = { workspace = true }
+me-container = { workspace = true }
+me-net = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,59 @@
+[workspace]
+resolver = "2"
+members = ["crates/*"]
+
+# ── release 优化档（2026-10-02 补）────────────────────────────────────────────
+#
+# 这里的每一项都是"不改一行逻辑就能拿到"的：默认档下 `codegen-units = 16`
+# 会把每个 crate 切成 16 个编译单元分开优化（跨单元**不内联**），而软解的热路径
+# 恰恰是"小函数套小函数"的形状（`sample_filter` → `read_window`/`narrow_filter`/
+# `wide_filter`；`restore_block` → `box_filter`）。关掉切分 + 开 LTO 之后这些
+# 内联与常量传播才跨得过去。
+#
+# `lto = "thin"` 而不是 `"fat"`：fat 的构建时间在这个工作区要多几分钟，
+# 而实测两者在本项目的差距 < 1%；thin 已经能跨 crate 内联。
+#
+# 特意**不**开 `panic = "abort"`：`main` 返回的 `ExitCode` 是对外契约的一部分
+# （宿主靠退出码区分"输入有问题"与"引擎自己坏了"），abort 会让所有 panic 退化成
+# 同一个信号，破坏这个契约。
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+debug = false
+panic = "unwind"
+
+# 测试也走优化：单测里有几处是"逐样本对拍"的长循环，debug 档慢到不想跑，
+# 于是容易被人绕过去 —— 优化档下与 release 同速，没有借口。
+[profile.test]
+opt-level = 1
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "ZuvRust —— 完全自研的 Rust 媒体引擎（不依赖任何老牌媒体引擎）"
+
+[workspace.dependencies]
+# 基础
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# 哈希与随机（BT 的 info_hash / peer_id 需要）
+sha1 = "0.10"
+getrandom = "0.3"
+# HTTP（只用来取 HLS 清单/分片；这是传输层，不是媒体引擎）
+ureq = { version = "3", default-features = false, features = ["rustls"] }
+# 日志
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 内部 crate
+me-core = { path = "crates/me-core" }
+me-container = { path = "crates/me-container" }
+me-mux = { path = "crates/me-mux" }
+me-net = { path = "crates/me-net" }
+me-bt = { path = "crates/me-bt" }
+me-stream = { path = "crates/me-stream" }
+me-decode = { path = "crates/me-decode" }
+me-cli = { path = "crates/me-cli" }

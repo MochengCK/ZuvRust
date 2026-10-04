@@ -1,0 +1,191 @@
+<!doctype html>
+<html>
+<head><meta charset="utf-8"><title>av1probe</title></head>
+<body>
+<pre id="out">running</pre>
+<script>
+const out = document.getElementById('out');
+const log = [];
+function say(s) { log.push(s); out.textContent = log.join('\n'); }
+
+function draw(g, w, h, kind) {
+  if (kind === 'solid') { g.fillStyle = '#808080'; g.fillRect(0, 0, w, h); return; }
+  if (kind === 'checker') {
+    for (let y = 0; y < h; y += 8) for (let x = 0; x < w; x += 8) {
+      g.fillStyle = (((x / 8) + (y / 8)) % 2) ? '#fff' : '#000';
+      g.fillRect(x, y, 8, 8);
+    }
+    return;
+  }
+  if (kind === 'gradient') {
+    const gr = g.createLinearGradient(0, 0, w, h);
+    gr.addColorStop(0, '#101018'); gr.addColorStop(0.5, '#9090a0'); gr.addColorStop(1, '#f0f0ff');
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    return;
+  }
+  if (kind === 'noise') {
+    const img = g.createImageData(w, h);
+    let s = 12345;
+    for (let i = 0; i < w * h; i++) {
+      s = (Math.imul(s, 1103515245) + 12345) & 0x7fffffff;
+      const v = s & 0xff;
+      img.data[i * 4] = v; img.data[i * 4 + 1] = (v * 3) & 0xff;
+      img.data[i * 4 + 2] = (v * 7) & 0xff; img.data[i * 4 + 3] = 255;
+    }
+    g.putImageData(img, 0, 0);
+    return;
+  }
+  if (kind.startsWith('flat')) {
+    g.fillStyle = kind.slice(4);
+    g.fillRect(0, 0, w, h);
+    return;
+  }
+  if (kind.startsWith('flat')) {
+    g.fillStyle = kind.slice(4);
+    g.fillRect(0, 0, w, h);
+    return;
+  }
+  if (kind === 'halves_h') {
+    g.fillStyle = '#101010'; g.fillRect(0, 0, w, h / 2);
+    g.fillStyle = '#f0f0f0'; g.fillRect(0, h / 2, w, h / 2);
+    return;
+  }
+  if (kind === 'halves_v') {
+    g.fillStyle = '#101010'; g.fillRect(0, 0, w / 2, h);
+    g.fillStyle = '#f0f0f0'; g.fillRect(w / 2, 0, w / 2, h);
+    return;
+  }
+  if (kind === 'quadrants') {
+    g.fillStyle = '#101010'; g.fillRect(0, 0, w / 2, h / 2);
+    g.fillStyle = '#a0a0a0'; g.fillRect(w / 2, 0, w / 2, h / 2);
+    g.fillStyle = '#404040'; g.fillRect(0, h / 2, w / 2, h / 2);
+    g.fillStyle = '#f0f0f0'; g.fillRect(w / 2, h / 2, w / 2, h / 2);
+    return;
+  }
+  if (kind.startsWith('checker')) {
+    const step = parseInt(kind.slice(7), 10);
+    for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) {
+      g.fillStyle = (((x / step) + (y / step)) % 2) ? '#f0f0f0' : '#101010';
+      g.fillRect(x, y, step, step);
+    }
+    return;
+  }
+  if (kind.startsWith('flat')) {
+    g.fillStyle = kind.slice(4);
+    g.fillRect(0, 0, w, h);
+    return;
+  }
+  if (kind.startsWith('flat')) {
+    g.fillStyle = kind.slice(4);
+    g.fillRect(0, 0, w, h);
+    return;
+  }
+  if (kind === 'halves_h') {
+    g.fillStyle = '#101010'; g.fillRect(0, 0, w, h / 2);
+    g.fillStyle = '#f0f0f0'; g.fillRect(0, h / 2, w, h / 2);
+    return;
+  }
+  if (kind === 'halves_v') {
+    g.fillStyle = '#101010'; g.fillRect(0, 0, w / 2, h);
+    g.fillStyle = '#f0f0f0'; g.fillRect(w / 2, 0, w / 2, h);
+    return;
+  }
+  if (kind === 'quadrants') {
+    g.fillStyle = '#101010'; g.fillRect(0, 0, w / 2, h / 2);
+    g.fillStyle = '#a0a0a0'; g.fillRect(w / 2, 0, w / 2, h / 2);
+    g.fillStyle = '#404040'; g.fillRect(0, h / 2, w / 2, h / 2);
+    g.fillStyle = '#f0f0f0'; g.fillRect(w / 2, h / 2, w / 2, h / 2);
+    return;
+  }
+  if (kind.startsWith('checker')) {
+    const step = parseInt(kind.slice(7), 10);
+    for (let y = 0; y < h; y += step) for (let x = 0; x < w; x += step) {
+      g.fillStyle = (((x / step) + (y / step)) % 2) ? '#f0f0f0' : '#101010';
+      g.fillRect(x, y, step, step);
+    }
+    return;
+  }
+  if (kind === 'mix') {
+    const gr = g.createLinearGradient(0, 0, w, 0);
+    gr.addColorStop(0, '#203040'); gr.addColorStop(1, '#d0c0a0');
+    g.fillStyle = gr; g.fillRect(0, 0, w, h);
+    let s = 987654321;
+    for (let b = 0; b < 24; b++) {
+      s = (Math.imul(s, 1103515245) + 12345) & 0x7fffffff;
+      const x = s % w, y = (s >> 8) % h, bw = 16 + ((s >> 16) % 64), bh = 16 + ((s >> 24) % 64);
+      g.fillStyle = 'rgb(' + (s & 0xff) + ',' + ((s >> 8) & 0xff) + ',' + ((s >> 16) & 0xff) + ')';
+      g.fillRect(x, y, bw, bh);
+    }
+    return;
+  }
+}
+
+async function post(name, bytes) {
+  const r = await fetch('/put/' + name, { method: 'POST', body: bytes });
+  if (!r.ok) throw new Error('post ' + name + ' -> ' + r.status);
+}
+
+async function encodeOne(level, w, h, kind) {
+  const cfg = { codec: 'av01.0.04M.08', width: w, height: h, bitrate: 2000000, framerate: 30 };
+  const sup = await VideoEncoder.isConfigSupported(cfg);
+  if (!sup.supported) { say('SKIP L' + level + ' ' + w + 'x' + h + ' unsupported'); return; }
+
+  const c = document.createElement('canvas');
+  c.width = w; c.height = h;
+  draw(c.getContext('2d'), w, h, kind);
+
+  const parts = [];
+  const enc = new VideoEncoder({
+    output: (chunk) => {
+      const buf = new Uint8Array(chunk.byteLength);
+      chunk.copyTo(buf);
+      parts.push({ type: chunk.type, ts: chunk.timestamp, data: buf });
+    },
+    error: (e) => say('ENC-ERR L' + level + ' ' + e.message),
+  });
+  enc.configure(cfg);
+  const frame = new VideoFrame(c, { timestamp: 0, duration: 33333 });
+  enc.encode(frame, { keyFrame: true });
+  frame.close();
+  await enc.flush();
+  enc.close();
+
+  let total = 0;
+  for (const p of parts) total += p.data.length;
+  const all = new Uint8Array(total);
+  let off = 0;
+  for (const p of parts) { all.set(p.data, off); off += p.data.length; }
+  const name = 'L' + level + '_' + w + 'x' + h + '_' + kind;
+  await post(name, all);
+  say('OK L' + level + ' ' + w + 'x' + h + ' ' + kind + ' chunks=' + parts.length + ' bytes=' + total
+      + ' type=' + parts[0].type);
+}
+
+(async () => {
+  const levels = [
+    [50, 32, 32, 'flat#808080'],
+    [51, 32, 32, 'flat#818181'],
+    [52, 32, 32, 'flat#828282'],
+    [53, 32, 32, 'flat#838383'],
+    [54, 32, 32, 'flat#848484'],
+    [55, 32, 32, 'flat#868686'],
+    [56, 32, 32, 'flat#888888'],
+    [57, 32, 32, 'flat#8c8c8c'],
+    [58, 32, 32, 'flat#909090'],
+    [59, 32, 32, 'flat#989898'],
+    [60, 32, 32, 'flat#a0a0a0'],
+    [61, 32, 32, 'flat#b0b0b0'],
+    [62, 32, 32, 'flat#c0c0c0'],
+    [63, 32, 32, 'flat#e0e0e0'],
+    [64, 32, 32, 'flat#101010'],
+    [65, 32, 32, 'flat#000000'],
+  ];
+  for (const [lv, w, h, k] of levels) {
+    try { await encodeOne(lv, w, h, k); } catch (e) { say('EXC L' + lv + ' ' + e.message); }
+  }
+  await post('done', new Uint8Array([1]));
+  say('DONE');
+})();
+</script>
+</body>
+</html>

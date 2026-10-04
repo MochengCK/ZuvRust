@@ -1,0 +1,12 @@
+[package]
+name = "me-net"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "多协议层：HLS / DASH 清单解析与分片取流"
+
+[dependencies]
+me-core = { workspace = true }
+ureq = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }

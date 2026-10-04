@@ -1,0 +1,16 @@
+# Rust
+/target/
+
+# 本地验证产物
+/tmp/
+*.ts
+*.mp4
+*.m4s
+*.m4a
+!crates/**/tests/fixtures/*
+
+# macOS
+.DS_Store
+
+# 构建产物回填目录（各宿主平台取这里的二进制，源码不入宿主仓库）
+/dist/

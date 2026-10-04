@@ -1,0 +1,10 @@
+[package]
+name = "me-container"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "容器层：MPEG-TS 与 fMP4 的探测与解封装"
+
+[dependencies]
+me-core = { workspace = true }
+serde = { workspace = true }
