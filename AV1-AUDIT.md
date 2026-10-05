@@ -13,7 +13,7 @@
 | **功能完整性** | ✅ 规范 §5 的每一层都有实现（OBU → 序列/颜色/定时 → 帧头与参数段 → 瓦片 → 熵层 → 分区树 → 块级语法 → 帧内/帧间预测 → 变换 → 三级环路滤波 → 颗粒 → 输出）。**没有 `todo!()` / `unimplemented!()`**                 |
 | **确定性**   | ✅ 四条路径**逐字节相同**：默认 / `ME_NO_SIMD` / row-mt 顺序 / row-mt 并行（20 帧 21 个 nv12 全 `cmp`）                                                                        |
 | **测试**    | ✅ workspace `897 passed / 0 failed`；`me-decode` lib **389 passed + 3 ignored**（其中 2 个是本轮新增的内核微基准）                                                        |
-| **三平台**   | ✅ `cargo check --release --target aarch64-apple-darwin -p me-decode` 通过（无缺桩）；CI 覆盖 ubuntu / windows / macos-arm64 / **macos-13(Intel)** + linux-arm64 交叉 |
+| **三平台**   | ✅ `cargo check --release --target aarch64-apple-darwin -p me-decode` 通过（无缺桩）；CI 覆盖 ubuntu / windows / macos-arm64 / **macos-26-intel** + linux-arm64 交叉 |
 | **性能**    | ❌ **未达标**。单线程 ≈ 50 ms/帧（≈20 fps），同窗口 dav1d 单线程 ≈ 15–17 ms ⇒ **约 3×**；目标 33 ms 还差 **1.5×**                                                                |
 
 **一句话**：正确性这一侧已经很硬（有外部参考物对拍），瓶颈**纯粹在性能**，而且瓶颈是**均匀分布在内核上**的（不是某个单点）。
