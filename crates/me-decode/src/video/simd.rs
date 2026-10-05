@@ -2684,6 +2684,13 @@ pub(crate) unsafe fn inv_txfm_rows(
 }
 
 /// 非 x86_64：见 [`inv_txfm_rows`]（`mc_horiz16_8bpc` 恒不调用，见 `avx2_available`）。
+///
+/// ⚠️ 这份桩的最后一个是 `&mut [i16]`，**与 x86 实现一致**。曾经在这里写成
+/// `&mut [i32]`（从 `mc_horiz8` 那类返回 `usize` 的内核抄来的形状），后果是：
+/// **Intel 机器上一切正常**（这份桩根本不参与编译），只有 arm64 的 CI 在编译
+/// 测试目标时才会报 `mismatched types`。桩的签名是"另一份实现的镜像"，
+/// **抄错一次就是一次只在别的架构上出现的编译失败** —— 见
+/// `tools/check_arch_stubs.py`（它会把这个漂移在 Intel 上就拦住）。
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn mc_horiz16_8bpc(
@@ -2691,7 +2698,7 @@ pub(crate) unsafe fn mc_horiz16_8bpc(
     _base: isize,
     _coef: &[i16; 8],
     _round: u32,
-    _out: &mut [i32],
+    _out: &mut [i16],
 ) {
 }
 #[cfg(not(target_arch = "x86_64"))]

@@ -21,16 +21,24 @@ use std::process::{Command, Stdio};
 
 use serde_json::Value;
 
-/// 二进制路径：`CARGO_BIN_EXE_<name>` 由 cargo 在编译集成测试时注入。
-const BIN: &str = env!("CARGO_BIN_EXE_zuvrust");
+/// 被测二进制。
+///
+/// 默认是 cargo 为本 crate 构建出来的那个（`CARGO_BIN_EXE_<name>`，编译期注入）；
+/// 设了 `ZUVRUST_BIN=<路径>` 就改测那一个 —— **这条是给"验收打包产物"用的**：
+/// "源码能过测试"与"发出去的那个二进制能用"是两件事，中间还夹着打包
+/// （选错文件、漏拷 LICENSE、架构不对、tar 坏掉）。CI 里有一步专门下载打包好的
+/// 产物、把路径从这里塞进来，再把这套用例原样跑一遍。
+fn bin_path() -> String {
+    std::env::var("ZUVRUST_BIN").unwrap_or_else(|_| env!("CARGO_BIN_EXE_zuvrust").to_string())
+}
 
 /// 跑一次引擎，返回 (退出码, stdout, stderr)。
 fn run(args: &[&str]) -> (i32, String, String) {
-    let out = Command::new(BIN)
+    let out = Command::new(bin_path())
         .args(args)
         .stdin(Stdio::null())
         .output()
-        .unwrap_or_else(|e| panic!("无法启动 {} {}：{e}", BIN, args.join(" ")));
+        .unwrap_or_else(|e| panic!("无法启动 {} {}：{e}", bin_path(), args.join(" ")));
     (
         out.status.code().expect("进程被信号杀死（契约测试不覆盖这种情况）"),
         String::from_utf8_lossy(&out.stdout).into_owned(),
@@ -41,13 +49,13 @@ fn run(args: &[&str]) -> (i32, String, String) {
 /// 跑一次引擎并**丢弃 stdout**：只关心 stderr 的场合用（`stream` 会往 stdout
 /// 灌一大段 fMP4 字节，测试里没人要它，收进内存只是浪费）。
 fn run_quiet(args: &[&str]) -> (i32, String) {
-    let mut child = Command::new(BIN)
+    let mut child = Command::new(bin_path())
         .args(args)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped())
         .spawn()
-        .unwrap_or_else(|e| panic!("无法启动 {} {}：{e}", BIN, args.join(" ")));
+        .unwrap_or_else(|e| panic!("无法启动 {} {}：{e}", bin_path(), args.join(" ")));
     let mut err = String::new();
     use std::io::Read as _;
     child
@@ -606,7 +614,8 @@ fn ci_artifact_names_match_the_host_layout() {
 /// 程序名与宿主寻找的文件名一致。
 #[test]
 fn binary_name_is_what_the_host_looks_for() {
-    let stem = Path::new(BIN)
+    let p = bin_path();
+    let stem = Path::new(&p)
         .file_stem()
         .and_then(|s| s.to_str())
         .expect("路径不是合法 UTF-8");

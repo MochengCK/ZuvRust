@@ -2,20 +2,21 @@ name: CI
 
 # 触发：push 到 main、PR、手动。
 #
-# 这个工作流的**唯一目的**是"三个系统上都真的能编译、能跑测试"，并按平台产出
-# 可直接回填给宿主的二进制。为什么非要有它：
+# ## 这个工作流要保证的一件事
 #
-# 引擎此前只在 macOS x86_64 上开发过，于是大量 `#[cfg(target_arch = "x86_64")]`
-# 之外的代码路径**从来没被编译过** —— aarch64（Apple Silicon、Linux arm64）的
-# SIMD 桩漏了 7 个函数，整个 `me-decode` 编译不过，而本地（Intel Mac）永远发现不了。
-# 现在四个运行器各管一段，本地测不到的路径由它们兜住：
-#   · macos-latest  → Apple Silicon（aarch64）原生编译 + 跑测试
-#   · macos-13      → Intel Mac 原生（宿主桌面端的主力场景；Intel 上没有 AV1 硬解）
-#   · ubuntu-latest → Linux x86_64 原生
-#   · windows-latest→ Windows x86_64-msvc 原生（ring 需要 nasm，镜像里自带）
-# 另有 linux-arm64 一个**交叉构建**（x64 runner 跑不了 aarch64，所以那条只验证
-# "编得过、产物架构对"，不跑测试）。darwin-x86_64 交给 macos-13 原生构建 ——
-# 交叉编译只能证明"编得过"，证明不了"在 Intel Mac 上真跑得起来"。
+# 「**不产出跑不起来或有功能缺陷的产物**」。光"编译通过"是不够的 —— 编译通过只说明
+# 代码能生成二进制，说明不了它能用，更说明不了它在**别的架构**上能用。引擎里大量
+# `#[cfg(target_arch = "x86_64")]` 的 SIMD 实现配上非 x86 的桩，桩不参与 x86 构建，
+# 于是「Intel 上一切正常、arm64 上编译不过」这种事会反复发生（已经发生过两次）。
+#
+# 所以流程是三层，逐层收紧（与 XferRust 的流程一致）：
+#
+#   build   每个平台**原生**跑全量测试 → 通过才构建 → 冒烟 → 打包 → 上传
+#   verify  下载**打包好的产物**，用产物本身再跑一遍验收（架构 / 契约 / 端到端）
+#   release 只有上面全部绿了才动 Release（草稿）
+#
+# 为什么 `verify` 不能省：`build` 验的是"这棵树"，`verify` 验的是"这个二进制"。
+# 中间隔着打包这一步（选错文件、漏拷、架构不对、tar 坏掉），而后者才是要发出去的东西。
 on:
   push:
     branches: [main]
@@ -29,95 +30,52 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
 
 jobs:
   # ---------------------------------------------------------------------------
-  # 测试：三个系统各跑一遍全量 `cargo test --workspace`。
-  # 测试自造数据（不依赖仓库外的样片），所以干净 clone 就能跑。
-  # ---------------------------------------------------------------------------
-  test:
-    name: Test ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: ubuntu-latest
-            name: linux-x86_64
-          - os: windows-latest
-            name: windows-x86_64
-          - os: macos-latest
-            name: macos-arm64
-          # `macos-13` 是 Intel Mac。**必须有它**：`macos-latest` 是 Apple Silicon，
-          # 而宿主的桌面端在 Intel Mac 上是主力场景（AV1 硬解在那边不存在，
-          # VideoToolbox 的行为也不同）。只跑 arm64 的话，"Intel Mac 上能不能用"
-          # 就是未知数 —— 而这正是"确保三平台完美运行"里最容易漏的一格。
-          - os: macos-13
-            name: macos-x86_64
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - uses: Swatinem/rust-cache@v2
-
-      # `cli_contract` 单独点出来跑一遍（`cargo test --workspace` 也会跑它），
-      # 原因是它**才是"三平台适配"这件事本身的门禁**：其余测试验的是业务逻辑，
-      # 只有它验的是"宿主与引擎之间的接口在**这个平台**上还成立" ——
-      # 退出码、日志是否上色、stderr 是否 UTF-8、路径能不能带空格与中文、
-      # 文件句柄有没有泄漏。逻辑测试在三个平台上都过、接口在某平台上悄悄坏掉的
-      # 情况，正是这批测试存在的理由。
-      - name: CLI 契约测试（宿主接口的门禁）
-        shell: bash
-        run: cargo test -p me-cli --test cli_contract -- --nocapture
-
-      - name: cargo test（全量：单元 + 集成）
-        shell: bash
-        run: cargo test --workspace
-
-      - name: 冒烟：产物能起来吗（`--version` 走的就是宿主的探测路径）
-        shell: bash
-        run: |
-          EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
-          cargo build --bin zuvrust
-          "target/debug/zuvrust$EXT" --version
-          "target/debug/zuvrust$EXT" version --json
-
-  # ---------------------------------------------------------------------------
-  # 构建：按平台产出 `zuvrust`。命名与宿主的回填目录一一对应：
-  #   darwin-x86_64  → extra/darwin/x64/engine/zuvrust
-  #   darwin-arm64   → extra/darwin/arm64/engine/zuvrust
-  #   linux-x86_64   → extra/linux/x64/engine/zuvrust
-  #   linux-arm64    → extra/linux/arm64/engine/zuvrust（musl 静态）
-  #   windows-x86_64 → extra/win32/x64/engine/zuvrust.exe
+  # 构建 + 测试 + 打包。测试**在同一个任务里、构建之前**跑：
+  # 这样任何一个平台的测试不过，那个平台就不会有产物产出。
+  #
+  # 四个运行器各管一段架构，本地（单机）测不到的路径由它们兜住：
+  #   · macos-13      → Intel Mac 原生（调用方桌面端的主力场景；Intel 上没有 AV1 硬解）
+  #   · macos-latest  → Apple Silicon 原生
+  #   · ubuntu-latest → Linux x86_64 原生
+  #   · windows-latest→ Windows x86_64-msvc 原生（ring 需要 nasm，镜像里自带）
+  # 另加 linux-arm64 交叉构建（x64 runner 跑不了 aarch64，只验证编得过与产物架构）。
   # ---------------------------------------------------------------------------
   build:
     name: Build zuvrust-${{ matrix.artifact }}
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 40
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
         include:
-          # Intel 产物用 Intel 运行器原生构建：交叉编译只能证明"编得过"，
-          # 证明不了"在 Intel Mac 上跑得起来"（SIMD 桩、VideoToolbox 探测都不同）。
+          # Intel 产物用 Intel 运行器**原生**构建 + 原生测试：交叉编译只能证明
+          # "编得过"，证明不了"在这台机器上跑得起来"（SIMD 桩、VideoToolbox 探测都不同）。
           - os: macos-13
             artifact: darwin-x86_64
             target: ""
+            runnable: true
           - os: macos-latest
             artifact: darwin-arm64
             target: ""
+            runnable: true
           - os: ubuntu-latest
             artifact: linux-x86_64
             target: ""
-          - os: ubuntu-latest
-            artifact: linux-arm64
-            target: aarch64-unknown-linux-musl
+            runnable: true
           - os: windows-latest
             artifact: windows-x86_64
             target: ""
+            runnable: true
+          # linux-arm64：x64 runner 跑不了 aarch64，且 ring 需要交叉 C 工具链 ⇒
+          # 用 cargo-zigbuild（zig 兼任 C 编译器与链接器）。只验证编得过与产物架构。
+          - os: ubuntu-latest
+            artifact: linux-arm64
+            target: aarch64-unknown-linux-musl
+            runnable: false
     steps:
       - uses: actions/checkout@v5
 
@@ -130,9 +88,39 @@ jobs:
         with:
           key: ${{ matrix.artifact }}
 
-      # 本机原生构建：macOS Intel(macos-13) / macOS arm64 / Linux x64 / Windows x64。
-      # 判据是"target 为空"= 用运行器自己的架构；唯一 target 非空的是 linux-arm64，
-      # 它走下面的 zigbuild 步骤。
+      # 顺手把仓库里的 shell 脚本查一遍（语法 + 一个真实踩过的坑：
+      # `$VAR` 紧跟中文标点时 bash 会把标点算进变量名）。只在一个条目上跑。
+      - name: 脚本静态检查
+        if: matrix.artifact == 'linux-x86_64'
+        shell: bash
+        run: ./scripts/lint-shell.sh
+
+      # ── 测试（构建之前）───────────────────────────────────────────────────
+      # 契约测试先单独点一次名，因为**它才是"多平台适配"这件事本身的门禁** ——
+      # 其余测试验业务逻辑，只有它验"调用方与引擎之间的接口在这个平台上还成立"
+      # （退出码、日志是否上色、stderr 编码、路径含空格与中文、文件句柄）。
+      # 先跑它是因为它快（秒级），失败时能立刻定位到接口层而不是业务层。
+      - name: 契约测试（调用方接口的门禁）
+        if: matrix.runnable
+        shell: bash
+        run: cargo test -p me-cli --test cli_contract
+
+      - name: 全量测试（单元 + 集成）
+        if: matrix.runnable
+        shell: bash
+        run: cargo test --workspace
+
+      # 交叉到 aarch64-linux 再编一遍核心层，补上**原生运行器覆盖不到的那一格**：
+      # 四个原生运行器已覆盖 x86_64/arm64 的 macOS、x86_64 的 Linux 与 Windows，
+      # 唯一没被原生验证的就是 aarch64-linux。`--all-targets` 不能省 ——
+      # 漏掉它就编译不到 `#[cfg(test)]` 里的调用点，而上次的真实故障
+      # （桩签名抄错）恰好只在测试代码里暴露。
+      - name: 交叉编译检查（aarch64-linux 核心层，含测试目标）
+        if: matrix.artifact == 'linux-arm64'
+        shell: bash
+        run: ./scripts/check-arches.sh aarch64-unknown-linux-musl
+
+      # ── 构建 ──────────────────────────────────────────────────────────────
       - name: Build（本机目标：macOS Intel/arm64、Linux x64、Windows x64）
         if: matrix.target == ''
         shell: bash
@@ -142,12 +130,9 @@ jobs:
           cargo build --release --bin zuvrust
           BIN="target/release/zuvrust$EXT"
           file "$BIN"
-          "$BIN" --version
           "$BIN" version --json
 
-      # linux-arm64：x64 runner 跑不了 aarch64，且 ring 需要交叉 C 工具链 →
-      # 用 cargo-zigbuild（zig 兼任 C 编译器与链接器）。只验证编得过与产物架构。
-      - name: "Cross build linux-arm64（musl 静态，x64 runner 无法冒烟运行）"
+      - name: Cross build linux-arm64（musl 静态，x64 runner 无法运行）
         if: matrix.artifact == 'linux-arm64'
         shell: bash
         run: |
@@ -159,6 +144,7 @@ jobs:
           cargo zigbuild --release --bin zuvrust --target "${{ matrix.target }}"
           file "target/${{ matrix.target }}/release/zuvrust"
 
+      # ── 打包 ──────────────────────────────────────────────────────────────
       - name: Package
         shell: bash
         run: |
@@ -183,14 +169,83 @@ jobs:
           if-no-files-found: error
 
   # ---------------------------------------------------------------------------
-  # 发布：按代码版本号管理草稿 Release（不自动发布）。
-  # 与 XferRust 的约定一致：产物与说明每次覆盖草稿，确认无误后再手动点 Publish。
-  # 说明暂用 GitHub 自动生成（引擎还没有 RELEASE_*.md 模板）。
+  # 产物验收：**下载打包好的产物**，用这个二进制本身再跑一遍。
+  #
+  # 与 build 的分工：build 证明"这棵树在这个平台上是对的"，这里证明
+  # "**这个要发出去的二进制**是对的"。两者之间夹着打包，会出的事包括：
+  # 打错文件、漏拷、tar 损坏、产物架构与标注不符、下载后带上 quarantine 标记。
+  #
+  # 只在**能原生运行该架构**的平台跑（linux-arm64 交叉产物跳过 —— x64 runner
+  # 跑不了 aarch64，硬跑只能得到"Exec format error"这种没有信息量的失败）。
+  # ---------------------------------------------------------------------------
+  verify:
+    name: Verify zuvrust-${{ matrix.artifact }}
+    needs: build
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13
+            artifact: darwin-x86_64
+            expect_arch: "Mach-O 64-bit executable x86_64"
+            bin: zuvrust
+          - os: macos-latest
+            artifact: darwin-arm64
+            expect_arch: "Mach-O 64-bit executable arm64"
+            bin: zuvrust
+          - os: ubuntu-latest
+            artifact: linux-x86_64
+            expect_arch: "ELF 64-bit LSB pie executable, x86-64"
+            bin: zuvrust
+          - os: windows-latest
+            artifact: windows-x86_64
+            expect_arch: "PE32+ executable"
+            bin: zuvrust.exe
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: verify-${{ matrix.artifact }}
+
+      - name: Download artifact
+        uses: actions/download-artifact@v5
+        with:
+          name: build-${{ matrix.artifact }}
+          path: pkg/
+
+      # 解包 → 架构核对 → 包内容齐全 → 能起来 → **用产物本身跑契约测试**。
+      # 逻辑放在 scripts/verify-artifact.sh 里，本地可以用同一条命令复现
+      # （CI 里内联一坨 shell 的坏处是：只有推上去才知道写得对不对）。
+      - name: 产物验收
+        shell: bash
+        run: |
+          ./scripts/verify-artifact.sh \
+            "pkg/zuvrust-${{ matrix.artifact }}.tar.gz" \
+            "${{ matrix.bin }}" \
+            "${{ matrix.expect_arch }}"
+
+      - name: Upload 失败日志
+        if: failure()
+        uses: actions/upload-artifact@v5
+        with:
+          name: verify-logs-${{ matrix.artifact }}
+          path: pkg/
+          if-no-files-found: ignore
+
+  # ---------------------------------------------------------------------------
+  # 发布：构建 + 产物验收全绿后，按代码版本号管理草稿 Release（不自动发布）。
+  # 与 XferRust 的约定一致：产物每次覆盖草稿，确认无误后再手动点 Publish。
   # ---------------------------------------------------------------------------
   release:
     name: Release (草稿/不覆盖已发布)
     if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    needs: [test, build]
+    needs: [build, verify]
     runs-on: ubuntu-latest
     permissions:
       contents: write
