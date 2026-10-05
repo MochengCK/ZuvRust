@@ -88,6 +88,39 @@ fn pick_track(info: &MediaInfo, kind: MediaKind) -> Option<&Track> {
     info.tracks.iter().find(|t| t.kind == kind)
 }
 
+/// 打开一个输入、读**目标轨**的第一帧，从 AC-3 的 syncframe 头里拼出 `dac3` 载荷。
+///
+/// 只有 AC-3 需要走这条路（别的编码的配置都在容器里）。读不出来就让调用**失败**：
+/// 写一个字段全 0 的 `dac3` 出去，播放器会按错误的声道布局去解，症状是
+/// "文件能生成但声音不对"，比直接报错难查得多。
+///
+/// ⚠️ **必须按轨道号过滤**：解封装器吐出的第一条采样是**按解码时间交织**的，
+/// 大多时候是画面那条轨 —— 不看 `track_id` 就会拿一帧视频去解 AC-3 同步字，
+/// 报出"第一帧不是 AC-3"这种指向完全错误的结论。
+fn read_dac3_from_first_frame(
+    src: Arc<dyn ReadAt>,
+    name: &str,
+    want_track: u32,
+) -> Result<Vec<u8>> {
+    let mut d = me_container::demux::open(src, name)?;
+    // 上限只是防御性的：正常文件里音频第一帧就在最前面几十条内
+    for _ in 0..1000 {
+        let Some(p) = d.next_packet()? else { break };
+        if p.track_id != want_track {
+            continue;
+        }
+        let dac3 = me_container::parse_dac3(&p.data).ok_or_else(|| {
+            MediaError::Bitstream(format!(
+                "{name} 轨 {want_track} 的第一帧不是 AC-3 syncframe（同步字不是 0x0B77），取不出 dac3"
+            ))
+        })?;
+        return Ok(dac3.to_payload().to_vec());
+    }
+    Err(MediaError::Container(format!(
+        "{name} 里读不到轨 {want_track} 的采样，取不出 AC-3 的 dac3"
+    )))
+}
+
 /// 某一段里、某个输入要搬运的轨道：`源轨 id → 输出轨 id`。
 struct SegInput {
     input_index: usize,
@@ -160,6 +193,32 @@ fn run(
             out_tracks.push(ot);
         }
     }
+    // ── 2.5 AC-3 的 `dac3` 补齐 ──
+    //
+    // TS 与裸流里的 AC-3 **没有配置盒**（采样率码、码率码、声道配置全都写在每个
+    // syncframe 的头里），而 fMP4 产物必须有 `dac3`。所以只能在这里从**码流第一帧**
+    // 读出来 —— 而且必须在 `Muxer::with_writer` 之前做：moov 里的 `stsd` 是最终
+    // 产物的一部分，写完就定型了，之后再补也进不去。
+    if matches!(container, OutputContainer::Fmp4) {
+        if let (Some(&ai), Some(aid)) = (audio_inputs.first(), audio_out) {
+            let needs_fill = out_tracks
+                .iter()
+                .any(|t| t.id == aid && t.codec == CodecId::Ac3 && t.extradata.is_empty());
+            if needs_fill {
+                let (name, src, info) = &inputs[ai];
+                let src_track = pick_track(info, MediaKind::Audio)
+                    .map(|t| t.id)
+                    .ok_or_else(|| {
+                        MediaError::Container(format!("{name} 里没有音频轨，取不出 AC-3 的 dac3"))
+                    })?;
+                let dac3 = read_dac3_from_first_frame(src.clone(), name, src_track)?;
+                if let Some(t) = out_tracks.iter_mut().find(|t| t.id == aid) {
+                    t.extradata = dac3;
+                }
+            }
+        }
+    }
+
     check_codec_support(container, &out_tracks)?;
 
     // 输出轨的时基（平移时要用）
@@ -408,14 +467,19 @@ fn check_codec_support(container: OutputContainer, tracks: &[Track]) -> Result<(
                 ),
                 _ => false,
             },
-            // fMP4：有对应配置盒的都能装（avcC / hvcC / av1C / vpcC / esds / dfLa / dOps）
+            // fMP4：有对应配置盒的都能装
+            // （avcC / hvcC / av1C / vpcC / esds / dfLa / dOps / dac3）
             OutputContainer::Fmp4 => match t.kind {
                 MediaKind::Video => {
                     matches!(t.codec, CodecId::H264 | CodecId::H265 | CodecId::Av1 | CodecId::Vp9)
                 }
-                MediaKind::Audio => {
-                    matches!(t.codec, CodecId::Aac | CodecId::Flac | CodecId::Opus)
-                }
+                // MP3 与 AAC 共用 `mp4a` 采样条目（靠 esds 的 OTI 区分），
+                // AC-3 用 `ac-3` + `dac3`。读侧（me-container/src/mp4.rs）本来就在认这三种，
+                // 写侧补齐后"能读出来的也能写回去"。
+                MediaKind::Audio => matches!(
+                    t.codec,
+                    CodecId::Aac | CodecId::Mp3 | CodecId::Flac | CodecId::Opus | CodecId::Ac3
+                ),
                 _ => false,
             },
         };

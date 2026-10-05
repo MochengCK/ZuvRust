@@ -357,8 +357,21 @@ cargo test --workspace > /tmp/me.log 2>&1; echo "exit=$?"; grep -E "test result|
   就检查并拒绝），不静默产出坏文件。
 - `remux` 需要目标容器支持该编解码器：TS 里 AAC 要带 ADTS、fMP4 里是裸帧，
   这个转换由 muxer 负责（已实现，TS→fMP4→TS 往返有测试）。
-- fMP4 封装支持 **H.264 / H.265 / AV1 / VP9 + AAC / FLAC / Opus**（各自有 `avcC` / `hvcC` /
-  `av1C` / `vpcC` / `esds` / `dfLa` / `dOps` 配置盒，见 `me-mux/src/mp4.rs` 的 `write_stsd`）。
+- fMP4 封装支持 **H.264 / H.265 / AV1 / VP9 + AAC / MP3 / FLAC / Opus / AC-3**
+  （各自有 `avcC` / `hvcC` / `av1C` / `vpcC` / `esds` / `dfLa` / `dOps` / `dac3` 配置盒，
+  见 `me-mux/src/mp4.rs` 的 `write_stsd`）。
+  - **MP3 与 AAC 共用 `mp4a` 采样条目**，靠 `esds` 里的 `objectTypeIndication` 区分
+    （0x40 = MPEG-4 Audio、0x6B = MPEG-1 Audio）。MP3 **没有解码配置**
+    （采样率/声道都在每帧的帧头里），所以它的 `extradata` 为空是**正常**的，
+    esds 里也不带 DecoderSpecificInfo。读侧本来就按 OTI 把 `mp4a` 分成
+    AAC / MP3 / AC-3，写侧补齐后两边才对称。
+  - **AC-3 的配置盒 `dac3` 在 TS 与裸流里不存在**（采样率码、码率码、声道配置
+    都写在每个 syncframe 的头里），而 fMP4 产物必须有它。`mux` 层在
+    `Muxer::with_writer` **之前**（即写 moov 之前）从目标轨的第一帧读出来补进
+    extradata，解析在 `me-container/src/ac3.rs`。
+    ⚠️ **读那一帧必须按轨道号过滤**：解封装器吐出的第一条采样是按解码时间交织的，
+    大多是**画面**那一条 —— 不加过滤就会拿视频帧去解 AC-3 同步字，报出
+    "第一帧不是 AC-3"这种指向完全错误的结论（2026-10-05 实际踩到）。
   - **AV1 与 VP9 的采样不做任何转换**（原样搬）：AV1 本来就是 OBU 流（每个 OBU 自带
     leb128 长度），VP9 的压缩帧也没有起始码/长度前缀可言 —— 走 H.264/H.265 那条
     "Annex-B → 长度前缀"的路会以"找不到起始码"报错。

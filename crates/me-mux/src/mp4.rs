@@ -759,7 +759,8 @@ fn write_visual_entry(w: &mut ByteWriter, t: &EsTrack) -> Result<()> {
     Ok(())
 }
 
-/// 音频采样条目：AAC（`mp4a` + `esds`）、FLAC（`fLaC` + `dfLa`）与 Opus（`Opus` + `dOps`）。
+/// 音频采样条目：AAC / MP3（`mp4a` + `esds`）、FLAC（`fLaC` + `dfLa`）、
+/// Opus（`Opus` + `dOps`）与 AC-3（`ac-3` + `dac3`）。
 ///
 /// 为什么 FLAC 也得支持：B 站的"Hi-Res 无损音质"就是 FLAC 装在 fMP4 里。
 /// 它与 AAC 的差别**只在配置盒** —— 采样数据都是"裸帧"，合并时原样搬、不重编码。
@@ -769,24 +770,37 @@ fn write_visual_entry(w: &mut ByteWriter, t: &EsTrack) -> Result<()> {
 ///   不是 48000 时 `duration` 会被按别的单位解释，时间轴整体漂；
 /// - **配置盒是 `dOps` 而不是 `OpusHead`**：两者只差魔数与字节序，转换在
 ///   [`me_container::opus_config`]（引擎内部统一用 `OpusHead` 形态）。
+///
+/// **MP3 与 AAC 共用 `mp4a` 采样条目**，靠 `esds` 里的 objectTypeIndication 区分
+/// （0x40 = MPEG-4 Audio、0x6B = MPEG-1 Audio）。MP3 **没有解码配置**
+/// （参数都在每帧的帧头里），所以它的 esds 里不带 DecoderSpecificInfo ——
+/// 这也是它与 AAC 在写侧唯一的实质差别。读侧（`me-container/src/mp4.rs`）本来
+/// 就按 OTI 把 `mp4a` 分成 AAC/MP3/AC-3，写侧补齐后两边才对称。
+///
+/// **AC-3 的配置盒是 `dac3`**：TS 与裸流里没有它，参数只能从 syncframe 头里读
+/// （见 [`me_container::ac3`]）；`mux` 层在写 moov 之前会把缺的补进 extradata。
 fn write_audio_entry(w: &mut ByteWriter, t: &EsTrack) -> Result<()> {
     let entry_kind: &[u8; 4] = match &t.track.codec {
-        CodecId::Aac => b"mp4a",
+        CodecId::Aac | CodecId::Mp3 => b"mp4a",
         CodecId::Flac => b"fLaC",
         CodecId::Opus => b"Opus",
+        CodecId::Ac3 => b"ac-3",
         other => {
             return Err(MediaError::Unsupported(format!(
-                "{} 暂时不能写进 fMP4 的音频轨（目前支持 AAC / FLAC / Opus）",
+                "{} 暂时不能写进 fMP4 的音频轨（目前支持 AAC / MP3 / FLAC / Opus / AC-3）",
                 other.name()
             )))
         }
     };
-    if t.track.extradata.is_empty() {
+    // MP3 没有解码配置：它的采样率/声道都在每一帧的帧头里，extradata 为空是**正常**的
+    let needs_config = !matches!(t.track.codec, CodecId::Mp3);
+    if needs_config && t.track.extradata.is_empty() {
         // 说清缺的是哪样东西：AAC 缺的是 AudioSpecificConfig、FLAC 缺的是 STREAMINFO
         let what = match &t.track.codec {
             CodecId::Aac => "AudioSpecificConfig",
             CodecId::Flac => "STREAMINFO（dfLa）",
             CodecId::Opus => "OpusHead（dOps 的来源）",
+            CodecId::Ac3 => "dac3（应当由 mux 层从第一帧的 syncframe 里补出来）",
             _ => "解码配置",
         };
         return Err(MediaError::Bitstream(format!(
@@ -836,7 +850,10 @@ fn write_audio_entry(w: &mut ByteWriter, t: &EsTrack) -> Result<()> {
     w.u32_be(if rate > 0xFFFF { 0 } else { rate << 16 });
 
     match &t.track.codec {
-        CodecId::Aac => write_esds(w, &t.track.extradata)?,
+        // 同为 `mp4a`，靠 objectTypeIndication 区分：0x40 = MPEG-4 Audio、
+        // 0x6B = MPEG-1 Audio（MP3）。MP3 不带 DecoderSpecificInfo。
+        CodecId::Aac => write_esds(w, &t.track.extradata, 0x40)?,
+        CodecId::Mp3 => write_esds(w, &[], 0x6B)?,
         CodecId::Flac => {
             // `dfLa` 是 FullBox，而解封装交给我们的 extradata **已经是它的载荷**
             // （含 version + flags）—— 所以这里用普通 `box_open`，不能再套一层 FullBox 头，
@@ -855,26 +872,47 @@ fn write_audio_entry(w: &mut ByteWriter, t: &EsTrack) -> Result<()> {
             w.bytes(&cfg.to_dops());
             box_close(w, at);
         }
+        CodecId::Ac3 => {
+            // `dac3` 是定长 3 字节：长度不对说明 mux 层补进来的不是 dac3 载荷，
+            // 直接拒绝 —— 写一个字段错位的配置盒出去，症状是"能生成但解不了"。
+            if t.track.extradata.len() != 3 {
+                return Err(MediaError::Bitstream(format!(
+                    "AC-3 轨 {} 的 dac3 载荷应当是 3 字节，实际 {}",
+                    t.track.id,
+                    t.track.extradata.len()
+                )));
+            }
+            let at = box_open(w, b"dac3");
+            w.bytes(&t.track.extradata);
+            box_close(w, at);
+        }
         _ => unreachable!("上面已经拦过不支持的编码"),
     }
     box_close(w, entry_at);
     Ok(())
 }
 
-/// `esds`：把 AudioSpecificConfig 放进 DecoderSpecificInfo。
-fn write_esds(w: &mut ByteWriter, asc: &[u8]) -> Result<()> {
+/// `esds`：把解码配置放进 DecoderSpecificInfo。
+///
+/// `object_type` 是 `objectTypeIndication`：0x40 = MPEG-4 Audio（AAC）、
+/// 0x6B = MPEG-1 Audio（MP3）。MP3 的参数都在帧头里，`config` 传空时
+/// **整个 DecoderSpecificInfo 都不写**（写一个长度 0 的 DSI 虽然合法，
+/// 但会让一部分老播放器在解析描述符链时提前收尾）。
+fn write_esds(w: &mut ByteWriter, asc: &[u8], object_type: u8) -> Result<()> {
     let esds_at = full_box_open(w, b"esds", 0, 0);
     // 描述符长度是**变长编码**（1~4 字节，最高位表示续接），所以先把内层拼进
     // Vec 里、拿到长度再写外层 —— 写死一字节在描述符稍大时就溢出
     let mut dsi = Vec::new();
-    dsi.push(0x05); // DecoderSpecificInfo
-    write_desc_len(&mut dsi, asc.len());
-    dsi.extend_from_slice(asc);
+    if !asc.is_empty() {
+        dsi.push(0x05); // DecoderSpecificInfo
+        write_desc_len(&mut dsi, asc.len());
+        dsi.extend_from_slice(asc);
+    }
 
     let mut dc = Vec::new();
     dc.push(0x04); // DecoderConfigDescriptor
     write_desc_len(&mut dc, 13 + dsi.len());
-    dc.push(0x40); // objectTypeIndication = MPEG-4 Audio
+    dc.push(object_type); // objectTypeIndication
     dc.push(0x15); // streamType = audio
     dc.extend_from_slice(&[0, 0, 0]); // bufferSizeDB
     dc.extend_from_slice(&0u32.to_be_bytes()); // maxBitrate

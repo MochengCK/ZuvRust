@@ -15,6 +15,8 @@
 //! | TS 分片（老站点 / HLS）| 探测 | 1 | **TS→fMP4** | 成功，两条轨都在 |
 //! | fMP4 分片 → TS 产物 | 探测 | 1 | **fMP4→TS** | 成功，AAC 补回 ADTS |
 //! | AV1 画面 + AAC 声音（B 站最常见） | 探测 | 1 | fMP4→fMP4 | 成功 |
+//! | MP3 音频 + MP4 画面 | 探测 | 1 | mp3→fMP4 | 成功（`mp4a` + esds OTI 0x6B） |
+//! | AC-3（来自 TS，没有配置盒） | 探测 | 1 | **TS→fMP4** | 成功，`dac3` 由首帧补出 |
 //! | AV1 → TS | 探测 | 1 | fMP4→**TS** | **明确拒绝**，不留半截产物 |
 //! | 不认识的输出扩展名 | 探测 | 1 | → `.avi` | **明确拒绝** |
 //! | 输入损坏 / 不是媒体 | — | 1 | → fMP4 | 报错，不留半截产物 |
@@ -125,6 +127,68 @@ fn write_ts(path: &Path, tracks: &[Track], packets: &[Packet]) {
     }
     let bytes = m.finish().expect("收尾");
     std::fs::write(path, bytes).expect("落盘");
+}
+
+/// 造一个**裸 MP3**（`.mp3`）：MPEG-1 Layer III / 44.1 kHz / 128 kbps / 立体声。
+///
+/// 帧长 417 字节、每帧 1152 采样 —— 这是 `me-container` 的裸 MP3 探测与解封装
+/// 认的那套头（`0xFF 0xFB 0x90 0x00`），不是随便凑的字节。
+fn write_mp3(path: &Path, seconds: f64) {
+    let frames = (seconds * 44_100.0 / 1152.0).round() as usize;
+    let mut v = Vec::with_capacity(frames * 417);
+    for _ in 0..frames {
+        v.extend_from_slice(&[0xFF, 0xFB, 0x90, 0x00]);
+        v.extend(std::iter::repeat_n(0x11u8, 417 - 4));
+    }
+    std::fs::write(path, v).expect("落盘");
+}
+
+fn ac3_track(id: u32) -> Track {
+    // AC-3 的 TS `stream_type` 是 0x81；它在 TS / 裸流里**没有配置盒**
+    let mut t = Track::new(id, MediaKind::Audio, CodecId::Ac3, Timebase::new(48_000));
+    t.sample_rate = 48_000;
+    t.channels = 6;
+    t
+}
+
+/// 一条 AC-3 采样：`syncword + crc1` 之后是字段（这里取 5.1：acmod=7、LFE 开）。
+///
+/// 字段按位拼（`fscod(2) frmsizecod(6) bsid(5) bsmod(3) acmod(3)
+/// cmixlev(2) surmixlev(2) lfeon(1)`），后面对齐到字节再补填充。
+fn ac3_packet(id: u32, dts: i64) -> Packet {
+    let mut bits: Vec<u8> = Vec::new();
+    let mut push = |v: u32, n: u32| {
+        for i in (0..n).rev() {
+            bits.push(((v >> i) & 1) as u8);
+        }
+    };
+    push(0, 2); // fscod = 48 kHz
+    push(38, 6); // frmsizecod → bit_rate_code = 19
+    push(8, 5); // bsid = 8（AC-3）
+    push(0, 3); // bsmod
+    push(7, 3); // acmod = 7（5.1：cmixlev + surmixlev 都要跳）
+    push(0, 2);
+    push(0, 2);
+    push(1, 1); // lfeon = 1
+
+    let mut data = vec![0x0B, 0x77, 0x00, 0x00];
+    let mut byte = 0u8;
+    let mut n = 0;
+    for b in bits {
+        byte = (byte << 1) | b;
+        n += 1;
+        if n == 8 {
+            data.push(byte);
+            byte = 0;
+            n = 0;
+        }
+    }
+    if n > 0 {
+        data.push(byte << (8 - n));
+    }
+    data.resize(512, 0);
+
+    Packet::new(id, dts, dts, 1536, data)
 }
 
 fn tmp_dir(tag: &str) -> PathBuf {
@@ -400,6 +464,63 @@ fn av1_with_aac_merges() {
     let probe = probe_json(&out);
     assert!(probe.contains("\"codec\":\"av1\""), "画面应当是 AV1：{probe}");
     assert!(probe.contains("\"codec\":\"aac\""), "声音应当是 AAC：{probe}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **MP3 音频 + MP4 画面** —— 市面很常见的一种组合。
+///
+/// 修之前 fMP4 的允许列表里没有 MP3，`mux` 会以"fmp4 装不下这条轨道：mp3 / Audio"
+/// 直接拒绝 —— 而**读侧本来就在认** `mp4a` + `esds`(OTI 0x6B) 的 MP3
+/// （`me-container/src/mp4.rs`）。写侧补齐之后两边才对称：
+/// 引擎读得出来的，也能原样写回去。
+#[test]
+fn mp3_audio_merges_into_mp4() {
+    let dir = tmp_dir("mp3");
+    let v = dir.join("v.mp4");
+    let a = dir.join("a.mp3");
+    write_fmp4(&v, &[h264_track(1)], &video_packets(1, 1.0, 0));
+    write_mp3(&a, 1.0);
+    let out = dir.join("out.mp4");
+
+    mux_ok(&out, &[&v, &a]);
+    let probe = probe_json(&out);
+    assert!(probe.contains("\"codec\":\"mp3\""), "声音应当被认成 MP3：{probe}");
+    assert_eq!(track_count(&probe, "audio"), 1, "{probe}");
+    assert_eq!(track_count(&probe, "video"), 1, "{probe}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// **AC-3（来自 TS）合并进 MP4** —— 关键在 `dac3`。
+///
+/// TS 里的 AC-3 没有配置盒，参数只写在 syncframe 头里；而 fMP4 必须有 `dac3`。
+/// `mux` 层会在写 moov **之前**从第一帧补出来，所以这里除"能出 AC-3 轨"之外，
+/// 还要断言**配置盒真的在产物里**（`extradataBytes == 3`）——
+/// 补 `dac3` 那一步一旦漏掉，产物会是一条"读得出 ac3、配置却为空"的轨：
+/// 播放器按默认声道布局解，声音是错的但文件看着没毛病。
+#[test]
+fn ac3_audio_from_ts_merges_into_mp4() {
+    let dir = tmp_dir("ac3");
+    let src = dir.join("in.ts");
+    let mut packets = video_packets(1, 1.0, 0);
+    packets.extend((0..20).map(|i| ac3_packet(2, i * 1536)));
+    write_ts(&src, &[h264_track(1), ac3_track(2)], &packets);
+    let out = dir.join("out.mp4");
+
+    mux_ok(&out, &[&src]);
+    let probe = probe_json(&out);
+    assert!(probe.contains("\"codec\":\"ac3\""), "声音应当被认成 AC-3：{probe}");
+    assert_eq!(track_count(&probe, "audio"), 1, "{probe}");
+
+    let ac3_bytes = probe
+        .split("\"codec\":\"ac3\"")
+        .nth(1)
+        .and_then(|s| s.split("\"extradataBytes\":").nth(1))
+        .and_then(|s| s.split([',', '}']).next())
+        .and_then(|s| s.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    assert_eq!(ac3_bytes, 3, "dac3 应当是 3 字节，实际 {ac3_bytes}（{probe}）");
 
     let _ = std::fs::remove_dir_all(&dir);
 }
