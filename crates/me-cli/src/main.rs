@@ -151,7 +151,7 @@ fn print_usage() {
   probe <输入>                 探测容器与轨道信息
   mux   <输出> <输入>...       合并成一个文件（角色由探测决定，同角色按顺序串接）
   remux <输出> <输入>          换个容器重新封装（不重编码）
-  download <地址> [--out=路径]  下载（HTTP / HLS / DASH / 磁力）
+  download <地址> [--out=路径]  下载（HTTP / HLS / DASH；磁力由下载引擎负责）
   play  <输入> [--seek=秒]      播放数据源（边下边播时给宿主喂采样）
   stream <输入> [--seek=秒]     流式播放：一行元信息 + 分片 fMP4 字节（宿主喂 MSE）
                                 stream 支持 --avail=<文件>：可用性图（哪些字节已下到，空洞会等）
