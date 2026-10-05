@@ -46,7 +46,6 @@ use crate::demux::Demuxer;
 
 // ── EBML 元素 ID ──
 const ID_EBML: u32 = 0x1A45_DFA3;
-const ID_DOCTYPE: u32 = 0x4282;
 const ID_SEGMENT: u32 = 0x1853_8067;
 const ID_INFO: u32 = 0x1549_A966;
 const ID_TIMESTAMP_SCALE: u32 = 0x2AD7_B1;
@@ -231,8 +230,6 @@ fn read_element(r: &mut Reader, off: u64) -> Result<Option<Element>> {
 // ───────────────────────── 轨道 ─────────────────────────
 
 struct MkvTrack {
-    /// Matroska 的 `TrackNumber`（**块里写的是它**，不是下标）。
-    number: u64,
     /// 引擎侧轨道号（= 下标 + 1；muxer 会重新分配）。
     id: u32,
     kind: MediaKind,
@@ -519,7 +516,7 @@ impl MkvDemuxer {
         t.channels = channels;
         t.language = language;
         self.info.tracks.push(t);
-        self.tracks.push(MkvTrack { number, id, kind, nal_len, default_duration });
+        self.tracks.push(MkvTrack { id, kind, nal_len, default_duration });
         self.by_number.insert(number, self.tracks.len() - 1);
         Ok(())
     }
@@ -934,14 +931,6 @@ mod tests {
             self
         }
 
-        fn default_duration(mut self, ns: u64) -> Self {
-            // 挂到最后一条轨上（测试里只用一条带 DefaultDuration 的轨）
-            let d = el(ID_DEFAULT_DURATION, &uint(ns));
-            let last = self.tracks.len();
-            self.tracks.splice(last..last, d);
-            self
-        }
-
         /// 一个 Cluster：时间戳（时基刻度）+ 若干块。
         fn cluster(mut self, ts: i64, blocks: &[Vec<u8>]) -> Self {
             let mut c = el(ID_CLUSTER_TS, &uint(ts as u64));
@@ -953,7 +942,7 @@ mod tests {
         }
 
         fn build(self) -> Vec<u8> {
-            let mut ebml = el(ID_DOCTYPE, b"matroska");
+            let mut ebml = el(0x4282, b"matroska"); // DocType
             ebml.extend_from_slice(&el(0x4286, &uint(1))); // EBMLVersion
             let mut out = el(ID_EBML, &ebml);
 
@@ -1133,19 +1122,15 @@ mod tests {
     }
 
     #[test]
-    fn duration_and_frame_rate_come_from_the_header() {
-        let b = Builder::new();
-        let b = b.track(1, 1, "V_VP9", &[]);
-        let mut bytes = b.build();
-        // 手工把 DefaultDuration(40ms = 40_000_000 ns) 塞进轨里太绕，直接改 ts_scale 验证时长
-        bytes = {
-            let mut b2 = Builder::new();
-            b2.duration = Some(2000.0); // 2000 个时间戳单位
-            b2 = b2.track(1, 1, "V_VP9", &[]).cluster(0, &[block(1, 0, true, b"F")]);
-            b2.build()
-        };
+    fn duration_comes_from_the_header() {
+        let mut b = Builder::new();
+        // 2000 个时间戳单位；TimestampScale 是 1 ms ⇒ 2000 刻度 = 2 秒
+        b.duration = Some(2000.0);
+        let bytes = b
+            .track(1, 1, "V_VP9", &[])
+            .cluster(0, &[block(1, 0, true, b"F")])
+            .build();
         let d = open(bytes);
-        // ts_scale = 1 ms ⇒ 2000 刻度 = 2 秒
         assert_eq!(d.duration_us(), Some(2_000_000));
     }
 }
