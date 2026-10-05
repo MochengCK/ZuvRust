@@ -216,41 +216,84 @@ impl MotionFieldStore {
     }
 }
 
-/// `MotionFieldMvs[ref][y8][x8]`（`ref` 从 `LAST_FRAME` 到 `ALTREF_FRAME`）。
-#[derive(Debug, Clone)]
+/// "这一格没有投影"的哨兵值（规范里 `MotionFieldMvs` 的初值）。
+pub const MF_INVALID: Mv = [-1 << 15, -1 << 15];
+
+/// 运动场每格存几个目标参考（`LAST_FRAME..=ALTREF_FRAME`，即 7 个）。
+///
+/// 规范写的是 `MotionFieldMvs[ref][y8][x8]`，但**访问模式**是"投影一格就把 7 个
+/// 目标一次性写满"，而 `[ref]` 在前意味着那 7 次写落在**相隔 `h8·w8·8` 字节**
+/// （1080p 约 259 KB）的 7 个不同平面上 —— 每次都是独立的缓存行，实测
+/// `AV1_SYNTAX_ONLY` 采样里 `project_frame` 占**语法阶段的 13%**。
+///
+/// 改成 `[y8][x8][ref]` 之后那 7 次写是**一段连续的 56 字节**（`base` 对齐到 7 个
+/// `Mv`），缓存行触碰从 7 条降到 1~2 条。读取方只有 [`MotionField::get`]，
+/// 索引一次就够。内存也从 8 槽降到 7 槽（2.07 MB → 1.81 MB）。
+///
+/// ⚠️ `INTRA_FRAME` 那一槽**不存在**（规范从不写它，读到时返回哨兵）——
+/// 老布局里它恒为 `MF_INVALID`，两种布局**可观测行为相同**。
+pub const MF_SRC_SLOTS: usize = (ALTREF_FRAME - LAST_FRAME + 1) as usize;
+
+/// `MotionFieldMvs[y8][x8][ref - LAST_FRAME]`（见 [`MF_SRC_SLOTS`] 的说明）。
+#[derive(Debug, Clone, Default)]
 pub struct MotionField {
     pub w8: usize,
     pub h8: usize,
-    /// 展平：`((ref) * h8 + y8) * w8 + x8`
+    /// 展平：`((y8) * w8 + x8) * MF_SRC_SLOTS + (ref - LAST_FRAME)`
     pub mvs: Vec<Mv>,
 }
 
 impl MotionField {
+    /// ⚠️ 生产路径**不再**用它：1080p 一份 ≈ 2 MB，每帧 `vec![哨兵; n]` 要走
+    /// `mmap` + 写入时 512 次缺页（实测 `mf` 段 4.14 ms 里相当一部分是它）。
+    /// 现在由 [`MotionField::reset`] 复用同一块缓冲。留作测试/冷路径。
     pub fn new(mi_rows: usize, mi_cols: usize) -> Self {
-        let w8 = mi_cols >> 1;
-        let h8 = mi_rows >> 1;
-        Self { w8, h8, mvs: vec![[-1 << 15, -1 << 15]; (TOTAL_REFS_PER_FRAME) * h8 * w8] }
+        let mut f = Self::default();
+        f.reset(mi_rows, mi_cols);
+        f
+    }
+
+    /// 复用同一块缓冲并**重置成哨兵**（尺寸变了才重新分配）。
+    ///
+    /// `fill` 仍要跑（没被投影到的格子必须回到哨兵，否则会读到上一帧的值），
+    /// 但省掉了 `mmap` 与随之而来的缺页。
+    pub fn reset(&mut self, mi_rows: usize, mi_cols: usize) {
+        self.w8 = mi_cols >> 1;
+        self.h8 = mi_rows >> 1;
+        let n = MF_SRC_SLOTS * self.h8 * self.w8;
+        if self.mvs.len() != n {
+            self.mvs.clear();
+            self.mvs.resize(n, MF_INVALID);
+        } else {
+            self.mvs.fill(MF_INVALID);
+        }
     }
 
     #[inline]
     pub fn get(&self, r: i8, y8: usize, x8: usize) -> Mv {
-        if r as usize >= TOTAL_REFS_PER_FRAME || y8 >= self.h8 || x8 >= self.w8 {
-            return [-1 << 15, -1 << 15];
+        // `r` 只可能是 `LAST_FRAME..=ALTREF_FRAME`（`INTRA_FRAME` 那一槽不存在，
+        // 老布局里它恒为哨兵 ⇒ 这里显式返回哨兵，行为不变）。
+        if r < LAST_FRAME || r > ALTREF_FRAME || y8 >= self.h8 || x8 >= self.w8 {
+            return MF_INVALID;
         }
-        self.mvs[r as usize * self.h8 * self.w8 + y8 * self.w8 + x8]
+        let slot = (r as usize) - (LAST_FRAME as usize);
+        self.mvs[(y8 * self.w8 + x8) * MF_SRC_SLOTS + slot]
     }
 }
 
 /// `get_mv_projection( mv, numerator, denominator )`（规范 §7.9.3）
+///
+/// ⚠️ 生产路径已换成 [`project_k`]（乘子提前算好，见 [`project_frame`]）；
+/// 这一对留作**参考实现**，由 `project_k_matches_the_reference_projection` 逐值对拍。
+#[cfg(test)]
 fn mv_projection(mv: Mv, numerator: i32, denominator: i32) -> Mv {
     let clipped_denominator = denominator.min(MAX_FRAME_DISTANCE).max(1);
     let clipped_numerator = numerator.clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE);
     mv_projection_clipped(mv, clipped_numerator, clipped_denominator)
 }
 
-/// [`mv_projection`] 的**已裁剪**版本：调用方已经把 `numerator` / `denominator`
-/// 钳好，本函数直接算 —— `project_frame` 里这两样对内层循环是常量（7 个目标帧）
-/// 或逐格共享（`denominator`），照原函数每格重钳一遍是白花。
+/// [`mv_projection`] 的**已裁剪**版本（参考实现，见上）。
+#[cfg(test)]
 fn mv_projection_clipped(mv: Mv, clipped_numerator: i32, clipped_denominator: i32) -> Mv {
     let mut out = [0i32; 2];
     for i in 0..2 {
@@ -259,6 +302,22 @@ fn mv_projection_clipped(mv: Mv, clipped_numerator: i32, clipped_denominator: i3
         // 规范是数学式定义，i64 之后夹到 ±(1<<14 - 1) 才是本意。
         let wide = mv[i] as i64 * clipped_numerator as i64
             * DIV_MULT[clipped_denominator as usize] as i64;
+        let scaled = round2_signed_i64(wide, 14);
+        out[i] = scaled.clamp(-(1 << 14) + 1, (1 << 14) - 1) as i32;
+    }
+    out
+}
+
+/// `mv_projection` 的**乘子已提好**版本：`round2_signed( mv · k, 14 )` 再夹到 ±(2^14-1)。
+///
+/// 等价于 `mv_projection_clipped( mv, num, den )`（`k = num · Div_Mult[den]`，见
+/// [`project_frame`] 里的推导）。**必须用 i64**：真实流里 `mv` 可达 ±8800，
+/// 乘出来会到 4e9 量级，i32 会溢出（规范是数学式定义，i64 之后夹到 ±(2^14-1) 才是本意）。
+#[inline]
+fn project_k(mv: Mv, k: i64) -> Mv {
+    let mut out = [0i32; 2];
+    for i in 0..2 {
+        let wide = mv[i] as i64 * k;
         let scaled = round2_signed_i64(wide, 14);
         out[i] = scaled.clamp(-(1 << 14) + 1, (1 << 14) - 1) as i32;
     }
@@ -292,11 +351,12 @@ fn block_position(x8: i32, y8: i32, dst_sign: i32, proj_mv: Mv, mi_rows: i32, mi
 
 /// `motion_field_estimation( )`（规范 §7.9）—— 在非压缩头里调用。
 pub fn motion_field_estimation(
+    field: &mut MotionField,
     fh: &FrameHeader,
     seq: &SequenceHeader,
     store: &MotionFieldStore,
-) -> MotionField {
-    let mut field = MotionField::new(fh.mi_rows as usize, fh.mi_cols as usize);
+) {
+    field.reset(fh.mi_rows as usize, fh.mi_cols as usize);
     let w8 = field.w8;
     let h8 = field.h8;
 
@@ -313,32 +373,31 @@ pub fn motion_field_estimation(
     let use_last = last_alt_order_hint != cur_gold_order_hint;
 
     if use_last {
-        project_frame(&mut field, store, seq, order_hints, fh, LAST_FRAME, -1, w8, h8);
+        project_frame(field, store, seq, order_hints, fh, LAST_FRAME, -1, w8, h8);
     }
     let mut ref_stamp = (MFMV_STACK_SIZE - 2) as i32;
 
     let use_bwd = get_relative_dist(seq, order_hints[BWDREF_FRAME as usize], fh.order_hint) > 0;
     if use_bwd
-        && project_frame(&mut field, store, seq, order_hints, fh, BWDREF_FRAME, 1, w8, h8)
+        && project_frame(field, store, seq, order_hints, fh, BWDREF_FRAME, 1, w8, h8)
     {
         ref_stamp -= 1;
     }
     let use_alt2 = get_relative_dist(seq, order_hints[ALTREF2_FRAME as usize], fh.order_hint) > 0;
     if use_alt2
-        && project_frame(&mut field, store, seq, order_hints, fh, ALTREF2_FRAME, 1, w8, h8)
+        && project_frame(field, store, seq, order_hints, fh, ALTREF2_FRAME, 1, w8, h8)
     {
         ref_stamp -= 1;
     }
     let use_alt = get_relative_dist(seq, order_hints[ALTREF_FRAME as usize], fh.order_hint) > 0;
     if use_alt && ref_stamp >= 0 {
-        if project_frame(&mut field, store, seq, order_hints, fh, ALTREF_FRAME, 1, w8, h8) {
+        if project_frame(field, store, seq, order_hints, fh, ALTREF_FRAME, 1, w8, h8) {
             ref_stamp -= 1;
         }
     }
     if ref_stamp >= 0 {
-        project_frame(&mut field, store, seq, order_hints, fh, LAST2_FRAME, -1, w8, h8);
+        project_frame(field, store, seq, order_hints, fh, LAST2_FRAME, -1, w8, h8);
     }
-    field
 }
 
 /// 本帧的 `OrderHints[ref]`（规范在非压缩头里算好，存在 `FrameHeader` 上）。
@@ -395,10 +454,34 @@ fn project_frame(
             && ro.abs() <= MAX_FRAME_DISTANCE
             && ro > 0;
     }
+    // ── 再提一层（2026-10-05）：把**乘子**也提前算好 ──────────────────────────
+    //
+    // `mv_projection_clipped( mv, num, den )` 展开是
+    //   `round2_signed( mv[i] * num * Div_Mult[den], 14 )`
+    // —— 每格每目标帧**两次 i64 乘**（1080p 实测 `mf` 段 4.14 ms/帧，是 `setup` 的八成）。
+    // 而 `num` 只跟 (src, dst) 有关、`den` 只跟 `src` 有关 ⇒ `k = num · Div_Mult[den]`
+    // 是一张 8×8 的小表，**每帧每源帧算一次**。整数乘可结合 ⇒ `mv * k` 与
+    // `mv * num * Div_Mult[den]` **逐位相同**（值域远在 i64 内）。
+    let mut k_tab = [[0i64; TOTAL_REFS_PER_FRAME]; TOTAL_REFS_PER_FRAME];
+    let num_cur = (ref_to_cur * dst_sign).clamp(-MAX_FRAME_DISTANCE, MAX_FRAME_DISTANCE);
+    let mut k_cur = [0i64; TOTAL_REFS_PER_FRAME];
+    for sr in (INTRA_FRAME + 1)..=ALTREF_FRAME {
+        if !pos_valid_tab[sr as usize] {
+            continue;
+        }
+        let dm = DIV_MULT[ref_offset_tab[sr as usize].max(1) as usize] as i64;
+        k_cur[sr as usize] = num_cur as i64 * dm;
+        for dst in LAST_FRAME..=ALTREF_FRAME {
+            k_tab[sr as usize][dst as usize] = num_clip[dst as usize] as i64 * dm;
+        }
+    }
     // `field.set` 的边界检查与目标帧平面步长也提到循环外：原来一格要判 7 次
     // （每目标帧一次），且**越界时 7 次投影全是白算** —— 现在整格先判一次，
     // 越界直接跳过（结果与"算了再丢弃"逐位相同）。
-    let plane = field.h8 * field.w8;
+    //
+    // 2026-10-05：布局改成 `[y8][x8][ref]` ⇒ 一格的 7 个目标在**一段连续的 56 字节**
+    // 里（`base` 是 7 的倍数、每格间隔 7 个 `Mv`，互不重叠），写出去的缓存行从 7 条
+    // 降到 1~2 条。索引推导见 [`MF_SRC_SLOTS`]。
     for y8 in 0..h8 {
         for x8 in 0..w8 {
             let row = 2 * y8 + 1;
@@ -411,9 +494,8 @@ fn project_frame(
             if !pos_valid_tab[sr] {
                 continue;
             }
-            let ref_offset = ref_offset_tab[sr];
             let mv = slot.mvs[row * slot.mi_cols + col];
-            let proj_mv = mv_projection(mv, ref_to_cur * dst_sign, ref_offset);
+            let proj_mv = project_k(mv, k_cur[sr]);
             let Some((pos_y8, pos_x8)) = block_position(
                 x8 as i32,
                 y8 as i32,
@@ -430,11 +512,12 @@ fn project_frame(
             }
             // `pos_valid` 已保证 `|ref_offset| ≤ MAX_FRAME_DISTANCE` ⇒ 这等价于
             // 原来的 `.min(MAX).max(1)`。
-            let denom_clip = ref_offset.max(1);
-            let base = py * w8 + px;
-            for dst in LAST_FRAME..=ALTREF_FRAME {
-                let pmv = mv_projection_clipped(mv, num_clip[dst as usize], denom_clip);
-                field.mvs[dst as usize * plane + base] = pmv;
+            let base = (py * w8 + px) * MF_SRC_SLOTS;
+            let krow = &k_tab[sr];
+            // 连续 7 个 `Mv`（`dst - LAST_FRAME` 正好是 0..=6）
+            let out = &mut field.mvs[base..base + MF_SRC_SLOTS];
+            for (slot, o) in out.iter_mut().enumerate() {
+                *o = project_k(mv, krow[slot + LAST_FRAME as usize]);
             }
         }
     }
@@ -1399,7 +1482,41 @@ mod tests {
         }
     }
 
+    /// `project_k( mv, num · Div_Mult[den] )` 必须与参考实现 `mv_projection` **逐值相同**。
+    ///
+    /// 这是把"两次 i64 乘并成一次"的安全性论证钉死的那条单测：整数乘可结合，
+    /// 但**夹取与取整的位置**必须一模一样，所以对全部 `den`（1..=MAX_FRAME_DISTANCE）
+    /// × 全部 `num`（-MAX..=MAX）× 一组覆盖值域的 `mv` 全扫一遍。
     #[test]
+    fn project_k_matches_the_reference_projection() {
+        let mvs: [Mv; 11] = [
+            [0, 0],
+            [1, -1],
+            [100, -100],
+            [200, -200],
+            [1 << 14, 0],
+            [-(1 << 14), 0],
+            [8800, -8800],
+            [-8800, 8800],
+            [4095, 4095],
+            [12345, -54321],
+            [REFMVS_LIMIT, -REFMVS_LIMIT],
+        ];
+        for den in 1..=MAX_FRAME_DISTANCE {
+            let dm = DIV_MULT[den as usize] as i64;
+            for num in -MAX_FRAME_DISTANCE..=MAX_FRAME_DISTANCE {
+                let k = num as i64 * dm;
+                for mv in mvs {
+                    assert_eq!(
+                        project_k(mv, k),
+                        mv_projection(mv, num, den),
+                        "mv={mv:?} num={num} den={den}"
+                    );
+                }
+            }
+        }
+    }
+
     fn mv_projection_clamps_and_scales() {
         // `numerator == denominator` 时是恒等变换（定点除法回到原值）
         let mv = [100, -100];

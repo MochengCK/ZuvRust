@@ -126,19 +126,13 @@ pub fn apply(
         .map(|(k, rows)| {
             let sink = &sinks[k];
             move || -> Result<()> {
-                // SIMD 内核的落盘暂存：**每个 worker 一份、跨块复用**。
-                // 原来它是 `cdef_filter` 里的一行 `let mut out = [0i16; 64]` —— 那是
-                // **每次调用**一次 128 字节的清零，而 1080p 一帧有三个平面 ×
-                // (1920/8)×(1080/8) = 32400 个 8×8 块 ⇒ **~12 MB/帧的白写**。
-                // 内核只会产出 `h × w` 个样本，而且每个都会被读一遍 ⇒ 不需要初值。
-                let mut scratch = vec![0i16; super::simd::LANES * 8];
                 for &r in rows {
                     for c in (0..mi_cols).step_by(step4 as usize) {
                         let base_r = r & mask;
                         let base_c = c & mask;
                         let slot = base_r as usize * mi_cols as usize + base_c as usize;
                         let idx = grid.cdef_idx.get(slot).copied().unwrap_or(-1);
-                        cdef_block(frame, sink, fh, seq, grid, r, c, idx, &mut scratch)?;
+                        cdef_block(frame, sink, fh, seq, grid, r, c, idx)?;
                     }
                 }
                 Ok(())
@@ -190,7 +184,6 @@ fn cdef_block(
     r: i32,
     c: i32,
     idx: i32,
-    scratch: &mut [i16],
 ) -> Result<()> {
     // `idx == -1` ⇒ 不滤波（拷贝已经在 `apply` 里做过了）
     if idx < 0 {
@@ -243,7 +236,7 @@ fn cdef_block(
     let damping = i32::from(params.damping) + coeff_shift as i32;
 
     cdef_filter(
-        curr, sinks, seq, grid, 0, r, c, pri_str, sec_str, damping, dir, scratch,
+        curr, sinks, seq, grid, 0, r, c, pri_str, sec_str, damping, dir,
     );
 
     if curr.num_planes == 1 {
@@ -263,10 +256,10 @@ fn cdef_block(
     };
     let uv_damping = i32::from(params.damping) + coeff_shift as i32 - 1;
     cdef_filter(
-        curr, sinks, seq, grid, 1, r, c, uv_pri, uv_sec, uv_damping, uv_dir, scratch,
+        curr, sinks, seq, grid, 1, r, c, uv_pri, uv_sec, uv_damping, uv_dir,
     );
     cdef_filter(
-        curr, sinks, seq, grid, 2, r, c, uv_pri, uv_sec, uv_damping, uv_dir, scratch,
+        curr, sinks, seq, grid, 2, r, c, uv_pri, uv_sec, uv_damping, uv_dir,
     );
     Ok(())
 }
@@ -275,40 +268,14 @@ fn cdef_block(
 fn cdef_direction(curr: &CurrFrame, r: i32, c: i32) -> (usize, i32) {
     let plane = &curr.planes[0];
     let bit_depth = plane.bit_depth;
-    let mut partial = [[0i32; 15]; 8];
+    // 每行**补到 16 项**（64 字节 = 一条缓存行）：向量版会做 `p[d][i..i+8]`
+    // 的 8 宽读写（`i ≤ 7`），补到 16 才能保证不串到下一行。标量段的下标全在 0..15。
+    let mut partial = [[0i32; 16]; 8];
 
     let x0 = (c << MI_SIZE_LOG2) as usize;
     let y0 = (r << MI_SIZE_LOG2) as usize;
     let sh = u32::from(bit_depth - 8);
-    let stride = plane.stride;
-    // **逐行切片**读（2026-10-04）：原来每个样本一次 `Plane::get` —— 那是**每样本**
-    // 一次 debug_assert + 一次 `y·stride + x` 乘法。这里一行取一次切片，
-    // 8 个样本一次读全；partial 的累加顺序变了但全是 i32 整数加、逐位不变。
-    for i in 0..8usize {
-        let base = (y0 + i) * stride + x0;
-        let mut xs = [0i32; 8];
-        if plane.is_u8() {
-            let d = plane.px8();
-            for (j, slot) in xs.iter_mut().enumerate() {
-                *slot = (d[base + j] >> sh) as i32 - 128;
-            }
-        } else {
-            let d = plane.px16();
-            for (j, slot) in xs.iter_mut().enumerate() {
-                *slot = (d[base + j] >> sh) as i32 - 128;
-            }
-        }
-        for (j, &x) in xs.iter().enumerate() {
-            partial[0][i + j] += x;
-            partial[1][i + j / 2] += x;
-            partial[2][i] += x;
-            partial[3][3 + i - j / 2] += x;
-            partial[4][7 + i - j] += x;
-            partial[5][3 - i / 2 + j] += x;
-            partial[6][j] += x;
-            partial[7][i / 2 + j] += x;
-        }
-    }
+    cdef_dir_accum(&mut partial, plane, x0, y0, sh);
 
     let mut cost = [0i32; 8];
     for i in 0..8 {
@@ -348,6 +315,148 @@ fn cdef_direction(curr: &CurrFrame, r: i32, c: i32) -> (usize, i32) {
     (y_dir, var)
 }
 
+/// `CDEF direction process` 的**累加段**（§7.15.2 前半）—— 标量/向量两条路。
+///
+/// 标量式是那段 `partial[0][i+j] += x[j] … partial[7][i/2+j] += x[j]` 的 8×8 双重
+/// 循环（**512 次带散列下标的加**，1080p 每帧 3.24 万个 8×8 块都要做一遍）。
+/// 关键观察：**每个方向都只是"把整行 `xs` 加到某个随 `i` 变化的偏移上"** ⇒
+/// 一条 8 宽向量加就够了。
+///
+/// ## 逐方向推导（`xs[j] = 样本 - 128`，当前行 `i`）
+///
+/// | 方向 | 标量式 | 向量式 |
+/// |---|---|---|
+/// | 0 | `partial[0][i+j] += xs[j]` | `p0[i..i+8] += xs` |
+/// | 1 | `partial[1][i+j/2] += xs[j]` | `p1[i..i+8] += y` |
+/// | 2 | `partial[2][i] += xs[j]` | `p2[i] += Σ xs` |
+/// | 3 | `partial[3][3+i-j/2] += xs[j]` | `p3[i..i+8] += rev(y)` |
+/// | 4 | `partial[4][7+i-j] += xs[j]` | `p4[i..i+8] += rev(xs)` |
+/// | 5 | `partial[5][3-i/2+j] += xs[j]` | `p5[(3-i/2)..+8] += xs` |
+/// | 6 | `partial[6][j] += xs[j]` | `p6 += xs`（寄存器里跨行累加） |
+/// | 7 | `partial[7][i/2+j] += xs[j]` | `p7[(i/2)..+8] += xs` |
+///
+/// `y[k] = xs[2k] + xs[2k+1]`（`k < 4`，高 4 通道是 **0**）。高位那 4 个 0 加进去
+/// **不改动**任何格点 —— 它们是**别的行**的累加器，加 0 是恒等。`rev` 把 8 个通道
+/// 反序（方向 4 要的正是 `x7…x0`）。
+///
+/// 整数加可结合，且每一格点上的加法次序与标量式**逐条相同** ⇒ `partial` 逐位相同
+/// （`ME_NO_SIMD` 开/关的输出逐字节一致就是这条的验收）。
+fn cdef_dir_accum(
+    partial: &mut [[i32; 16]; 8],
+    plane: &super::intra::Plane,
+    x0: usize,
+    y0: usize,
+    sh: u32,
+) {
+    #[cfg(target_arch = "x86_64")]
+    if super::simd::avx2_available() {
+        // SAFETY: AVX2 已判。样本读取与标量式**逐样本相同**（每行读 `[x0, x0+8)`，
+        // `plane` 有 border；见 `intra::PLANE_PAD`）；`partial` 每行 16 项、
+        // `i ≤ 7` ⇒ 所有 8 宽读写都落在本行内。
+        unsafe { dir_accum_avx2(partial, plane, x0, y0, sh) };
+        return;
+    }
+    let stride = plane.stride;
+    for i in 0..8usize {
+        let base = (y0 + i) * stride + x0;
+        let mut xs = [0i32; 8];
+        if plane.is_u8() {
+            let d = plane.px8();
+            for (j, slot) in xs.iter_mut().enumerate() {
+                *slot = (d[base + j] >> sh) as i32 - 128;
+            }
+        } else {
+            let d = plane.px16();
+            for (j, slot) in xs.iter_mut().enumerate() {
+                *slot = (d[base + j] >> sh) as i32 - 128;
+            }
+        }
+        for (j, &x) in xs.iter().enumerate() {
+            partial[0][i + j] += x;
+            partial[1][i + j / 2] += x;
+            partial[2][i] += x;
+            partial[3][3 + i - j / 2] += x;
+            partial[4][7 + i - j] += x;
+            partial[5][3 - i / 2 + j] += x;
+            partial[6][j] += x;
+            partial[7][i / 2 + j] += x;
+        }
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[inline]
+unsafe fn dir_add_at(base: *mut i32, dir: usize, off: usize, v: std::arch::x86_64::__m256i) {
+    use std::arch::x86_64::*;
+    // SAFETY: 调用方保证 `dir < 8`、`off ≤ 7`（8 宽读写落在本行的 16 项内）。
+    let p = base.add(dir * 16 + off);
+    let cur = _mm256_loadu_si256(p as *const __m256i);
+    _mm256_storeu_si256(p as *mut __m256i, _mm256_add_epi32(cur, v));
+}
+
+/// [`cdef_dir_accum`] 的 AVX2 版（推导见那张表）。
+///
+/// # Safety
+/// 必须已确认 AVX2 可用；`plane` 的每一行 `y0..y0+8` 都要覆盖 `[x0, x0+8)`。
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+unsafe fn dir_accum_avx2(
+    partial: &mut [[i32; 16]; 8],
+    plane: &super::intra::Plane,
+    x0: usize,
+    y0: usize,
+    sh: u32,
+) {
+    use std::arch::x86_64::*;
+    let stride = plane.stride;
+    let base = partial.as_mut_ptr() as *mut i32;
+    let rev_idx = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+    // `hadd(xs, 0)` = `[x0+x1, x2+x3, 0, 0, x4+x5, x6+x7, 0, 0]`
+    // ⇒ 取 `[0,1,4,5]` 就是 `y`；取 `[5,4,1,0]` 就是 `rev(y)`。
+    let y_idx = _mm256_setr_epi32(0, 1, 4, 5, 6, 6, 6, 6);
+    let ry_idx = _mm256_setr_epi32(5, 4, 1, 0, 6, 6, 6, 6);
+    let zero = _mm256_setzero_si256();
+    let c128 = _mm256_set1_epi32(128);
+    let mut p6 = zero;
+    for i in 0..8usize {
+        let off = (y0 + i) * stride + x0;
+        // SAFETY: 见函数文档；两个分支都恰好读 8 个样本（与标量式逐样本相同）。
+        let raw = if plane.is_u8() {
+            let d = plane.px8();
+            _mm256_cvtepu8_epi32(_mm_loadl_epi64(d.as_ptr().add(off) as *const __m128i))
+        } else {
+            let d = plane.px16();
+            _mm256_cvtepu16_epi32(_mm_loadu_si128(d.as_ptr().add(off) as *const __m128i))
+        };
+        let raw = match sh {
+            0 => raw,
+            2 => _mm256_srli_epi32::<2>(raw),
+            _ => _mm256_srli_epi32::<4>(raw),
+        };
+        let xs = _mm256_sub_epi32(raw, c128);
+        let rev = _mm256_permutevar8x32_epi32(xs, rev_idx);
+        let h = _mm256_hadd_epi32(xs, zero);
+        let y = _mm256_permutevar8x32_epi32(h, y_idx);
+        let ry = _mm256_permutevar8x32_epi32(h, ry_idx);
+
+        dir_add_at(base, 0, i, xs);
+        dir_add_at(base, 1, i, y);
+        dir_add_at(base, 3, i, ry);
+        dir_add_at(base, 4, i, rev);
+        dir_add_at(base, 5, 3 - i / 2, xs);
+        dir_add_at(base, 7, i / 2, xs);
+        p6 = _mm256_add_epi32(p6, xs);
+
+        // 方向 2：整行和（两个 128 位通道各 4 项，再横加）
+        let t = _mm256_hadd_epi32(h, h);
+        let lo = _mm256_castsi256_si128(t);
+        let hi = _mm256_extracti128_si256::<1>(t);
+        *base.add(2 * 16 + i) += _mm_cvtsi128_si32(_mm_add_epi32(lo, hi));
+    }
+    _mm256_storeu_si256(base.add(6 * 16) as *mut __m256i, p6);
+}
+
 /// `CDEF filter process`（规范 §7.15.3）。
 ///
 /// **只读 `CurrFrame`、只写 `CdefFrame`** —— 这是规范里"滤波结果不回流到输入"
@@ -365,7 +474,6 @@ fn cdef_filter(
     sec_str: i32,
     damping: i32,
     dir: usize,
-    scratch: &mut [i16],
 ) {
     let sub_x = if plane > 0 { u32::from(seq.color.subsampling_x) } else { 0 };
     let sub_y = if plane > 0 { u32::from(seq.color.subsampling_y) } else { 0 };
@@ -437,9 +545,41 @@ fn cdef_filter(
                 }
             }
         }
-        let out = &mut scratch[..super::simd::LANES * 8]; // h ≤ 8，每行 8 列
+        // **就地写目标平面**：内核按 `(y0+r)*dst_stride + x0` 直接写 `CdefFrame`，
+        // 省掉"内核→scratch→memcpy 进平面"的那次往返（1080p 一帧 78 万行 × 16 字节）。
+        let (dptr, dstride, dy0, dy1) = sink.direct();
+        debug_assert!(
+            y0 as usize >= dy0 && (y0 as usize + h) <= dy1,
+            "CDEF 的 SIMD 路径要写出自己那段行了"
+        );
         // SAFETY: `simd` 已保证 AVX2 可用、`pri_adj`/`sec_adj` 远小于 16，
-        // 且 12 个候选 × 8 通道的取址全部落在平面缓冲内（上面的窗口判据）。
+        // 12 个候选 × 8 通道的取址全部落在**源**平面缓冲内（上面的窗口判据）；
+        // `dptr`/`dstride` 来自本 worker 的 `RowsSink`，写入范围由上面的断言守住。
+        //
+        // ⚠️ **4×4 的块走 `cdef_quad8`**（2026-10-05 第三十五轮）：`cdef_pair16` 一次
+        // 算 2 行 × **8** 列，而 4:2:0 的色度块只有 **4** 列 ⇒ 一半的通道白算。
+        // `cdef_quad8` 一次算 **4 行 × 4 列**（4 个 qword），16 个通道全部用满，
+        // 迭代次数从 `h/2` 降到 `h/4`。取址要求**更弱**（每行只读 4 个 u16）。
+        if w == 4 && h == 4 {
+            // SAFETY: 同上；`w == h == 4` 正是本分支的前提。
+            unsafe {
+                super::simd::cdef_quad8(
+                    data,
+                    stride as isize,
+                    x0 as isize,
+                    y0 as isize,
+                    &offs,
+                    &taps,
+                    pri_str,
+                    pri_adj as u32,
+                    sec_str,
+                    sec_adj as u32,
+                    dptr,
+                    dstride,
+                );
+            }
+            return;
+        }
         unsafe {
             super::simd::cdef_pair16(
                 data,
@@ -454,14 +594,9 @@ fn cdef_filter(
                 pri_adj as u32,
                 sec_str,
                 sec_adj as u32,
-                out,
+                dptr,
+                dstride,
             );
-        }
-        for i in 0..h {
-            let y = y0 as usize + i;
-            // 内核输出已过 `Clip3(mn, mx, ·)`（`mn`/`mx` 都是合法样本）⇒ 值必在
-            // `[0, 2^bd)` 内，落盘不需要再逐样本钳位（`set_row_i16` 里有断言）。
-            sink.set_row_i16(x0 as usize, y, &out[i * w..i * w + w]);
         }
         return;
     }
@@ -683,5 +818,72 @@ mod tests {
             assert_eq!(DIV_TABLE[i], 840 / i as i32, "Div_Table[{i}]");
         }
         assert_eq!(DIV_TABLE[0], 0, "伪代码里 Div_Table[0] 从不用到，但约定为 0");
+    }
+
+    /// [`cdef_dir_accum`]（向量版）必须与"照规范逐条抄"的标量式**逐格相同**。
+    ///
+    /// 这是 2026-10-05 那次向量化的护栏：8 个方向全被重新表达成"把整行加到某个随
+    /// `i` 变化的偏移上"，**写错一个偏移只会让 `y_dir` 整体偏**（画面出现方向性拖影），
+    /// 从最终像素差很难定位。所以这里独立写第二遍标量式对拍 `partial`。
+    #[test]
+    fn cdef_dir_accum_matches_the_scalar_reference() {
+        const W: usize = 40;
+        const H: usize = 40;
+        for &(bit_depth, sh) in &[(8u8, 0u32), (10, 2), (12, 4)] {
+            let mut plane = crate::video::intra::Plane::new(W, H, bit_depth);
+            let stride = plane.stride;
+            let max = (1i32 << bit_depth) - 1;
+            // 造出**有方向性**的内容（斜条纹 + 台阶），保证 8 个方向的代价互不相同
+            if plane.is_u8() {
+                let d = plane.px8_mut();
+                for y in 0..H {
+                    for x in 0..W {
+                        d[y * stride + x] = (((x * 7 + y * 3) % 97) as i32 * max / 97) as u8;
+                    }
+                }
+            } else {
+                let d = plane.px16_mut();
+                for y in 0..H {
+                    for x in 0..W {
+                        d[y * stride + x] = (((x * 7 + y * 3) % 97) as i32 * max / 97) as u16;
+                    }
+                }
+            }
+            // 独立取样本（与 `cdef_dir_accum` 走的不是同一段代码）
+            let sample = |x: usize, y: usize| -> i32 {
+                if plane.is_u8() {
+                    plane.px8()[y * stride + x] as i32
+                } else {
+                    plane.px16()[y * stride + x] as i32
+                }
+            };
+            for &(x0, y0) in &[(0usize, 0usize), (8, 8), (16, 24), (24, 16), (31, 32)] {
+                let mut got = [[0i32; 16]; 8];
+                super::cdef_dir_accum(&mut got, &plane, x0, y0, sh);
+                let mut want = [[0i32; 16]; 8];
+                for i in 0..8usize {
+                    let mut xs = [0i32; 8];
+                    for (j, slot) in xs.iter_mut().enumerate() {
+                        *slot = (sample(x0 + j, y0 + i) >> sh) - 128;
+                    }
+                    for (j, &x) in xs.iter().enumerate() {
+                        want[0][i + j] += x;
+                        want[1][i + j / 2] += x;
+                        want[2][i] += x;
+                        want[3][3 + i - j / 2] += x;
+                        want[4][7 + i - j] += x;
+                        want[5][3 - i / 2 + j] += x;
+                        want[6][j] += x;
+                        want[7][i / 2 + j] += x;
+                    }
+                }
+                for d in 0..8 {
+                    assert_eq!(
+                        got[d], want[d],
+                        "方向 {d} 在 ({x0},{y0}) bit_depth={bit_depth} 对不上"
+                    );
+                }
+            }
+        }
     }
 }

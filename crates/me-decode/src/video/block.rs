@@ -810,21 +810,37 @@ impl BlockGrid {
     }
 
     /// 一个块覆盖到的每一格都写同样的值。
-    fn stamp<F: FnMut(&mut Self, usize)>(&mut self, r: i32, c: i32, bsize: u8, mut f: F) {
+    /// 把一个块覆盖的每个 4×4 **行**交给闭包：`f(grid, lo, hi)`，`[lo, hi)` 已经
+    /// 裁到网格内（`lo < hi` 恒成立 ⇒ 闭包不必再判边界）。
+    ///
+    /// ## 为什么按行给，而不是逐格给（2026-10-05）
+    ///
+    /// 原来是 `f(grid, i)` **逐格**调用 —— 闭包里 8~14 个 `g.field[i] = v`，每个都要
+    /// **重新加载 `Vec` 的数据指针 + 一次越界判断**。编译器**无法**把这些指针提升到
+    /// `f(self, i)` 之外：它不知道闭包会不会改别的字段（`&mut BlockGrid` 的别名假设）。
+    /// 1080p 一帧 13 万个 4×4 格、每格 8~14 次带检查的写 ⇒ `AV1_SYNTAX_ONLY` 采样里
+    /// `BlockGrid::stamp` 占**语法阶段的 6%**。
+    ///
+    /// 改成按行给 `[lo, hi)` 之后闭包写 `g.y_modes[lo..hi].fill(v)`：
+    /// **越界判断每行一次**（少 `h` 倍）、数据指针每行加载一次，`fill` 还能被 LLVM
+    /// 展开成定长写。语义与逐格版逐格相同。
+    fn stamp<F: FnMut(&mut Self, usize, usize)>(&mut self, r: i32, c: i32, bsize: u8, mut f: F) {
         if bsize as usize >= BLOCK_SIZES {
             return;
         }
         let w = NUM_4X4_BLOCKS_WIDE[bsize as usize] as i32;
         let h = NUM_4X4_BLOCKS_HIGH[bsize as usize] as i32;
-        for y in 0..h {
-            for x in 0..w {
-                let (rr, cc) = (r + y, c + x);
-                if rr < 0 || cc < 0 || rr as usize >= self.rows || cc as usize >= self.cols {
-                    continue;
-                }
-                let i = rr as usize * self.cols + cc as usize;
-                f(self, i);
-            }
+        let r0 = r.max(0);
+        let c0 = c.max(0);
+        let r1 = (r + h).min(self.rows as i32);
+        let c1 = (c + w).min(self.cols as i32);
+        if r0 >= r1 || c0 >= c1 {
+            return;
+        }
+        let (c0, c1) = (c0 as usize, c1 as usize);
+        for rr in r0..r1 {
+            let base = rr as usize * self.cols;
+            f(self, base + c0, base + c1);
         }
     }
 }
@@ -2300,24 +2316,24 @@ impl<'a> BlockCtx<'a> {
             let ifs = info.interp_filter;
             let mvs = info.mv;
             let iim = info.interintra_mode;
-            self.grid.stamp(r, c, bsize, move |g, i| {
-                g.y_modes[i] = y;
+            self.grid.stamp(r, c, bsize, move |g, lo, hi| {
+                g.y_modes[lo..hi].fill(y);
                 if refs[0] == mv::INTRA_FRAME && has_chroma {
-                    g.uv_modes[i] = uv;
+                    g.uv_modes[lo..hi].fill(uv);
                 }
-                g.ref_frames[i] = refs;
+                g.ref_frames[lo..hi].fill(refs);
                 if is_inter {
-                    g.comp_group_idxs[i] = cg;
-                    g.compound_idxs[i] = ci;
-                    g.compound_types[i] = ct;
-                    g.wedge_idxs[i] = wix;
-                    g.wedge_signs[i] = wsg;
-                    g.mask_types[i] = mty;
-                    g.interp_filters[i] = ifs;
-                    g.mvs[i] = mvs;
-                    g.interintra_modes[i] = iim;
+                    g.comp_group_idxs[lo..hi].fill(cg);
+                    g.compound_idxs[lo..hi].fill(ci);
+                    g.compound_types[lo..hi].fill(ct);
+                    g.wedge_idxs[lo..hi].fill(wix);
+                    g.wedge_signs[lo..hi].fill(wsg);
+                    g.mask_types[lo..hi].fill(mty);
+                    g.interp_filters[lo..hi].fill(ifs);
+                    g.mvs[lo..hi].fill(mvs);
+                    g.interintra_modes[lo..hi].fill(iim);
                 }
-                g.written[i] = true;
+                g.written[lo..hi].fill(true);
             });
         }
 
@@ -2413,18 +2429,27 @@ impl<'a> BlockCtx<'a> {
             let ps = [info.palette_size_y, info.palette_size_uv];
             // `PaletteColors` 也要按 4×4 铺开：下一块的 `get_palette_cache` 就是
             // 从这里取"上/左调色板"的（UV 只存 U 分量，与规范一致）。
+            //
+            // ⚠️ **只在真的是调色板块时才写**（`ps != [0,0]`）：这一格 32 字节，
+            // 1080p 一帧 13 万个 4×4 格 ⇒ 无条件写就是 **4.2 MB/帧**的白写，而
+            // 真素材里调色板块几乎为零。安全性：**所有**读它的地方都在
+            // `get_palette_cache` 里，且各自被 `palette_sizes[邻居][plane] > 0` 挡着
+            //（`palette_sizes` 仍然无条件写，所以那道门是准的）。
             let pc = [self.palette_colors_y, self.palette_colors_u];
+            let has_palette = ps != [0, 0];
             // `DeltaLF` 的累积值也要按块铺进网格（§7.14.4 去块强度要逐 4×4 读它）
             let dlf = self.delta_lfs;
-            self.grid.stamp(r, c, bsize, move |g, i| {
-                g.is_inters[i] = ii;
-                g.skip_modes[i] = sm;
-                g.skips[i] = sk;
-                g.inter_tx_sizes[i] = tx;
-                g.seg_ids[i] = seg;
-                g.palette_sizes[i] = ps;
-                g.palette_colors[i] = pc;
-                g.delta_lfs[i] = dlf;
+            self.grid.stamp(r, c, bsize, move |g, lo, hi| {
+                g.is_inters[lo..hi].fill(ii);
+                g.skip_modes[lo..hi].fill(sm);
+                g.skips[lo..hi].fill(sk);
+                g.inter_tx_sizes[lo..hi].fill(tx);
+                g.seg_ids[lo..hi].fill(seg);
+                g.palette_sizes[lo..hi].fill(ps);
+                if has_palette {
+                    g.palette_colors[lo..hi].fill(pc);
+                }
+                g.delta_lfs[lo..hi].fill(dlf);
             });
         }
 
@@ -4449,7 +4474,7 @@ impl<'a> BlockCtx<'a> {
             let allow_select = !info.skip || !info.is_inter;
             self.read_tx_size(dec, mi_grid, bsize, lossless, allow_select, info)?;
             let tx = info.tx_size;
-            self.grid.stamp(r, c, bsize, move |g, i| g.inter_tx_sizes[i] = tx);
+            self.grid.stamp(r, c, bsize, move |g, lo, hi| g.inter_tx_sizes[lo..hi].fill(tx));
         }
         Ok(())
     }

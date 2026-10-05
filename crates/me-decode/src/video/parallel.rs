@@ -117,6 +117,20 @@ impl RowsSink {
             }
         }
     }
+    /// **直接写的 `(基址, 步长, 允许行区间)`**（CDEF 的 SIMD 内核按**绝对行号**直接落盘用）。
+    ///
+    /// 存在的理由：CDEF 原来是"内核写 `scratch` → 再 `set_row_i16` 拷进平面"，
+    /// 白付一次**暂存写 + 暂存读**。1080p 一帧 3 平面 × 32400 块 × 8 行 ⇒ 78 万次
+    /// 16 字节的往返。内核本来就按 `(y0+r)*stride + x0` 算地址，直接给它基址即可。
+    ///
+    /// # Safety
+    /// 调用方必须保证所有写入落在 `[y0, y1)` 行内、`x` 在 `[0, stride)` 内
+    /// （debug 构建下 `direct` 的使用点会断言）。
+    #[inline]
+    pub(crate) fn direct(&self) -> (*mut u16, isize, usize, usize) {
+        (self.ptr, self.stride as isize, self.y0, self.y1)
+    }
+
     /// 同 [`Self::set_row`]，但样本是 **i16**（[`super::simd::cdef_pair16`] 的 16 通道
     /// 内核产出：两行 × 8 列一次算完）。
     ///

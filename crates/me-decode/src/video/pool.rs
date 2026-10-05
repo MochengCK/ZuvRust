@@ -170,7 +170,7 @@ pub(crate) fn give(v: Vec<u16>) {
     POOL.with(|p| {
         GAVE.fetch_add(1, Ordering::Relaxed);
         p.borrow_mut().give(v)
-    });;
+    });
 }
 
 /// [`take`] 的 u8 版（8bit 平面的缓冲；契约完全相同）。
@@ -186,7 +186,7 @@ pub(crate) fn give_u8(v: Vec<u8>) {
     if v.capacity() == 0 {
         return;
     }
-    POOL8.with(|p| p.borrow_mut().give(v));;
+    POOL8.with(|p| p.borrow_mut().give(v));
 }
 
 #[cfg(test)]

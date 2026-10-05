@@ -1718,13 +1718,12 @@ fn block_inter_prediction(
                 let out = &mut dst[r * wu..r * wu + wu];
                 let mut c = 0usize;
                 if simd {
-                    while c + simd::LANES <= wu {
-                        // SAFETY: 已判 AVX2；interior 保证 `[x0+c, x0+c+8)` 全在帧内
-                        unsafe {
-                            simd::mc_shift8(row, (x0 + c as i64) as isize, post_round, &mut out[c..])
-                        };
-                        c += simd::LANES;
-                    }
+                    // **整行一次**（2026-10-05）：原来每 8 个像素一次跨 `target_feature`
+                    // 调用，1920 宽的一行要付 240 次函数调用。
+                    // SAFETY: 已判 AVX2；`interior` 保证 `[x0, x0+wu)` 全在帧内。
+                    c = unsafe {
+                        simd::mc_shift_row(row, x0 as isize, post_round, wu, out)
+                    };
                 }
                 while c < wu {
                     let sx = clip(x0 + c as i64, last_x) as usize;

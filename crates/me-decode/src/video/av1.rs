@@ -174,6 +174,10 @@ pub struct Av1Decoder {
     /// ⚠️ 它**不在** `tiles`/`filters` 里 —— 那两段只包 `finish_frame`，
     /// 而网格是在**帧头解析**时就建好的。要算"单帧完整预算"必须把它加进来。
     last_setup_ms: f64,
+    /// `setup` 的三段拆账（grid / ctx / mf），`AV1_PHASE_TIMING` 打出来。
+    last_setup_parts: (f64, f64, f64),
+    /// **跨帧复用的运动场缓冲**（1080p 一份 ≈ 2 MB；每帧新开要走 mmap + 512 次缺页）。
+    mf_buf: Option<MotionField>,
     /// 当前采样的时间戳（显示事件用它，见模块抬头的契约 1）
     sample_pts_us: i64,
     /// 诊断：已解帧数（含 show_existing）
@@ -222,6 +226,8 @@ impl Av1Decoder {
             pending: None,
             grid_pool: None,
             last_setup_ms: 0.0,
+            last_setup_parts: (0.0, 0.0, 0.0),
+            mf_buf: None,
             sample_pts_us: 0,
             frames_parsed: 0,
             tile_frames: 0,
@@ -316,7 +322,12 @@ impl Av1Decoder {
         mi_grid.reset_all(mi_rows, mi_cols);
         let _grid_ms = _t_setup.elapsed().as_secs_f64() * 1e3;
         block_grid.latch_prev_segment_ids();
-        block_grid.reset_frame();
+        // ⚠️ **不要**在这里再调 `reset_frame()`（2026-10-05 删掉）。
+        // `reset_all` 刚刚把 `cdef_idx` / `lf_tx_sizes` / `above|left_seg_pred_ctx` /
+        // `written` **全都重填过一遍**，而 `reset_frame` 填的正是这同一组数组 ⇒
+        // 每帧白写 ≈ 1 MB（cdef_idx 是 i32，1080p 就 0.52 MB）。
+        // `BlockGrid::reset_frame` 这个方法本身留着（语义清楚、单测会用），只是
+        // 生产路径上不再有"连着重置两次"这件事。
         let num_planes = if seq.color.mono_chrome { 1usize } else { 3 };
         let coeff_ctxs = CoeffContexts::new(
             mi_rows,
@@ -332,12 +343,15 @@ impl Av1Decoder {
         // "单帧预算 = setup + tiles + filters" 少算这一块（`MFMV_STACK_SIZE` 个源帧
         // × 全部 8×8 格的投影）。
         let motion_field = if fh.use_ref_frame_mvs && !fh.is_intra {
-            Some(motion_field_estimation(&fh, seq, &self.mf_store))
+            let mut f = self.mf_buf.take().unwrap_or_default();
+            motion_field_estimation(&mut f, &fh, seq, &self.mf_store);
+            Some(f)
         } else {
             None
         };
         let _mf_ms = _t_setup.elapsed().as_secs_f64() * 1e3 - _grid_ms - _ctx_ms;
         self.last_setup_ms = _grid_ms + _ctx_ms + _mf_ms;
+        self.last_setup_parts = (_grid_ms, _ctx_ms, _mf_ms);
         // CDF 上下文：帧内/关键帧用默认表，帧间帧从参考槽整份载入（§7.20）
         let cdf = if fh.primary_ref_frame == PRIMARY_REF_NONE {
             CdfContext::defaults(fh.params.quant.base_q_idx as u32)
@@ -435,7 +449,7 @@ impl Av1Decoder {
         //    `AV1_SYNTAX_ONLY=1` 时跳过滤波（像素是垃圾），但**参考帧槽仍照常更新** ——
         //    后续帧的语法（`is_scaled` / `num_warp_samples` 等）依赖参考帧已就绪，
         //    早退会让那些判据变样、语法跟着错位（踩过：第二个带瓦片的帧就报"多读 2 位"）。
-        let mut lr = if syntax_only {
+        let lr = if syntax_only {
             frame
         } else {
             filters::decode_frame_wrapup(
@@ -513,7 +527,7 @@ impl Av1Decoder {
             if phase_t {
                 let (mc_ms, txb_ms, mark_ms) = super::block::take_replay_dbg();
                 eprintln!(
-                    "PHASE frame={} shown=1 tiles={:.1}ms filters={:.1}ms ref={:.1}ms out={:.1}ms setup={:.1}ms mc={:.1}ms txb={:.1}ms mark={:.1}ms",
+                    "PHASE frame={} shown=1 tiles={:.1}ms filters={:.1}ms ref={:.1}ms out={:.1}ms setup={:.1}ms mc={:.1}ms txb={:.1}ms mark={:.1}ms grid={:.1}ms ctx={:.1}ms mf={:.1}ms",
                     self.frames_parsed,
                     tiles_ms,
                     filters_ms,
@@ -523,6 +537,9 @@ impl Av1Decoder {
                     mc_ms,
                     txb_ms,
                     mark_ms,
+                    self.last_setup_parts.0,
+                    self.last_setup_parts.1,
+                    self.last_setup_parts.2,
                 );
             }
             Some(frame)
@@ -530,14 +547,19 @@ impl Av1Decoder {
             if phase_t {
                 let (mc_ms, txb_ms, mark_ms) = super::block::take_replay_dbg();
                 eprintln!(
-                    "PHASE frame={} shown=0 tiles={:.1}ms filters={:.1}ms ref={:.1}ms setup={:.1}ms mc={:.1}ms txb={:.1}ms mark={:.1}ms",
-                    self.frames_parsed, tiles_ms, filters_ms, ref_ms, self.last_setup_ms, mc_ms, txb_ms, mark_ms
+                    "PHASE frame={} shown=0 tiles={:.1}ms filters={:.1}ms ref={:.1}ms setup={:.1}ms mc={:.1}ms txb={:.1}ms mark={:.1}ms grid={:.1}ms ctx={:.1}ms mf={:.1}ms",
+                    self.frames_parsed, tiles_ms, filters_ms, ref_ms, self.last_setup_ms, mc_ms, txb_ms, mark_ms,
+                    self.last_setup_parts.0, self.last_setup_parts.1, self.last_setup_parts.2,
                 );
             }
             None
         };
         // 网格回池（只增不减；尺寸变了 `reset_all` 会自己调长度）。见 `grid_pool`。
         self.grid_pool = Some((pf.block_grid, pf.mi_grid));
+        // 运动场缓冲也回池（见 `mf_buf`）。
+        if pf.motion_field.is_some() {
+            self.mf_buf = pf.motion_field;
+        }
         Ok(out)
     }
 }

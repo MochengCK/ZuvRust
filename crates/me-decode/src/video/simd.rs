@@ -95,6 +95,44 @@ pub(crate) const LANES: usize = 8;
 /// 改滤波器表或改这个常数，它立刻红。
 pub(crate) const HORIZ16_BIAS: i16 = -16384;
 
+/// 横向内核**收尾**用的两个常数（[`x86::mc_horiz16_8bpc`] 等，2026-10-05 第三十三轮）。
+///
+/// ## 收尾原本在做什么
+///
+/// 带偏置累加之后 `acc = Σ c·s − 16384`（全是 i16 通道），要还原成
+/// `Round2(Σ c·s, n) = (Σ + 2^(n−1)) >> n`。旧写法是
+/// "`cvtepi16_epi32` ×2 → `add_epi32` 抵消偏置 ×2 → `rnd`（`add` + `srai`）×2 →
+/// `packs_epi32` → `permute4x64`"，**11 条指令**，而且 16 个输出要拆成两个
+/// 8 通道的 i32 向量再拼回去。
+///
+/// ## 现在只有 2 条：`pmulhrsw` + `paddw`
+///
+/// `PMULHRSW(a, b) = sat16((a·b + 2¹⁴) >> 15)`。取 `b = 2^(15−n)`（[`horiz_round_mul`]）：
+///
+/// ```text
+///   (acc·2^(15−n) + 2¹⁴) >> 15  ==  (acc + 2^(n−1)) >> n              （n ≤ 14 时整除）
+///                               ==  ((Σ − 2¹⁴) + 2^(n−1)) >> n
+///                               ==  (Σ + 2^(n−1)) >> n − 2^(14−n)     （2¹⁴ 被 2^n 整除）
+/// ```
+///
+/// ⇒ 再加上 [`horiz_round_add`] 就是 `Round2(Σ c·s, n)`。
+///
+/// ⚠️ 是**加**不是减：`acc` 已经比真正的 `Σ` 小了 `2¹⁴`，所以 `pmulhrsw` 的结果
+/// 比目标**小** `2^(14−n)`。写反过一次（`psubw`），`horiz16_matches_scalar_bit_for_bit`
+/// 当场变红 —— 那条单测就是为这种事存在的。
+///
+/// 全程留在 i16：`pmulhrsw` 的饱和分支**永远不触发**（`Σ` 的值域使取整结果落在
+/// `[−1785, 5865]` 附近，再加一个 ≤ 8192 的常数也远在 i16 内）。
+/// 省下的是 9 条指令 / 16 个输出 —— 横向内核整条链从 ~36 条降到 ~20 条。
+pub(crate) const fn horiz_round_mul(round: u32) -> i16 {
+    (1i32 << (15 - round)) as i16
+}
+
+/// 见 [`horiz_round_mul`]：`2^(14−round)` = `16384 >> round`（`round ≤ 14` 时整除）。
+pub(crate) const fn horiz_round_add(round: u32) -> i16 {
+    (16384i32 >> round) as i16
+}
+
 /// CDEF 一个像素的候选样本数：主抽头 `2`（`k`）× `2`（符号）= 4，
 /// 次抽头 `2`（方向 ±2）× `2`（`k`）× `2`（符号）= 8，合计 12（§7.15.3）。
 /// 约定前 4 个是主抽头、后 8 个是次抽头（两组的阈值与阻尼不同）。
@@ -196,10 +234,12 @@ mod x86 {
     ///   永远不溢出，**恰好是误差最大的盲区**。
     ///
     /// 修法：i16 通道改成**带偏置累加**（[`super::HORIZ16_BIAS`]，全程算
-    /// `BIAS + Σ c·s`，展宽到 i32 后 `+16384` 抵消回来）。每个抽头仍是一次
-    /// `mullo_epi16` + `add_epi16`、仍一次覆盖 16 个输出，**指令数一条不多**，
-    /// 而值域被平移到 `[-30664, 30536]`（96 相位 × 8 前缀全值域枚举钉住）⇒
-    /// 与 i32 版/标量**逐位一致**。
+    /// `BIAS + Σ c·s`）。每个抽头仍是一次 `mullo_epi16` + `add_epi16`、仍一次
+    /// 覆盖 16 个输出，值域被平移到 `[-30664, 30536]`（96 相位 × 8 前缀全值域
+    /// 枚举钉住）⇒ 与 i32 版/标量**逐位一致**。
+    ///
+    /// 2026-10-05（第三十三轮）把**收尾**也从 11 条压到 2 条（`pmulhrsw` + `paddw`，
+    /// 推导见 [`super::horiz_round_mul`]）—— 内核整条链 ≈ 20 条 / 16 个输出。
     ///
     /// # Safety
     /// 必须已确认 AVX2 可用；`row` 要覆盖 `[base-3, base+16+4)`、`out.len() >= 16`。
@@ -222,25 +262,70 @@ mod x86 {
             let s = _mm256_loadu_si256(p.offset(base + t as isize - 3) as *const __m256i);
             acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(s, _mm256_set1_epi16(*c)));
         }
-        // 展宽到 i32 后把偏置抵消掉 ⇒ 还原成真正的 Σ c·s（值域 [0, 32640]）。
-        let bias = _mm256_set1_epi32(-(super::HORIZ16_BIAS as i32));
-        let lo = _mm256_add_epi32(
-            _mm256_cvtepi16_epi32(_mm256_castsi256_si128(acc)),
-            bias,
+        // ── 收尾（2026-10-05 第三十三轮）：`pmulhrsw` + `paddw`，2 条指令 ──────
+        //
+        // 原来这里要 `cvtepi16_epi32` ×2 → `add_epi32` ×2（抵消偏置）→ `rnd` ×2
+        // （各 `add` + `srai`）→ `packs_epi32` → `permute4x64`，共 11 条。
+        // 推导见 [`super::horiz_round_mul`]：`PMULHRSW(acc, 2^(15−n))` 恰好等于
+        // `(acc + 2^(n−1)) >> n`，而 `acc = Σ − 2¹⁴` ⇒ 再加上 `2^(14−n)` 就还原成
+        // `Round2(Σ c·s, n)`。全程 i16、无饱和、**与旧实现逐位相同**
+        // （由 `horiz16_matches_scalar_bit_for_bit` 对 96 个相位逐值对拍）。
+        debug_assert!(
+            (1..=14).contains(&round),
+            "pmulhrsw 收尾要求 round ∈ 1..=14（读到 {round}）"
         );
-        let hi = _mm256_add_epi32(
-            _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(acc)),
-            bias,
+        let v = _mm256_add_epi16(
+            _mm256_mulhrs_epi16(acc, _mm256_set1_epi16(super::horiz_round_mul(round))),
+            _mm256_set1_epi16(super::horiz_round_add(round)),
         );
-        // 取整之后**收窄回 i16** 再存（2026-10-04）。8bit 的 `rnd(Σc·s, inter_round0)`
-        // 值域只有 `±4.5e3`（`Σ|c|·255 = 61200`，`>>3` 后 7650，实际系数下更小），
-        // i16 绰绰有余 —— 而这一收窄让**纵向要读的中间量缓存占用直接减半**
-        // （128 宽的块 × (h+7) 行：i32 是 69 KB、超出 L1；i16 只有 34.5 KB）。
-        // dav1d 的 `prep_8tap_c` 用的就是 `int16_t mid[128*135]`。
-        let packed = _mm256_packs_epi32(rnd(lo, round), rnd(hi, round));
-        // `packs_epi32` 按 128 位通道交错（`[lo0..3, hi0..3, lo4..7, hi4..7]`）
-        // ⇒ 用 64 位块重排 `0,2,1,3` 还原成 `[lo0..7, hi0..7]`。
-        let v = _mm256_permute4x64_epi64::<0xD8>(packed);
+        _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, v);
+    }
+
+    /// **横向 8 抽头、u8 源**（16 位通道，**只用于 8bit**）—— 用来量"u8 存储"这条路的
+    /// 真实收益，**结论：不是收益、是代价**。
+    ///
+    /// ## 为什么写它（2026-10-05 把这条算清了）
+    ///
+    /// `AV1-AUDIT.md` 里"8bit 走 u8 存储（~5~10%）"的前置一直写着"MC 横向内核换
+    /// `pmaddubsw`"。真正算一遍之后：
+    ///
+    /// * `pmaddubsw(u8 像素, i8 系数)` 的每一对是 `sat(i16, s·c_a + s'·c_b)`，
+    ///   而 AV1 的 `SUBPEL_FILTERS` 在 **384 个「(相位, 抽头对)」里有 18 个**
+    ///   `|c_a| + |c_b| > 32767/255 = 128.5`（最坏 **138**：
+    ///   `[-2,8,-18,120,26,-10,6,-2]` 的第 2 对，`138·255 = 35190`）⇒ **会饱和 ⇒
+    ///   直接用是错的**。要绕开只能拆抽头 / 加偏置，多出来的指令把"一次算两个抽头"
+    ///   的便宜吃回去。
+    /// * 8bit 的非 δ 相位 `max|c| = 126`（装得进 i8）—— 唯一超过的是 **δ 相位的 128**，
+    ///   而 δ（整像素）本来就走 `mc_shift_row`。⇒ **卡住的不是系数范围，是配对和**。
+    /// * 退一步只把"载入"换成 u8 + `vpmovzxbw`（不做 `pmaddubsw`，就是本函数）：
+    ///   数据 L1 常驻（一行 8 抽头才 256 B），瓶颈是**载入条数**不是字节数 ——
+    ///   u8 版每条只搬 16 B，条数**一模一样**（8 条），却多出 8 条 `vpmovzxbw`
+    ///   ⇒ 纯亏。`bench_mc_kernels` 就是拿它来把这条量出来（同一台机器、同一段时间）。
+    ///
+    /// # Safety
+    /// 必须已确认 AVX2 可用；`row` 覆盖 `[base-3, base+16+4)`、`out.len() >= 16`；
+    /// `round >= 2`（同 [`Self::mc_horiz16_8bpc`]）。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn mc_horiz16_u8(
+        row: &[u8],
+        base: isize,
+        coef: &[i16; 8],
+        round: u32,
+        out: &mut [i16],
+    ) {
+        let p = row.as_ptr();
+        let mut acc = _mm256_set1_epi16(super::HORIZ16_BIAS);
+        for (t, c) in coef.iter().enumerate() {
+            // 一次 16 字节载入 + `vpmovzxbw`（LLVM 会把载入折进这条指令）
+            let s8 = _mm_loadu_si128(p.offset(base + t as isize - 3) as *const __m128i);
+            let s = _mm256_cvtepu8_epi16(s8);
+            acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(s, _mm256_set1_epi16(*c)));
+        }
+        // 收尾同 [`Self::mc_horiz16_8bpc`]（`pmulhrsw` + `paddw`）。
+        let v = _mm256_add_epi16(
+            _mm256_mulhrs_epi16(acc, _mm256_set1_epi16(super::horiz_round_mul(round))),
+            _mm256_set1_epi16(super::horiz_round_add(round)),
+        );
         _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, v);
     }
 
@@ -312,6 +397,35 @@ mod x86 {
         }
     }
 
+    /// 横向 8 抽头的 **8 输出版**（128 位通道）—— 见 [`mc_horiz_rows_8bpc`] 里
+    /// 「为什么需要它」那段。
+    ///
+    /// 语义与 [`mc_horiz16_8bpc`] 的**前 8 个通道**逐位相同（同一条带偏置的
+    /// i16 累加链、同一套 `pmulhrsw` 收尾），只是通道数减半、源样本用
+    /// `_mm_loadu_si128` 读 16 字节。
+    ///
+    /// # Safety
+    /// - 必须已确认 AVX2 可用。
+    /// - `row` 覆盖 `[base - 3, base + 11)` 这 15 个 u16（`row` 必须是**这一行的首
+    ///   地址**，`base` 是输出 `c = 0` 对应的源下标）。
+    /// - `out` 至少 8 项。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn mc_horiz8_8bpc(row: *const u16, base: isize, coef: &[i16; 8], round: u32, out: *mut i16) {
+        let p = row.offset(base - 3);
+        let mut acc = _mm_set1_epi16(super::HORIZ16_BIAS);
+        for (t, c) in coef.iter().enumerate() {
+            // SAFETY: 见函数文档；`t ∈ [0, 8)` ⇒ 最远读到 `base - 3 + 7 + 7 = base + 11`。
+            let s = _mm_loadu_si128(p.add(t) as *const __m128i);
+            acc = _mm_add_epi16(acc, _mm_mullo_epi16(s, _mm_set1_epi16(*c)));
+        }
+        // 收尾同 [`mc_horiz16_8bpc`]（`pmulhrsw` + `paddw`）。
+        let v = _mm_add_epi16(
+            _mm_mulhrs_epi16(acc, _mm_set1_epi16(super::horiz_round_mul(round))),
+            _mm_set1_epi16(super::horiz_round_add(round)),
+        );
+        _mm_storeu_si128(out as *mut __m128i, v);
+    }
+
     /// # Safety
     /// 必须已确认 AVX2 可用；`data` 覆盖所有 `rows[r] * stride + [0, stride)`；
     /// `out` 至少 `rows.len() * wu` 项。
@@ -332,7 +446,14 @@ mod x86 {
         let dp = data.as_ptr();
         let op = out.as_mut_ptr();
         let cv: [__m256i; 8] = std::array::from_fn(|t| _mm256_set1_epi16(coef[t]));
-        let bias = _mm256_set1_epi32(-(super::HORIZ16_BIAS as i32));
+        // 收尾常数（`pmulhrsw` + `paddw`，见 [`super::horiz_round_mul`]）——整块共用，
+        // 不必每个 16 列批次重算。
+        debug_assert!(
+            (1..=14).contains(&round),
+            "pmulhrsw 收尾要求 round ∈ 1..=14（读到 {round}）"
+        );
+        let mul = _mm256_set1_epi16(super::horiz_round_mul(round));
+        let add = _mm256_set1_epi16(super::horiz_round_add(round));
         for (r, &sy) in rows.iter().enumerate() {
             let row = dp.add(sy * stride);
             let out_row = op.add(r * wu);
@@ -345,21 +466,40 @@ mod x86 {
                         let s = _mm256_loadu_si256(p.add(t) as *const __m256i);
                         acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(s, *cvv));
                     }
-                    let lo = _mm256_add_epi32(
-                        _mm256_cvtepi16_epi32(_mm256_castsi256_si128(acc)),
-                        bias,
-                    );
-                    let hi = _mm256_add_epi32(
-                        _mm256_cvtepi16_epi32(_mm256_extracti128_si256::<1>(acc)),
-                        bias,
-                    );
-                    let packed = _mm256_packs_epi32(rnd(lo, round), rnd(hi, round));
                     _mm256_storeu_si256(
                         out_row.add(c) as *mut __m256i,
-                        _mm256_permute4x64_epi64::<0xD8>(packed),
+                        _mm256_add_epi16(_mm256_mulhrs_epi16(acc, mul), add),
                     );
                     c += 16;
                 }
+                // ── 8 宽补一刀（2026-10-05）────────────────────────────────
+                //
+                // 原来这条循环的门槛是 `c + 16 <= wu`，于是**所有 `wu ∈ [8, 16)` 的块
+                // 整段走标量**。4:2:0 下 `BLOCK_16X16` 的色度平面正好 8 宽、
+                // `BLOCK_8X8`/`BLOCK_4X4` 的色度是 4 宽 —— 真素材实测：**64% 的块
+                // 色度宽 < 16**（33.7% 是 8、6.6% 是 4），也就是色度那一路的横向
+                // 滤波原本全是标量。
+                //
+                // 8 个输出从 `base + c - 3` 起读 8 抽头 × 8 元素 ⇒ 最远
+                // `base + c + 11`；而 `c + 8 ≤ wu` ⇒ 最远 `base + wu + 3`，
+                // **正是 `interior_x` 保证的那个界**（不多读一个字节）。
+                while c + 8 <= wu {
+                    // SAFETY: 已判 AVX2；上面那条不等式就是 `mc_horiz8_8bpc` 的前提。
+                    mc_horiz8_8bpc(row, base + c as isize, coef, round, out_row.add(c));
+                    c += 8;
+                }
+                // 不钳位的标量尾：`interior_x` 已经保证 `[base-3, base+wu+3]` 全在帧内，
+                // 逐样本 `clamp` 是白做（那是给**边界块**用的）。
+                while c < wu {
+                    let bc = base + c as isize - 3;
+                    let mut s = 0i32;
+                    for (t, k) in coef.iter().enumerate() {
+                        s += *k as i32 * i32::from(*row.offset(bc + t as isize));
+                    }
+                    *out_row.add(c) = rnd_scalar(s, round) as i16;
+                    c += 1;
+                }
+                continue;
             }
             while c < wu {
                 let bc = base + c as isize;
@@ -720,6 +860,47 @@ mod x86 {
         _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, v);
     }
 
+    /// [`mc_shift8`] 的**整行版**（2026-10-05）。
+    ///
+    /// 原来调用方是"每 8 个像素调一次 `mc_shift8`"—— 而 `#[target_feature]` 函数
+    /// **不能被没有该 feature 的调用方内联**，于是整像素 MV 那条路上每一行要付
+    /// `1920/8 = 240` 次真实函数调用（含序言/尾声/参数搬运）。把行循环搬进来之后
+    /// 内层只剩 load / widen / shift / store。
+    ///
+    /// 语义与逐段调用 `mc_shift8` **逐位相同**（同一段代码、同一个 `post_round` 分支）。
+    ///
+    /// # Safety
+    /// 必须已确认 AVX2 可用；`row` 覆盖 `[base, base + n)`；`out` 至少 `n` 项。
+    /// 返回**实际用 SIMD 处理掉的个数**（`n` 向下取到 8 的倍数），余数留给调用方标量。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn mc_shift_row(
+        row: &[u16],
+        base: isize,
+        post_round: u32,
+        n: usize,
+        out: &mut [i32],
+    ) -> usize {
+        let p = row.as_ptr();
+        let o = out.as_mut_ptr();
+        let mut c = 0usize;
+        while c + 8 <= n {
+            // SAFETY: 见函数文档；`c + 8 <= n` ⇒ 读 `[base+c, base+c+8) ⊂ [base, base+n)`。
+            let s16 = _mm_loadu_si128(p.offset(base + c as isize) as *const __m128i);
+            let s32 = _mm256_cvtepu16_epi32(s16);
+            let v = match post_round {
+                0 => s32,
+                1 => _mm256_slli_epi32::<1>(s32),
+                2 => _mm256_slli_epi32::<2>(s32),
+                3 => _mm256_slli_epi32::<3>(s32),
+                4 => _mm256_slli_epi32::<4>(s32),
+                _ => s32,
+            };
+            _mm256_storeu_si256(o.add(c) as *mut __m256i, v);
+            c += 8;
+        }
+        c
+    }
+
     /// **CDEF**（§7.15.3）一次滤完**两行**（16 个 **i16** 通道 = 2 行 × 8 列）。
     ///
     /// 一个像素要取 12 个候选（主抽头 2×2 + 次抽头 2 方向×2×2），每个候选都要
@@ -753,7 +934,8 @@ mod x86 {
     /// - 必须已确认 AVX2 可用。
     /// - 对每个 `r ∈ [0, h)`、每个 `c ∈ [0, 12)`，
     ///   `data` 必须覆盖 `((y0+r)·stride + x0 + offs[c]) .. + 8 个 u16`。
-    /// - `out.len() >= h · wu`，`wu ∈ {4, 8}`。
+    /// - `dst` 覆盖 `((y0+h-1)·dst_stride + x0) .. + wu 个 u16`（**就地写目标平面**；
+    ///   `dst_stride` 通常是平面 stride，`x0` 是平面内的绝对列）。
     /// - `adj` 必须 < 16（`_mm256_sra_epi16` 的语义要求；调用方给的
     ///   `damping_adj ≤ damping ≤ 11`，且 `mag < 2^16` ⇒ 16 位以上的移位两边同为 0）。
     #[target_feature(enable = "avx2")]
@@ -771,7 +953,8 @@ mod x86 {
         pri_adj: u32,
         sec_thr: i32,
         sec_adj: u32,
-        out: &mut [i16],
+        dst: *mut u16,
+        dst_stride: isize,
     ) {
         debug_assert!(wu == 4 || wu == 8);
         let base = data.as_ptr();
@@ -784,7 +967,6 @@ mod x86 {
         let sec_s = _mm_cvtsi32_si128(sec_adj as i32);
         let tap_v: [__m256i; super::CDEF_CANDS] =
             std::array::from_fn(|c| _mm256_set1_epi16(taps[c] as i16));
-        let op = out.as_mut_ptr();
         let mut r = 0usize;
         while r < h {
             // `h` 为奇数时最后一行只算一次（高半读同一行）、只写一次。
@@ -828,20 +1010,132 @@ mod x86 {
             // `Clip3(min, max, v)`：min/max 都来自合法样本 ⇒ 结果自然在 [0, 2^bd) 内
             let v = _mm256_min_epi16(_mm256_max_epi16(v, mn), mx);
             let lo = _mm256_castsi256_si128(v);
-            let hi = _mm256_extracti128_si256::<1>(v);
-            let dst = op.add(r * wu);
+            let dst0 = dst.offset((y0 + r as isize) * dst_stride + x0);
             if wu == 8 {
-                _mm_storeu_si128(dst as *mut __m128i, lo);
+                _mm_storeu_si128(dst0 as *mut __m128i, lo);
                 if r + 1 < h {
-                    _mm_storeu_si128(dst.add(8) as *mut __m128i, hi);
+                    _mm_storeu_si128(
+                        dst.offset((y0 + r1 as isize) * dst_stride + x0) as *mut __m128i,
+                        _mm256_extracti128_si256::<1>(v),
+                    );
                 }
             } else {
-                _mm_storel_epi64(dst as *mut __m128i, lo);
+                _mm_storel_epi64(dst0 as *mut __m128i, lo);
                 if r + 1 < h {
-                    _mm_storel_epi64(dst.add(4) as *mut __m128i, hi);
+                    _mm_storel_epi64(
+                        dst.offset((y0 + r1 as isize) * dst_stride + x0) as *mut __m128i,
+                        _mm256_extracti128_si256::<1>(v),
+                    );
                 }
             }
             r += 2;
+        }
+    }
+
+    /// **CDEF**（§7.15.3）一次滤完**四行 × 四列**（16 个 i16 通道，**全部用满**）。
+    ///
+    /// ## 为什么色度要单独一条（2026-10-05 第三十五轮）
+    ///
+    /// [`cdef_pair16`] 一次算 **2 行 × 8 列**。亮度块正好 8×8 ⇒ 16 个通道
+    /// **全部用满**；而 4:2:0 的**色度块只有 4×4**（`w = h = 4`）⇒ 那 16 个通道里
+    /// **只有 8 个有用**（另外 8 个读到的是右边的样本、算完直接丢弃）——
+    /// **一半的算力白花**，而色度恰好占 CDEF 内核时间的一半
+    /// （每平面 `h/2 = 2` 次迭代 × 2 个平面 = 与亮度同样的 4 次）。
+    ///
+    /// 本函数把 **4 行 × 4 列**塞进同一个 256 位寄存器（4 个 qword，每个 qword 是
+    /// 一行的 4 个 u16）⇒ 16 个通道**全部有用**，迭代次数从 `h/2` 降到 `h/4`。
+    /// 每个候选的取址从"两次 128 位载入 + 拼接"变成"四次 64 位载入 + 拼接"，
+    /// **指令条数不变、每次迭代多产出一倍**。
+    ///
+    /// 逐条与 [`cdef_pair16`] 相同（同一个 `constrain` 展开、同一个 `Clip3`），
+    /// 判据是 `cdef_quad8_matches_cdef_pair16` 对 8 个方向 × 随机数据逐像素对拍。
+    ///
+    /// # Safety
+    /// - 必须已确认 AVX2 可用。
+    /// - `h` 必须是 **4**（本函数不算尾行）。
+    /// - 对每个 `c ∈ [0, 12)`、`j ∈ [0, 4)`，
+    ///   `data` 必须覆盖 `((y0+j)·stride + x0 + offs[c]) .. + 4 个 u16`
+    ///   （`cdef_pair16` 要求同样的地址上可读 **8** 个 ⇒ 本要求**更弱**）。
+    /// - `dst` 覆盖 `((y0+3)·dst_stride + x0) .. + 4 个 u16`。
+    /// - `adj` 必须 < 16（同 `cdef_pair16`）。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn cdef_quad8(
+        data: &[u16],
+        stride: isize,
+        x0: isize,
+        y0: isize,
+        offs: &[isize; super::CDEF_CANDS],
+        taps: &[i32; super::CDEF_CANDS],
+        pri_thr: i32,
+        pri_adj: u32,
+        sec_thr: i32,
+        sec_adj: u32,
+        dst: *mut u16,
+        dst_stride: isize,
+    ) {
+        debug_assert!(super::CDEF_CANDS == 12, "本内核按 12 个候选写死");
+        let base = data.as_ptr();
+        let zero = _mm256_setzero_si256();
+        let one = _mm256_set1_epi16(1);
+        let eight = _mm256_set1_epi16(8);
+        let pri_t = _mm256_set1_epi16(pri_thr as i16);
+        let sec_t = _mm256_set1_epi16(sec_thr as i16);
+        let pri_s = _mm_cvtsi32_si128(pri_adj as i32);
+        let sec_s = _mm_cvtsi32_si128(sec_adj as i32);
+        let tap_v: [__m256i; super::CDEF_CANDS] =
+            std::array::from_fn(|c| _mm256_set1_epi16(taps[c] as i16));
+        // 把 4 行（每行 4 个 u16）拼成一个 256 位向量：qword `j` = 行 `j`。
+        // `lin` 是**相对块左上角**的线性偏移（候选位移就在这个尺度上），
+        // 所以基准地址要带上 `y0·stride` —— 漏掉它就读成第 0..3 行了
+        // （第一版就这样错的，被 `cdef_quad8_matches_cdef_pair16_bit_for_bit` 抓住）。
+        let gather = |lin: isize| -> __m256i {
+            let o = x0 + y0 * stride + lin;
+            _mm256_set_epi64x(
+                _mm_cvtsi128_si64(_mm_loadl_epi64(
+                    base.offset(o + 3 * stride) as *const __m128i
+                )),
+                _mm_cvtsi128_si64(_mm_loadl_epi64(
+                    base.offset(o + 2 * stride) as *const __m128i
+                )),
+                _mm_cvtsi128_si64(_mm_loadl_epi64(
+                    base.offset(o + stride) as *const __m128i
+                )),
+                _mm_cvtsi128_si64(_mm_loadl_epi64(base.offset(o) as *const __m128i)),
+            )
+        };
+        let cur = gather(0);
+        let mut acc = zero;
+        let mut mx = cur;
+        let mut mn = cur;
+        for c in 0..super::CDEF_CANDS {
+            let (thr, sh) = if c < 4 { (pri_t, pri_s) } else { (sec_t, sec_s) };
+            let cand = gather(offs[c]);
+            // `constrain( cand - cur, thr, adj )`（§7.15.3），与 `cdef_pair16` 同式。
+            let diff = _mm256_sub_epi16(cand, cur);
+            let mag = _mm256_abs_epi16(diff);
+            let t = _mm256_sub_epi16(thr, _mm256_sra_epi16(mag, sh));
+            let t = _mm256_max_epi16(_mm256_min_epi16(t, mag), zero);
+            let val = _mm256_sign_epi16(t, diff);
+            acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(val, tap_v[c]));
+            mx = _mm256_max_epi16(mx, cand);
+            mn = _mm256_min_epi16(mn, cand);
+        }
+        let adjust = _mm256_and_si256(_mm256_cmpgt_epi16(zero, acc), one);
+        let v = _mm256_add_epi16(
+            cur,
+            _mm256_srai_epi16::<4>(_mm256_add_epi16(_mm256_sub_epi16(eight, adjust), acc)),
+        );
+        let v = _mm256_min_epi16(_mm256_max_epi16(v, mn), mx);
+        // 写回：4 行 × 4 个 u16，每个 qword 一行。
+        let lo = _mm256_castsi256_si128(v);
+        let hi = _mm256_extracti128_si256::<1>(v);
+        let q = [lo, _mm_unpackhi_epi64(lo, lo), hi, _mm_unpackhi_epi64(hi, hi)];
+        for (j, qq) in q.iter().enumerate() {
+            _mm_storel_epi64(
+                dst.offset((y0 + j as isize) * dst_stride + x0) as *mut __m128i,
+                *qq,
+            );
         }
     }
 
@@ -1413,6 +1707,54 @@ mod x86 {
         vt_srai(vt_add(v, _mm256_set1_epi64x(1i64 << (n - 1))), n)
     }
 
+    /// `v >> N`（**算术**右移，`N` 是编译期常量）—— **3 条**指令，比 [`vt_srai`] 少 2 条。
+    ///
+    /// ## 怎么来的（2026-10-05）
+    ///
+    /// AVX2 没有 `srai_epi64`。[`vt_srai`] 的写法是"把符号位复制到整个通道、
+    /// 逻辑右移、再或回去"：`shuffle_epi32` + `sllv_epi64` + `srlv_epi64` + `or`
+    /// = **5 条**（其中两条还是**变量**移位）。
+    ///
+    /// 换个角度：**一个 i64 就是两个 i32**，而 32 位有 `srai_epi32`。
+    /// 结果的高 32 位恰好是 `hi >> N` 的**算术**值（`srai_epi32` 一条搞定），
+    /// 低 32 位恰好是"逻辑 64 位右移"的低半（`srli_epi64` 一条搞定）⇒
+    /// 两者按 32 位半字 `blend` 一下就行。
+    ///
+    /// ⚠️ **第一版写错过**：想当然写成 `(v << (64-N)) >> (64-N)` —— 那其实是
+    /// **逻辑**右移（左移把符号位丢掉了），负数全错。是 `ME_THREADS=1` 的
+    /// **逐字节对拍**在第一次构建后就抓出来的；现在这条由
+    /// `vt_srai_const_matches_arithmetic_shift` 对着 **Rust 自己的 `>>`** 逐值对拍。
+    ///
+    /// ⚠️ `N` 必须 ∈ `1..=31`（`srai_epi32` 的立即数上限；生产里最大是 12）。
+    /// `SHL`（= `64 - N`）只用来断言互补，**由调用方传** —— stable Rust 还不允许
+    /// 在 const 泛型里做算术。
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn vt_srai_c<const N: i32, const SHL: i32>(v: __m256i) -> __m256i {
+        debug_assert_eq!(N + SHL, 64, "vt_srai_c 的两个常量必须互补");
+        debug_assert!((1..=31).contains(&N), "vt_srai_c 的移位量必须在 1..=31");
+        // 一个 i64 = 两个 i32：`srli_epi64` 给出**正确**的低 32 位，
+        // `srai_epi32` 给出**正确**的高 32 位（低 32 位无意义），按半字拼起来。
+        _mm256_blend_epi32::<0xAA>(_mm256_srli_epi64::<N>(v), _mm256_srai_epi32::<N>(v))
+    }
+
+    /// [`vt_round2`] 的**常量移位**版：`(v + (1 << (N-1))) >> N`。语义逐位相同。
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn vt_round2_c<const N: i32, const SHL: i32>(v: __m256i) -> __m256i {
+        vt_srai_c::<N, SHL>(vt_add(v, _mm256_set1_epi64x(1i64 << (N - 1))))
+    }
+
+    /// 单测入口：把 [`vt_srai_c`] 的效果摊成 4 个 `i64`（`mod tests` 在 `x86` 外面，
+    /// 拿不到这个私有函数，也不想为它放宽可见性）。
+    #[cfg(test)]
+    pub(crate) unsafe fn vt_srai_c_probe<const N: i32, const SHL: i32>(v: [i64; 4]) -> [i64; 4] {
+        let x = _mm256_loadu_si256(v.as_ptr() as *const __m256i);
+        let mut o = [0i64; 4];
+        _mm256_storeu_si256(o.as_mut_ptr() as *mut __m256i, vt_srai_c::<N, SHL>(x));
+        o
+    }
+
     /// `Clip3( lo, hi, v )`（64 位有符号比较；`cmpgt_epi64` + `blendv`）。
     #[inline]
     #[target_feature(enable = "avx2")]
@@ -1433,8 +1775,8 @@ mod x86 {
         );
         let x = _mm256_sub_epi64(vt_mul(v[a], c), vt_mul(v[b], s));
         let y = _mm256_add_epi64(vt_mul(v[a], s), vt_mul(v[b], c));
-        v[a] = vt_round2(x, 12);
-        v[b] = vt_round2(y, 12);
+        v[a] = vt_round2_c::<12, 52>(x);
+        v[b] = vt_round2_c::<12, 52>(y);
         if flip {
             v.swap(a, b);
         }
@@ -1497,7 +1839,7 @@ mod x86 {
             vt_sub(vt_add(s[0], s[1]), s[3]),
         ];
         for (k, slot) in v[..4].iter_mut().enumerate() {
-            *slot = vt_round2(x[k], 12);
+            *slot = vt_round2_c::<12, 52>(x[k]);
         }
         let _ = r;
     }
@@ -1826,7 +2168,7 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
         match n {
             2 => {
                 for slot in v[..4].iter_mut() {
-                    *slot = vt_round2(vt_mul(*slot, 5793), 12);
+                    *slot = vt_round2_c::<12, 52>(vt_mul(*slot, 5793));
                 }
             }
             3 => {
@@ -1836,7 +2178,7 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
             }
             4 => {
                 for slot in v[..16].iter_mut() {
-                    *slot = vt_round2(vt_mul(*slot, 11586), 12);
+                    *slot = vt_round2_c::<12, 52>(vt_mul(*slot, 11586));
                 }
             }
             5 => {
@@ -2139,7 +2481,7 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
             // 1:2 长方块的预缩放（§7.13.3：`Round2( *2896, 12 )`）
             if rect_prescale {
                 for slot in v[..w].iter_mut() {
-                    *slot = vt_round2(vt_mul(*slot, 2896), 12);
+                    *slot = vt_round2_c::<12, 52>(vt_mul(*slot, 2896));
                 }
             }
             if lossless {
@@ -2152,7 +2494,13 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
             while j + 4 <= w {
                 let rows = vt_transpose4([v[j], v[j + 1], v[j + 2], v[j + 3]]);
                 for (k, row) in rows.iter().enumerate() {
-                    let o = vt_round2(*row, row_shift);
+                    // `row_shift ∈ {0, 1, 2}`（`TRANSFORM_ROW_SHIFT`）⇒ 全都能常量展开
+                    let o = match row_shift {
+                        0 => *row,
+                        1 => vt_round2_c::<1, 63>(*row),
+                        2 => vt_round2_c::<2, 62>(*row),
+                        other => vt_round2(*row, other),
+                    };
                     _mm256_storeu_si256(
                         data.as_mut_ptr().add((i + k) * w + j) as *mut __m256i,
                         o,
@@ -2194,7 +2542,12 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
                 vt_forward_1d(kind, &mut v[..h], log2_h, r);
             }
             for (i, slot) in v[..h].iter().enumerate() {
-                let o = vt_round2(*slot, col_shift);
+                // `col_shift ∈ {0, 4}`（`transform.rs`：无损 0、其余 4）⇒ 常量展开
+                let o = match col_shift {
+                    0 => *slot,
+                    4 => vt_round2_c::<4, 60>(*slot),
+                    other => vt_round2(*slot, other),
+                };
                 _mm256_storeu_si256(data.as_mut_ptr().add(i * w + j) as *mut __m256i, o);
             }
             j += 4;
@@ -2296,13 +2649,19 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
 
 }
 
+// 这份重导出是**给单测/微基准留的入口**：`inter.rs` 的 `block_inter_prediction`
+// 现在都走"整块版"内核，于是 `mc_horiz16_8bpc` / `mc_delta8` / `mc_shift8` / `mc_vert8`
+// 在非 test 构建里没有生产调用点。去掉重导出会把它们变成 `never used` 的 dead_code
+// 警告（噪声更大），所以这里留着并显式放行。
 #[cfg(target_arch = "x86_64")]
+#[allow(unused_imports)]
 pub(crate) use x86::{
     diffwtd_mask8,
-    cdef_pair16, deblock_edge4, inv_txfm_cols, inv_txfm_rows, mc_delta8, mc_horiz16_8bpc,
-    blend_avg8, blend_dist8, blend_masked8, blend_masked_u16in8, mc_horiz8, mc_horiz_rows_8bpc,
-    mc_shift8, mc_vert8, mc_vert_rows_8bpc, sgr_ab_8, sgr_cols_update8, sgr_final_8,
-    store_row_clamped, wiener_horiz_rows, wiener_vert_row,
+    cdef_pair16, cdef_quad8, deblock_edge4, inv_txfm_cols, inv_txfm_rows,
+    blend_avg8, blend_dist8, blend_masked8, blend_masked_u16in8, mc_delta8, mc_horiz8,
+    mc_horiz16_8bpc, mc_horiz16_u8, mc_horiz_rows_8bpc, mc_shift8, mc_shift_row, mc_vert8,
+    mc_vert_rows_8bpc,
+    sgr_ab_8, sgr_cols_update8, sgr_final_8, store_row_clamped, wiener_horiz_rows, wiener_vert_row,
 };
 
 /// 非 x86_64：没有 AVX2 内核，`avx2_available()` 恒为 false ⇒ 这两个入口
@@ -2336,6 +2695,16 @@ pub(crate) unsafe fn mc_horiz16_8bpc(
 ) {
 }
 #[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn mc_horiz16_u8(
+    _row: &[u8],
+    _base: isize,
+    _coef: &[i16; 8],
+    _round: u32,
+    _out: &mut [i16],
+) {
+}
+#[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn store_row_clamped(_dst: *mut u16, _src: &[i32], _n: usize, _max: i32) {}
 
 /// 非 x86_64 的 CDEF 桩（`avx2_available()` 恒假 ⇒ 调用方走标量）。
@@ -2354,7 +2723,27 @@ pub(crate) unsafe fn cdef_pair16(
     _pri_adj: u32,
     _sec_thr: i32,
     _sec_adj: u32,
-    _out: &mut [i16],
+    _dst: *mut u16,
+    _dst_stride: isize,
+) {
+}
+
+/// 非 x86_64 的 CDEF 4×4 桩（见 [`cdef_pair16`] 的同名桩）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cdef_quad8(
+    _data: &[u16],
+    _stride: isize,
+    _x0: isize,
+    _y0: isize,
+    _offs: &[isize; CDEF_CANDS],
+    _taps: &[i32; CDEF_CANDS],
+    _pri_thr: i32,
+    _pri_adj: u32,
+    _sec_thr: i32,
+    _sec_adj: u32,
+    _dst: *mut u16,
+    _dst_stride: isize,
 ) {
 }
 
@@ -2590,6 +2979,18 @@ pub(crate) unsafe fn diffwtd_mask8(
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn mc_shift8(_row: &[u16], _base: isize, _post_round: u32, _out: &mut [i32]) {}
 
+/// 非 x86_64 的 [`mc_shift_row`] 桩：返回 0（一个也没用 SIMD 处理）⇒ 全走标量。
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn mc_shift_row(
+    _row: &[u16],
+    _base: isize,
+    _post_round: u32,
+    _n: usize,
+    _out: &mut [i32],
+) -> usize {
+    0
+}
+
 /// 非 x86_64 的横向 8 通道桩（`avx2_available()` 恒假 ⇒ 标量抽头累加）。
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
@@ -2616,6 +3017,116 @@ mod tests {
     /// 非 x86_64 平台上没有这个内核（`avx2_available()` 恒假，调用方直接走标量），
     /// 标量路径本身由解码用例 + `ME_NO_SIMD` 对拍覆盖。
     #[cfg(target_arch = "x86_64")]
+    /// `mc_horiz16_u8`（u8 源 + `vpmovzxbw`）必须与 u16 版**逐位一致**。
+    ///
+    /// 这是"8bit 走 u8 存储"那条路的安全性论证：两者做的是**同一串 16 位算术**，
+    /// 只是载入宽度不同 ⇒ 只要源样本相同，输出必须逐位相同。有了这条，
+    /// 后面真去迁移存储时可以放心用 `ME_PLANE_U8` 开/关做逐字节对拍。
+    #[cfg(target_arch = "x86_64")]
+    /// `vt_srai_c`（**3 条**）必须与**算术右移**逐值相同。
+    ///
+    /// 参照系直接用 Rust 自己的 `i64 >> n`（那就是算术右移），比"跟另一份 SIMD 实现
+    /// 对拍"更强：不会两个都错还互相印证。
+    ///
+    /// ## 为什么这条单测是**必需**的
+    ///
+    /// 第一版把 `(v << (64-N)) >> (64-N)` 当成算术右移 —— 那其实是**逻辑**右移，
+    /// 负数全错。`ME_THREADS=1` 的逐字节对拍在第一次构建后就把它抓出来了；
+    /// 这条单测是"再快也不会漏"的那一道闸。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn vt_srai_const_matches_arithmetic_shift() {
+        if !avx2_available() {
+            return;
+        }
+        // 覆盖值域：0、±1、±(2^k)、i64::MIN/MAX 附近的若干组合
+        let mut vals: Vec<i64> = vec![
+            0,
+            1,
+            -1,
+            2,
+            -2,
+            i64::MIN,
+            i64::MAX,
+            i64::MIN + 1,
+            i64::MAX - 1,
+            i64::MIN / 2,
+            i64::MAX / 2,
+            -(1i64 << 62),
+            (1i64 << 62) - 1,
+            123456789012345,
+            -987654321098765,
+        ];
+        for k in 0..63 {
+            vals.push(1i64 << k);
+            vals.push(-(1i64 << k));
+            vals.push((1i64 << k) - 1);
+            vals.push(-(1i64 << k) + 1);
+        }
+        for n in 1..=31u32 {
+            for chunk in vals.chunks(4) {
+                let mut input = [0i64; 4];
+                for (k, slot) in input.iter_mut().enumerate() {
+                    *slot = chunk.get(k).copied().unwrap_or(0);
+                }
+                // 参照系 = **Rust 自己的 `>>`**（就是算术右移）—— 比"跟另一份 SIMD
+                // 实现对拍"更强：两份实现同时错还会互相印证。
+                let want: [i64; 4] = std::array::from_fn(|k| input[k] >> n);
+                // SAFETY: 已判 AVX2；生产只用到 1/2/4/12，这里再多验几档，
+                // 其余档位用标量右移顶一下让循环完整。
+                let got = unsafe {
+                    match n {
+                        1 => x86::vt_srai_c_probe::<1, 63>(input),
+                        2 => x86::vt_srai_c_probe::<2, 62>(input),
+                        3 => x86::vt_srai_c_probe::<3, 61>(input),
+                        4 => x86::vt_srai_c_probe::<4, 60>(input),
+                        5 => x86::vt_srai_c_probe::<5, 59>(input),
+                        8 => x86::vt_srai_c_probe::<8, 56>(input),
+                        12 => x86::vt_srai_c_probe::<12, 52>(input),
+                        16 => x86::vt_srai_c_probe::<16, 48>(input),
+                        31 => x86::vt_srai_c_probe::<31, 33>(input),
+                        _ => std::array::from_fn(|k| input[k] >> n),
+                    }
+                };
+                assert_eq!(got, want, "n={n} input={input:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn mc_horiz16_u8_matches_the_u16_version_bit_for_bit() {
+        if !avx2_available() {
+            return;
+        }
+        let stride = 140usize;
+        let rows = 8usize;
+        // 造一段带高低对比的样本（纯常量会掩盖取整/饱和类错误）
+        let row16: Vec<u16> = (0..stride * rows)
+            .map(|i| (((i * 37 + 11) % 256) as u16).min(255))
+            .collect();
+        let row8: Vec<u8> = row16.iter().map(|v| *v as u8).collect();
+        let filters: [[i16; 8]; 4] = [
+            [0, 0, 0, 128, 0, 0, 0, 0],
+            [-4, 12, -24, 80, 80, -24, 12, -4],
+            [-2, 8, -18, 120, 26, -10, 6, -2],
+            [1, -5, 20, 112, 12, -4, 1, 0],
+        ];
+        for (f, coef) in filters.iter().enumerate() {
+            for round in 3u32..=5 {
+                for base in 3isize..=96 {
+                    let mut a = [0i16; 16];
+                    let mut b = [0i16; 16];
+                    // SAFETY: 已判 AVX2；base ≤ 96 ⇒ 读 [base-3, base+20) ⊂ 8 行 × 140
+                    unsafe {
+                        mc_horiz16_8bpc(&row16, base, coef, round, &mut a);
+                        mc_horiz16_u8(&row8, base, coef, round, &mut b);
+                    }
+                    assert_eq!(a, b, "filter={f} round={round} base={base}");
+                }
+            }
+        }
+    }
+
     #[test]
     fn diffwtd_mask8_matches_the_two_step_formula() {
         if !avx2_available() {
@@ -2693,13 +3204,69 @@ mod tests {
         let mut sink = 0i64;
         let t = std::time::Instant::now();
         for i in 0..iters {
-            let base = std::hint::black_box((i % 64) as isize);
-            // SAFETY: 已判 AVX2；base ∈ [0,63] ⇒ 读 [base-3, base+20) ⊂ 140
+            // ⚠️ `base ≥ 3`（旧版从 0 起，`base-3` 是负下标 —— 这条基准本身是 UB）
+            let base = std::hint::black_box((i % 64) as isize + 3);
+            // SAFETY: 已判 AVX2；base ∈ [3, 66] ⇒ 读 [base-3, base+20) ⊂ 140
             unsafe { mc_horiz16_8bpc(&row, base, &coef, 3, &mut out16) };
             sink += out16[black_box(0)] as i64;
         }
         let ns = t.elapsed().as_secs_f64() * 1e9 / (iters as f64);
         eprintln!("mc_horiz16_8bpc   {:.2} ns/调用 = {:.3} ns/像素 (sink={sink})", ns, ns / 16.0);
+
+        // 横向：**u8 源**的同一条内核（`vpmovzxbw` 加宽，不做 `pmaddubsw`）。
+        // 用来量"8bit 走 u8 存储"对 MC 横向的真实价值 —— 见内核文档的推导。
+        let row8: Vec<u8> = row.iter().map(|v| *v as u8).collect();
+        let mut out16u8 = [0i16; 16];
+        let mut sink_u8 = 0i64;
+        let t = std::time::Instant::now();
+        for i in 0..iters {
+            let base = std::hint::black_box((i % 64) as isize + 3);
+            // SAFETY: 已判 AVX2；base ∈ [3, 66] ⇒ 读 [base-3, base+20) ⊂ 140
+            unsafe { mc_horiz16_u8(&row8, base, &coef, 3, &mut out16u8) };
+            sink_u8 += out16u8[black_box(0)] as i64;
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / (iters as f64);
+        eprintln!(
+            "mc_horiz16_u8     {:.2} ns/调用 = {:.3} ns/像素 (sink={sink_u8})",
+            ns,
+            ns / 16.0
+        );
+
+        // 横向：一次 **8** 个输出（2026-10-05 新增的 8 宽内核）。
+        // 和上面那条比 `ns/像素` 才有意义 —— 两者做的是同一件事的不同宽度。
+        let mut out8 = [0i16; 8];
+        let mut sink8 = 0i64;
+        let t = std::time::Instant::now();
+        for i in 0..iters {
+            // ⚠️ `base ≥ 3`：内核从 `base - 3` 起读，base = 0 会越界（旧版这条基准有这个问题）
+            let base = std::hint::black_box((i % 64) as isize + 3);
+            // SAFETY: 已判 AVX2；base ∈ [3, 66] ⇒ 读 [base-3, base+12) ⊂ 140
+            unsafe { x86::mc_horiz8_8bpc(row.as_ptr(), base, &coef, 3, out8.as_mut_ptr()) };
+            sink8 += out8[black_box(0)] as i64;
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / (iters as f64);
+        eprintln!("mc_horiz8_8bpc    {:.2} ns/调用 = {:.3} ns/像素 (sink={sink8})", ns, ns / 8.0);
+
+        // 标量参照：同一件事的 8 输出标量写法（= `mc_horiz_rows_8bpc` 的尾循环，
+        // 也是 `wu ∈ [8,16)` 的块在改动**之前**走的唯一一条路）。
+        let mut sink_sc = 0i64;
+        let t = std::time::Instant::now();
+        for i in 0..iters {
+            // ⚠️ `base ≥ 3`：标量尾循环里 `bc - 3` 会读到 `base-3`，base=0 时越界
+            let base = std::hint::black_box((i % 64) as isize + 3);
+            let mut o = [0i16; 8];
+            for (c, slot) in o.iter_mut().enumerate() {
+                let bc = base + c as isize - 3;
+                let mut s = 0i32;
+                for (t, k) in coef.iter().enumerate() {
+                    s += *k as i32 * i32::from(row[(bc + t as isize) as usize]);
+                }
+                *slot = rnd_scalar(s, 3) as i16;
+            }
+            sink_sc += o[black_box(0)] as i64;
+        }
+        let ns = t.elapsed().as_secs_f64() * 1e9 / (iters as f64);
+        eprintln!("横向标量(8 输出)  {:.2} ns/调用 = {:.3} ns/像素 (sink={sink_sc})", ns, ns / 8.0);
 
         // 纵向：一次 16 个输出（i16 中间量）
         let inter: Vec<i16> = (0..stride * rows).map(|i| (i % 300) as i16).collect();
@@ -3106,7 +3673,8 @@ mod tests {
         let iters = 400_000usize;
         let (pri_thr, sec_thr, adj) = (32i32, 8i32, 1u32);
         let mut out_i32 = [0i32; 8 * LANES];
-        let mut out_i16 = [0i16; 8 * 8];
+        // 目标缓冲与源同 stride（内核按 `(y0+r)*dst_stride + x0` 写，`x0 = 8`）
+        let mut out_i16 = vec![0u16; stride * rows];
         let mut best_new = f64::MAX;
         let mut best_old = f64::MAX;
         for _ in 0..3 {
@@ -3127,7 +3695,8 @@ mod tests {
                         adj,
                         sec_thr,
                         adj,
-                        &mut out_i16,
+                        out_i16.as_mut_ptr(),
+                        stride as isize,
                     )
                 });
             }
@@ -3232,15 +3801,19 @@ mod tests {
                         }
                     }
                 }
-                let mut got = vec![0i16; h * wu];
+                // ⚠️ 目标缓冲必须与**源同 stride、同 x0/y0 约定** —— 内核按
+                // `(y0+r)*dst_stride + x0` 算地址，`x0 = 8` 意味着最小宽度要 ≥ 17。
+                // 一开始写成 `h*wu` + `dst_stride = wu` 就越界了（单测当场 SIGSEGV）。
+                let mut dst_buf = vec![0u16; stride * rows];
                 // SAFETY: 已判 AVX2；(x0,y0)=(8,8)、h≤8、候选 ±2 ⇒ 最远读到 (x0+9, y0+9)，
-                // 都在 40×32 内；`out.len() == h·wu`。
+                // 都在 40×32 内；目标缓冲同尺寸。
                 unsafe {
                     cdef_pair16(
                         &data, stride as isize, x0, y0, h, wu, &offs, &taps, pri_str, pri_adj,
-                        sec_str, sec_adj, &mut got,
+                        sec_str, sec_adj, dst_buf.as_mut_ptr(), stride as isize,
                     )
                 };
+                let at = |r: usize, c: usize| dst_buf[(y0 as usize + r) * stride + x0 as usize + c] as i16;
                 // 标量参照：就是 cdef.rs 里那段逐像素的写法
                 for r in 0..h {
                     for c in 0..wu {
@@ -3262,10 +3835,119 @@ mod tests {
                         let adjust = if sum < 0 { 1 } else { 0 };
                         let want = (cur + ((8 + sum - adjust) >> 4)).clamp(mn, mx);
                         assert_eq!(
-                            got[r * wu + c] as i32,
+                            at(r, c) as i32,
                             want,
                             "r={r} c={c} h={h} wu={wu} pri={pri_str} sec={sec_str}"
                         );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `cdef_quad8`（4 行 × 4 列）必须与 `cdef_pair16`（2 行 × 8 列、只取前 4 列）
+    /// **逐位相同**。
+    ///
+    /// ## 为什么要这条（而不是直接对着拍标量）
+    ///
+    /// `cdef_pair16` 已经有 [`cdef_pair16_matches_scalar_bit_for_bit`] 钉着标量。
+    /// 本函数是**同一个数学式子的第二份实现**（只是"哪些通道装哪一行"不同），
+    /// 所以对着那份已被标量钉住的实现对拍，比再写一遍标量更强也更短 ——
+    /// 它同时挡住"新内核的 qword 拼装顺序写反"这类**只在 4×4 上出现**的错误。
+    ///
+    /// 覆盖：8 个方向 × 3 组阈值/阻尼 × 两类数据（阶梯+振铃 / 伪随机）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn cdef_quad8_matches_cdef_pair16_bit_for_bit() {
+        if !avx2_available() {
+            return;
+        }
+        const DIRS: [[[i32; 2]; 2]; 8] = [
+            [[-1, 1], [-2, 2]],
+            [[0, 1], [-1, 2]],
+            [[0, 1], [0, 2]],
+            [[0, 1], [1, 2]],
+            [[1, 1], [2, 2]],
+            [[1, 0], [2, 1]],
+            [[1, 0], [2, 0]],
+            [[1, 0], [2, -1]],
+        ];
+        const PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
+        const SEC_TAPS: [[i32; 2]; 2] = [[2, 1], [2, 1]];
+        let stride = 40usize;
+        let rows = 32usize;
+        let (x0, y0) = (8isize, 8isize);
+        // 两类数据：① 阶梯 + 振铃（`constrain` 的各条分支都会走到）
+        //          ② 伪随机（含 0/4095 极值，验算 i16 通道不溢出）
+        let mut stepped: Vec<u16> = (0..stride * rows)
+            .map(|i| (((i * 37) % 251) as u16) + 3)
+            .collect();
+        for y in 0..rows {
+            for x in 0..stride {
+                if (x / 8 + y / 8) % 2 == 0 {
+                    stepped[y * stride + x] = (stepped[y * stride + x] / 2).max(1);
+                }
+            }
+        }
+        let noisy: Vec<u16> = (0..stride * rows)
+            .map(|i| if i % 97 == 0 { 4095 } else { ((i * 2654) % 4096) as u16 })
+            .collect();
+        for (tag, data) in [("阶梯", &stepped), ("伪随机", &noisy)] {
+            for dir in 0..8usize {
+                for (pri_str, sec_str, pri_adj, sec_adj, tap_sel) in [
+                    (32i32, 8i32, 0u32, 1u32, 0usize),
+                    (7, 3, 2, 3, 1),
+                    (0, 5, 0, 0, 0),
+                    (240, 240, 0, 1, 1),
+                ] {
+                    let pri_taps = PRI_TAPS[tap_sel];
+                    let sec_taps = SEC_TAPS[tap_sel];
+                    let mut offs = [0isize; CDEF_CANDS];
+                    let mut taps = [0i32; CDEF_CANDS];
+                    let mut n = 0usize;
+                    for k in 0..2usize {
+                        for sign in [-1i32, 1] {
+                            let [dy, dx] = DIRS[dir][k];
+                            offs[n] =
+                                (sign * dy) as isize * stride as isize + (sign * dx) as isize;
+                            taps[n] = pri_taps[k];
+                            n += 1;
+                        }
+                    }
+                    for k in 0..2usize {
+                        for dir_off in [-2i32, 2] {
+                            let d = ((dir as i32 + dir_off) & 7) as usize;
+                            let [dy, dx] = DIRS[d][k];
+                            for sign in [-1i32, 1] {
+                                offs[n] = (sign * dy) as isize * stride as isize
+                                    + (sign * dx) as isize;
+                                taps[n] = sec_taps[k];
+                                n += 1;
+                            }
+                        }
+                    }
+                    let mut a = vec![0u16; stride * rows];
+                    let mut b = vec![0u16; stride * rows];
+                    // SAFETY: 已判 AVX2；(x0,y0)=(8,8)、h=4、候选 ±2 ⇒ 最远读到
+                    // (x0+5, y0+6)，都在 40×32 内；两个目标缓冲同尺寸同约定。
+                    unsafe {
+                        cdef_pair16(
+                            data, stride as isize, x0, y0, 4, 4, &offs, &taps, pri_str, pri_adj,
+                            sec_str, sec_adj, a.as_mut_ptr(), stride as isize,
+                        );
+                        cdef_quad8(
+                            data, stride as isize, x0, y0, &offs, &taps, pri_str, pri_adj,
+                            sec_str, sec_adj, b.as_mut_ptr(), stride as isize,
+                        );
+                    }
+                    for r in 0..4usize {
+                        for c in 0..4usize {
+                            let i = (y0 as usize + r) * stride + x0 as usize + c;
+                            assert_eq!(
+                                a[i], b[i],
+                                "{tag} dir={dir} pri={pri_str} sec={sec_str} r={r} c={c}"
+                            );
+                        }
                     }
                 }
             }

@@ -985,7 +985,9 @@ mod real_av1_tests {
                         }
                         // `use_ref_frame_mvs` 时先做运动场估计（规范里在非压缩头里做）
                         let field: Option<MotionField> = if fh.use_ref_frame_mvs {
-                            Some(motion_field_estimation(&fh, seq, &mf_store))
+                            let mut f = MotionField::default();
+                            motion_field_estimation(&mut f, &fh, seq, &mf_store);
+                            Some(f)
                         } else {
                             None
                         };
@@ -2103,7 +2105,9 @@ mod real_av1_tests {
                         if seq.color.mono_chrome { 1 } else { 3 },
                     );
                     let field: Option<MotionField> = if fh.use_ref_frame_mvs {
-                        Some(motion_field_estimation(&fh, seq, &MotionFieldStore::new()))
+                        let mut f = MotionField::default();
+                        motion_field_estimation(&mut f, &fh, seq, &MotionFieldStore::new());
+                        Some(f)
                     } else {
                         None
                     };

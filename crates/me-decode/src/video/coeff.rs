@@ -867,9 +867,11 @@ impl<'a> GridAccess<'a> {
 ///
 /// 每块 `vec![]` 一次在这里是纯浪费：这几块缓冲在连续的块之间**尺寸大概率相同**，
 /// 长度没变就什么都不用做（与 [`super::inter::scratch_of`] 同一个套路）。清零规则：
-/// * `levels`：`coeffs` 全量写（写入前 `quant` 已清零，未编码位置就是 0）；
-/// * `quant`：**唯一需要调用方显式清零的一块** —— 每次 `fill(0)`，且**只清
-///   `min(w*h, MAX_TXB_COEFFS)` 个**（不是整个 `MAX_TXB_COEFFS`）；
+/// * `levels`：`coeffs` 全量写（写入前 `quant` 的对应位置已清零，未编码位置就是 0）；
+/// * `quant`：**唯一需要清零的一块**，但清零**由 `coeffs` 自己做、且只清
+///   `[0, min(w*h, MAX_TXB_COEFFS))` 减去"这次真写到的位置"那个补集**
+///   （2026-10-05 第三十四轮：原来由调用方每次 `fill(0)` 整块，`sample` 显示
+///   独占整帧 2.1%，而 `all_zero` 的块那份完全是白写）；
 /// * `t`：`dequantize` 写满系数格 `min(32,w)×min(32,h)`，而反变换**只读**这一片；
 /// * `residual`：行趟把 `w·h` 全部写满；
 /// * `pred`：每次整块从平面重填。
@@ -1159,8 +1161,10 @@ impl ResidualCtx<'_> {
             let eob = if self.cfg.skip {
                 0
             } else {
+                // ⚠️ 这里**不再** `quant.fill(0)`（2026-10-05 第三十四轮）：清零已经
+                // 挪进 `coeffs` 内部、且只在"真的编了系数"之后做 —— `all_zero` 的块
+                // 一个字节都不该白写。
                 let quant = scratch_len(&mut scratch.quant, n_eff);
-                quant.fill(0);
                 self.coeffs(dec, plane, start_x, start_y, tx_sz, out, quant)?
             };
             if let Some(r) = rec.as_deref_mut() {
@@ -1188,8 +1192,8 @@ impl ResidualCtx<'_> {
             let eob = {
                 let n_eff = (w * h).min(MAX_TXB_COEFFS);
                 let levels = scratch_len(&mut scratch.levels, n_eff);
+                // 清零在 `coeffs` 内部做（同上），这里只负责把缓冲切到该长度。
                 let quant = scratch_len(&mut scratch.quant, n_eff);
-                quant.fill(0);
                 self.coeffs(
                     dec,
                     plane,
@@ -1984,6 +1988,50 @@ impl ResidualCtx<'_> {
         }
 
         self.stats.bits_eob += (dec.consumed_bits() - pos0) as u64;
+        // ── 清零改到"知道 eob 之后"（2026-10-05 第三十四轮）────────────────
+        //
+        // 原来由调用方在进 `coeffs` 之前 `quant[..n].fill(0)`。`sample` 显示这一处
+        // 的 `bzero` 独占**整帧 2.1%**（30k+ 个变换块 × 平均不到 100 格）——
+        // 而其中**一大半是白写的**：
+        //
+        // * `txb_skip == 1`（`all_zero`）的块在 §上面就 `return Ok(0)` 了，
+        //   `eob == 0` ⇒ `add_residual` 根本不会被调用 ⇒ **`quant` 一个字节都没被读**；
+        // * 剩下的块只需要"没写到的位置是 0"，而**已写到的位置马上就会被写掉**。
+        //
+        // 于是改成：只清 `[0, n)` 减去 `scan[0..eob)` 的那个补集。
+        // `DEFAULT_SCAN_*` 是**对角扫描**（`0,1,4,8,5,2,…`，不单调），所以
+        // 补集不能靠"顺序扫一遍"求；用一张 16 项的位图标 `scan[0..eob]`，
+        // 再把没打标的位置清掉，最后把 `mx` 之后整段一次 `fill`。
+        // 对角扫描下 `mx` 只比 `eob` 大一点 ⇒ 实际写入量是 `O(eob)` 而不是 `O(n)`。
+        //
+        // ⚠️ **最终状态与"先整块 `fill(0)`"逐位相同**：被清零的集合完全一样，
+        // 而 `scan[0..eob]` 里的值随后由下面的幅度循环覆写（掩码里的洞也在
+        // 同一个补集里）。这条由受控流 + dav1d 逐像素对拍钉住。
+        {
+            let n = quant.len();
+            let mut mx = 0usize;
+            for &p in &scan[..eob_usize] {
+                mx = mx.max(usize::from(p));
+            }
+            // 空洞太多时位图不划算（`eob` 接近 `n` 的稠密块）——退回整块清。
+            // `mx < n ≤ MAX_TXB_COEFFS = 1024` ⇒ 16 项位图一定够用。
+            if mx + 1 > n / 2 {
+                quant[..n].fill(0);
+            } else {
+                debug_assert!(mx < 1024, "系数量图必须放得下 16 × u64");
+                let mut written = [0u64; 16];
+                for &p in &scan[..eob_usize] {
+                    let p = usize::from(p);
+                    written[p >> 6] |= 1u64 << (p & 63);
+                }
+                for (i, slot) in quant[..=mx].iter_mut().enumerate() {
+                    if written[i >> 6] & (1u64 << (i & 63)) == 0 {
+                        *slot = 0;
+                    }
+                }
+                quant[mx + 1..].fill(0);
+            }
+        }
         let p_eob = dec.consumed_bits();
         // 第一轮：从 EOB-1 往回读幅度
         for c in (0..eob_usize).rev() {

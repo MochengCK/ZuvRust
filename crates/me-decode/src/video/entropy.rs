@@ -55,17 +55,49 @@ pub const CDF_PROB_TOP: u32 = 1 << CDF_PROB_BITS;
 pub const EQUIPROBABLE_CDF: [u16; 3] = [(1 << 14) as u16, (1 << 15) as u16, 0];
 
 /// 按位读（MSB-first），越界返回 `NeedMore`。
+///
+/// ## 为什么不能逐位（2026-10-05）
+///
+/// 原来这里是 `for i in 0..n { (data[(pos+i)/8] >> (7 - (pos+i)%8)) & 1 }` ——
+/// **逐位一次除法 + 一次取模 + 一次越界判断 + 一次装载**。而归一化**几乎每个符号
+/// 都要读 1~15 位**（`num_bits = bits.min(avail)`），于是每个符号有几十条指令
+/// 花在拆位上 —— `AV1_SYNTAX_ONLY` 采样里 `read_symbol_inner` 占**语法阶段的 11%**。
+///
+/// 改成一次取 **8 字节大端窗口**（末尾不足 8 字节时左对齐补零），
+/// `off + n ≤ 7 + 32 = 39 ≤ 64` ⇒ 一次移位就出来。越界口径与逐位版**逐位一致**
+/// （`have` = 第一个越界的下标）。逐位版留在单测 `read_bits_at_matches_the_bitwise_version` 里。
+#[inline]
 fn read_bits_at(data: &[u8], pos: usize, n: u32) -> Result<u32> {
-    let mut out = 0u32;
-    for i in 0..n as usize {
-        let p = pos + i;
-        if p / 8 >= data.len() {
-            return Err(MediaError::NeedMore { need: n as usize, have: i });
-        }
-        let bit = (data[p / 8] >> (7 - (p % 8))) & 1;
-        out = (out << 1) | bit as u32;
+    if n == 0 {
+        return Ok(0);
     }
-    Ok(out)
+    let total = data.len() * 8;
+    if pos + n as usize > total {
+        return Err(MediaError::NeedMore {
+            need: n as usize,
+            have: total.saturating_sub(pos),
+        });
+    }
+    debug_assert!(n <= 32, "read_bits_at 一次最多 32 位（读到 {n}）");
+    let byte = pos >> 3;
+    let off = (pos & 7) as u32;
+    // 8 字节大端窗口：`w` 的最高位 == `data[byte]` 的最高位
+    let w: u64 = if byte + 8 <= data.len() {
+        let mut buf = [0u8; 8];
+        buf.copy_from_slice(&data[byte..byte + 8]);
+        u64::from_be_bytes(buf)
+    } else {
+        // 末尾不足 8 字节：左对齐补零（缺的位本来就不在 `data` 里，
+        // 而上面已经保证需要的位全在）
+        let take = data.len() - byte;
+        let mut w = 0u64;
+        for k in 0..take {
+            w |= (data[byte + k] as u64) << (56 - 8 * k);
+        }
+        w
+    };
+    let want = off + n; // ≤ 39
+    Ok(((w >> (64 - want)) & ((1u64 << n) - 1)) as u32)
 }
 
 /// AV1 的符号解码器：**一个瓦片一份**（规范里 `init_symbol(tileSize)` 在
@@ -421,17 +453,25 @@ impl<'a> SymbolDecoder<'a> {
         if update {
             let c = cdf[n] as u32;
             let rate = 3 + (c > 15) as u32 + (c > 31) as u32 + floor_log2(n as u32).min(2);
-            let mut tmp = 0i32;
-            for i in 0..n - 1 {
-                if i == symbol {
-                    tmp = CDF_PROB_TOP as i32;
-                }
-                let v = cdf[i] as i32;
-                cdf[i] = if tmp < v {
-                    (v - ((v - tmp) >> rate)) as u16
-                } else {
-                    (v + ((tmp - v) >> rate)) as u16
-                };
+            // ── 拆成两段单调循环（2026-10-05）─────────────────────────────
+            //
+            // 原来是**一个**循环 + 每项一个 `if i == symbol { tmp = TOP }`：
+            // `tmp` 只在 `i == symbol` 那一步变成 `CDF_PROB_TOP`，所以
+            //   * `i <  symbol`：`tmp == 0`         ⇒ `v - (v >> rate)`
+            //   * `i >= symbol`：`tmp == CDF_PROB_TOP` ⇒ `v + ((TOP - v) >> rate)`
+            //（`v == 0` 时第一式给 `0 - 0 = 0`、原式走 `v + 0 = 0`，**同值**。）
+            // 拆开之后循环体内**没有分支**，两项都是单调映射。
+            //
+            // ⚠️ 边界与原来一致：`symbol` 最大取到 `n-1`，而循环上界是 `n-1`
+            // （不含），所以 `symbol == n-1` 时**从头到尾都是第一式** ——
+            // 第二段的空区间正好表达这一点。
+            for v in cdf[..symbol].iter_mut() {
+                let x = *v as i32;
+                *v = (x - (x >> rate)) as u16;
+            }
+            for v in cdf[symbol..n - 1].iter_mut() {
+                let x = *v as i32;
+                *v = (x + ((CDF_PROB_TOP as i32 - x) >> rate)) as u16;
             }
             if cdf[n] < 32 {
                 cdf[n] += 1;
@@ -599,6 +639,103 @@ mod tests {
     /// 用递减 CDF 跑随机数据，24 个符号里 22 个是 3）。
     fn uniform4() -> [u16; 5] {
         [8192, 16384, 24576, 32768, 0]
+    }
+
+
+    /// 逐位参照实现（改动前的版本，原样保留）。
+    fn read_bits_at_bitwise(data: &[u8], pos: usize, n: u32) -> Result<u32> {
+        let mut out = 0u32;
+        for i in 0..n as usize {
+            let p = pos + i;
+            if p / 8 >= data.len() {
+                return Err(MediaError::NeedMore { need: n as usize, have: i });
+            }
+            let bit = (data[p / 8] >> (7 - (p % 8))) & 1;
+            out = (out << 1) | bit as u32;
+        }
+        Ok(out)
+    }
+
+    /// [`read_bits_at`] 的 64 位窗口版必须与**逐位版**逐值相同（含越界报错口径）。
+    ///
+    /// 这是 2026-10-05 那次提速的护栏：改错了只会让"某些位位置/位长"读错一格，
+    /// 而算术流错一位就是整帧错，**从像素差几乎定位不到**。
+
+    /// CDF 自适应的**两段拆分**必须与原来"一个循环 + 每项判 `i == symbol`"
+    /// 的写法逐项相同（`rate` 取遍真实值域、`symbol` 取遍每个位置、`n` 取几个典型值）。
+    ///
+    /// 这条自适应是**唯一**让解码器与编码器保持同一个概率模型的地方：拆错一项，
+    /// 后面整条算术流都会偏，而现象是"某一帧之后画面花掉"——**极难定位**。
+    #[test]
+    fn cdf_adapt_split_matches_the_single_loop_version() {
+        // 照规范播种的 CDF：单调增、末项 1<<15（用一个固定斜坡近似真实表）
+        for n in [2usize, 3, 4, 5, 8, 11, 13, 14, 16] {
+            let seed: Vec<u16> = (0..n)
+                .map(|i| (((i + 1) * CDF_PROB_TOP as usize) / n) as u16)
+                .collect();
+            let mut cdf = seed.clone();
+            cdf.push(0); // 计数器
+            for symbol in 0..n {
+                for rate in 3u32..=8 {
+                    let mut want = cdf.clone();
+                    {
+                        let mut tmp = 0i32;
+                        for i in 0..n - 1 {
+                            if i == symbol {
+                                tmp = CDF_PROB_TOP as i32;
+                            }
+                            let v = want[i] as i32;
+                            want[i] = if tmp < v {
+                                (v - ((v - tmp) >> rate)) as u16
+                            } else {
+                                (v + ((tmp - v) >> rate)) as u16
+                            };
+                        }
+                        if want[n] < 32 {
+                            want[n] += 1;
+                        }
+                    }
+                    let mut got = cdf.clone();
+                    {
+                        for v in got[..symbol].iter_mut() {
+                            let x = *v as i32;
+                            *v = (x - (x >> rate)) as u16;
+                        }
+                        for v in got[symbol..n - 1].iter_mut() {
+                            let x = *v as i32;
+                            *v = (x + ((CDF_PROB_TOP as i32 - x) >> rate)) as u16;
+                        }
+                        if got[n] < 32 {
+                            got[n] += 1;
+                        }
+                    }
+                    assert_eq!(got, want, "n={n} symbol={symbol} rate={rate}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn read_bits_at_matches_the_bitwise_version() {
+        // 造一段有 0/1 交替模式的字节（避免全 0/全 1 掩盖移位错误）
+        let data: Vec<u8> = (0..40u32).map(|i| ((i * 37 + 11) & 0xff) as u8).collect();
+        let total = data.len() * 8;
+        for pos in 0..total {
+            // `n ≤ 32` 是函数契约（`off + n ≤ 7 + 32 = 39 ≤ 64` 一个窗口装得下）；
+            // 生产调用点的 `n` 实际只有 1~15（重归一化位数）。
+            for n in 0..=32u32 {
+                let got = super::read_bits_at(&data, pos, n);
+                let want = read_bits_at_bitwise(&data, pos, n);
+                match (got, want) {
+                    (Ok(a), Ok(b)) => assert_eq!(a, b, "pos={pos} n={n}"),
+                    (Err(MediaError::NeedMore { need: a, have: b }),
+                     Err(MediaError::NeedMore { need: c, have: d })) => {
+                        assert_eq!((a, b), (c, d), "pos={pos} n={n} 的越界口径不同");
+                    }
+                    (a, b) => panic!("pos={pos} n={n}：一边成功一边失败 {a:?} vs {b:?}"),
+                }
+            }
+        }
     }
 
     #[test]

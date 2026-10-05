@@ -271,7 +271,7 @@ fn run_line(
         let mut col = 0i32;
         while col < mi_cols {
             let tx = table[row * cols + ((col | sub_x) >> sub_x) as usize];
-            loop_filter_edge(view, pass, o, col, fh, seq, grid, mi_grid)?;
+            loop_filter_edge(view, pass, o, col, tx, fh, seq, grid, mi_grid)?;
             col += ((TX_WIDTH[tx as usize] as i32) >> 2) << sub_x;
         }
     } else {
@@ -279,7 +279,7 @@ fn run_line(
         let mut row = 0i32;
         while row < mi_rows {
             let tx = table[(((row | sub_y) >> sub_y) as usize) * cols + col];
-            loop_filter_edge(view, pass, row, o, fh, seq, grid, mi_grid)?;
+            loop_filter_edge(view, pass, row, o, tx, fh, seq, grid, mi_grid)?;
             row += ((TX_HEIGHT[tx as usize] as i32) >> 2) << sub_y;
         }
     }
@@ -412,16 +412,19 @@ fn aligned(v: i32, step: i32) -> bool {
 ///
 /// ⚠️ **本函数是这条判定的唯一来源**：`loop_filter_edge` 自己也调它，
 /// 所以不存在"两处逻辑走样"的风险。
+/// `tx_sz` 由调用方**已经读好**传进来（2026-10-05）：`run_line` 按变换块跳着走，
+/// 每次都已经从 `lf_tx_sizes` 取过这一格的变换尺寸；这里再取一次是**同一格同一张
+/// 数组的重复读**（每次一条缓存访问）。`loop_filter_edge` 后面还要用同一个值，
+/// 于是原先一次边要读三次 `lf_tx_sizes`，现在只剩一次。
 #[inline(always)]
 fn lf_gate(
-    view: &PlaneView,
     pass: u8,
     row_in: i32,
     col_in: i32,
     fh: &FrameHeader,
-    grid: &BlockGrid,
     sub_x: i32,
     sub_y: i32,
+    tx_sz: u8,
 ) -> bool {
     // `x` / `y` 用的是**未调整**的 row/col（规范 §7.14.2 的顺序）
     let x = col_in * MI_SIZE;
@@ -435,10 +438,6 @@ fn lf_gate(
     }
     // `isTxEdge` 排在 MiSize / planeSz 之前（理由见 `loop_filter_edge` 里的长注释：
     // 92% 的边在这一步就退出，不该先付 `mi_grid.get` + `plane_residual_size`）。
-    let row = row_in | sub_y;
-    let col = col_in | sub_x;
-    let tx_sz = grid.lf_tx_sizes[view.plane as usize]
-        [((row >> sub_y) as usize) * grid.cols() + ((col >> sub_x) as usize)];
     if pass == 0 {
         aligned(x >> sub_x, TX_WIDTH[tx_sz as usize] as i32)
     } else {
@@ -446,11 +445,13 @@ fn lf_gate(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn loop_filter_edge(
     view: &PlaneView,
     pass: u8,
     row_in: i32,
     col_in: i32,
+    tx_sz: u8,
     fh: &FrameHeader,
     seq: &SequenceHeader,
     grid: &BlockGrid,
@@ -469,7 +470,7 @@ fn loop_filter_edge(
     //
     // 现在由 [`run_line`] 的**热循环先内联判一次**；这里再判一次是为了让本函数
     // "单独调用也自洽"（判定已在 `lf_gate` 内联，重复的成本可忽略）。
-    if !lf_gate(view, pass, row_in, col_in, fh, grid, i32::from(sub_x), i32::from(sub_y)) {
+    if !lf_gate(pass, row_in, col_in, fh, i32::from(sub_x), i32::from(sub_y), tx_sz) {
         return Ok(());
     }
 
@@ -484,10 +485,6 @@ fn loop_filter_edge(
 
     let cols = grid.cols() as i32;
     let plane_idx = plane as usize;
-    // `tx_sz` 在 [`lf_gate`] 里已读过一次（那里只用来算 `isTxEdge`）；这里再读一次
-    // 给后面的 `prev_tx_sz` / `filter_size` 用（一次数组读，比把返回值穿回来简单）。
-    let tx_sz = grid.lf_tx_sizes[plane_idx]
-        [((row >> sub_y) as usize) * cols as usize + ((col >> sub_x) as usize)];
 
     let mi_size = mi_grid.get(row, col);
     if mi_size == super::partition::BLOCK_INVALID {

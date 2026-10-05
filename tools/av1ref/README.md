@@ -389,3 +389,34 @@ grep '^WAIT' /tmp/w.log                       # jobs=135（9 带 × 15 列）
 3. **语法阶段的调色板 flush 会污染 `ROWD2`**：它也会调 `predict_intra`，而那时代码里的
    `CUR_BLOCK_IDX` 还是上一帧回放留下的值。`rowneed.py` 用"位置一致性校验"把这类行剔除
    （本机真素材 8 帧里有 1929 条）。
+
+---
+
+## `cpuab.py` —— 子进程 CPU 时间的交替 A/B（2026-10-05 新增）
+
+**为什么需要它**：`perfab.py` 走的是引擎内的 `PHASE` 行（墙钟），而本机墙钟
+`min` 与 `median` 能差 **20%**，`elapsedMs` 更差 —— 只有"两版都稳定"的窗口里
+才能比。`cpuab.py` 改量**子进程 CPU 时间**（`getrusage(RUSAGE_CHILDREN)` 的
+`ru_utime + ru_stime`）：它与"同时有多少别的进程抢核"无关。
+代价是**把并行折成总工作量** ⇒ **只在同一线程配置下比较**（默认 `ME_THREADS=1`）。
+
+统计口径：**同窗口交替**（奇偶轮换顺序）+ **配对比值 `B_i/A_i` 的中位数**
+（比"中位之比"稳 —— 它抵消窗口漂移）+ 报"更快轮数/总轮数"。
+
+```sh
+# 两个二进制比
+python3 tools/av1ref/cpuab.py base=/tmp/me_base new=./target/release/zuvrust \
+    --count=100 --rounds=24
+
+# 拿"隔离开关"量某个阶段的真实成本：先做包装脚本（exec 掉 shell，不多算一层 CPU）
+for v in NODBL:AV1_NO_DEBLOCK NOCDEF:AV1_NO_CDEF NOLR:AV1_NO_LR; do
+  n=${v%%:*}; e=${v##*:}
+  printf '#!/bin/sh\nexec env %s=1 %s/target/release/zuvrust "$@"\n' \
+    "$e" "$PWD" > /tmp/wrap_$n.sh; chmod +x /tmp/wrap_$n.sh
+done
+python3 tools/av1ref/cpuab.py base=./target/release/zuvrust \
+    nodbl=/tmp/wrap_NODBL.sh nocdef=/tmp/wrap_NOCDEF.sh nolr=/tmp/wrap_NOLR.sh \
+    --count=80 --rounds=8
+```
+
+⚠️ 跑之前 `pgrep -x zuvrust` 清残留；**别在同一次比较里混不同的线程配置**。

@@ -397,20 +397,39 @@ pub fn dequantize(
     }
     let q_dc = quant.dc[plane as usize] as i64;
     let q_ac = quant.ac[plane as usize] as i64;
-    let denom = dq_denom(tx_sz);
+    // ⚠️ `dqDenom` 只可能是 **1 / 2 / 4**（见 [`dq_denom`]）—— 而规范给的是
+    // `sign · (Abs(dq) & 0xFFFFFF) / dqDenom`，分子**恒非负** ⇒ 除法就是右移。
+    // 原来这里是一条**真正的硬件除法**（`div` 指令，~20-40 周期）**每个系数一次**：
+    // 一个 32×32 变换块就是 1024 次、1080p 一帧几百万次。采样里 `dequantize` 单独占 1.6%。
+    // 改成移位之后这一步只剩 1 条指令（单测 `dequant_uses_a_shift_not_a_division` 钉住
+    // 三个 `dqDenom` 取值下的等价性）。
+    let denom_shift = {
+        let d = dq_denom(tx_sz);
+        debug_assert!(d > 0 && d & (d - 1) == 0, "dqDenom 只允许 2 的幂（规范里只有 1/2/4）");
+        d.trailing_zeros()
+    };
     let bd = quant.bit_depth;
     let clamp_lo = -(1i64 << (7 + bd));
     let clamp_hi = (1i64 << (7 + bd)) - 1;
 
     for i in 0..th {
         for j in 0..tw {
+            let lv = levels[i * tw + j];
+            // **零系数直接落 0**（2026-10-05）：`levels` 只有 `< eob` 那一段非零，
+            // 其余整片是 0，而 `dq == 0 ⇒ mag == 0 ⇒ dq2 == 0` ⇒ 与直接算逐位相同。
+            // 真素材上平均 eob 不到 100（见 `TxScratch::quant` 的说明），
+            // 这个 `continue` 把绝大多数格子的乘/移位/钳位全省掉了。
+            if lv == 0 {
+                t[i * w + j] = 0;
+                continue;
+            }
             // a. 系数的位置决定用 DC 还是 AC 步长
             let q = if i == 0 && j == 0 { q_dc } else { q_ac };
             // b. q2：`using_qmatrix` 这一版没接进来（`Quant` 里没有矩阵），q2 = q
             // c. dq = Quant[i * tw + j] * q2
-            let dq = levels[i * tw + j] as i64 * q;
+            let dq = lv as i64 * q;
             // d. sign、e. dq2 = sign * (Abs(dq) & 0xFFFFFF) / dqDenom
-            let mag = (dq.abs() & 0xFF_FFFF) / denom;
+            let mag = (dq.abs() & 0xFF_FFFF) >> denom_shift;
             let dq2 = if dq < 0 { -mag } else { mag };
             // f. Dequant[i][j] = Clip3(-(1 << (7 + BitDepth)), (1 << (7 + BitDepth)) - 1, dq2)
             t[i * w + j] = dq2.clamp(clamp_lo, clamp_hi) as i32;
@@ -441,35 +460,77 @@ const COS128_LOOKUP: [i32; 65] = [
     1567, 1474, 1380, 1285, 1189, 1092, 995, 897, 799, 700, 601, 501, 401, 301, 201, 101, 0,
 ];
 
+/// `cos128(a)`（`a ∈ 0..256`）的**直查表** —— 把 [`cos128`] 的四个象限分支折叠掉。
+///
+/// 原函数按 `a = angle & 255` 落在哪个象限决定"取哪个下标 + 要不要取负"，
+/// 每次调用 2~3 个分支。而 `cos128`/`sin128` 在 1D 变换里是**每个蝴蝶 2 次**
+/// （32 点 ≈ 15 个蝴蝶、64 点 ≈ 30 个），分支进得去就出不来。
+///
+/// 表由 [`COS128_LOOKUP`] 在编译期按原式求值（单测
+/// `cos128_full_table_matches_the_quadrant_version` 对 256 项逐项与原分支式对拍）。
+static COS128_FULL: [i32; 256] = {
+    let mut t = [0i32; 256];
+    let mut a = 0usize;
+    while a < 256 {
+        t[a] = if a <= 64 {
+            COS128_LOOKUP[a]
+        } else if a <= 128 {
+            -COS128_LOOKUP[128 - a]
+        } else if a <= 192 {
+            -COS128_LOOKUP[a - 128]
+        } else {
+            COS128_LOOKUP[256 - a]
+        };
+        a += 1;
+    }
+    t
+};
+
 /// `cos128( angle )`（§7.13.1.2）：以 4096 为单位的 128 分段余弦。
+///
+/// 语义与"四象限分支"版**逐值相同**（那就是 `COS128_FULL` 的构造式），
+/// 但只剩 **一次掩码 + 一次查表**：`angle & 255` 对负角也落在 `0..256`
+/// （补码低 8 位），不需要额外处理。
 #[inline]
 pub(crate) fn cos128(angle: i32) -> i32 {
-    let a = (angle & 255) as usize;
-    if a <= 64 {
-        COS128_LOOKUP[a]
-    } else if a <= 128 {
-        -COS128_LOOKUP[128 - a]
-    } else if a <= 192 {
-        -COS128_LOOKUP[a - 128]
-    } else {
-        COS128_LOOKUP[256 - a]
-    }
+    COS128_FULL[(angle & 255) as usize]
 }
 
 /// `sin128( angle ) = cos128( angle - 64 )`（§7.13.1.2）。
 #[inline]
 pub(crate) fn sin128(angle: i32) -> i32 {
-    cos128(angle - 64)
+    COS128_FULL[((angle - 64) & 255) as usize]
 }
 
-/// `brev( numBits, x )`（§7.13.1.1）：`numBits` 位位反转。
-#[inline]
-pub(crate) fn brev(num_bits: u32, x: usize) -> usize {
-    let mut t = 0usize;
-    for i in 0..num_bits {
-        t += ((x >> i) & 1) << (num_bits - 1 - i);
+/// `brev(6, x)`：低 6 位位反转（1D 变换最长 64 点 ⇒ `numBits ≤ 6`）。
+static BREV6: [u8; 64] = {
+    let mut t = [0u8; 64];
+    let mut x = 0usize;
+    while x < 64 {
+        let mut r = 0u8;
+        let mut i = 0usize;
+        while i < 6 {
+            r |= (((x >> i) & 1) as u8) << (5 - i);
+            i += 1;
+        }
+        t[x] = r;
+        x += 1;
     }
     t
+};
+
+/// `brev( numBits, x )`（§7.13.1.1）：`numBits` 位位反转。
+///
+/// 原来是"逐位拼"的 `for i in 0..numBits { ... }` 循环 —— 而 **`vt_dct_permute`
+/// 对每个元素都要调一次**（32 点 = 32 次、64 点 = 64 次），每次几十条指令。
+/// 改成查 64 项表 + 一次移位：`reverse6(x)` 的**高** `numBits` 位恰好是
+/// "低 `numBits` 位反转后的值"，右移 `6 - numBits` 就落到低位。
+///
+/// 单测 `brev_table_matches_the_bitwise_version` 对 `numBits ∈ 0..=6` × 全下标对拍。
+#[inline]
+pub(crate) fn brev(num_bits: u32, x: usize) -> usize {
+    debug_assert!(num_bits <= 6, "1D 变换最长 64 点 ⇒ numBits ≤ 6（读到 {num_bits}）");
+    (BREV6[x & 63] >> (6 - num_bits)) as usize
 }
 
 /// `Round2( x, n )`（§3）。`n = 0` 时等于 `x`。
@@ -999,12 +1060,23 @@ fn inverse_transform_2d_into(
     let row_clamp = bit_depth as u32 + 8;
     let col_clamp = (bit_depth as u32 + 6).max(16);
 
-    // 复用缓冲：长度没变就什么都不做（连续同尺寸的块是常态）。
-    // 行趟会把 `residual` 的 `w·h` 个位置**全部写满**，所以不需要清零。
-    if residual.len() != w * h {
-        residual.clear();
+    // 复用缓冲：**只增不减**（2026-10-05）。
+    //
+    // 原来写的是 `if residual.len() != w * h { residual.clear(); residual.resize(w * h, 0) }`
+    // —— 只要**尺寸变了**就重开一次，而 `resize` 会把 `w·h` 个 `i64`（最大 4096 个 =
+    // 32 KB）整片写 0。真素材里块尺寸 64→32→16→8 反复跳，等于**每换一次尺寸就白写一次**，
+    // 采样里这些 `__bzero` 就挂在 `inv_txfm_rows` / `inv_txfm_cols` 底下。
+    //
+    // 改成"只增不减"之后：长度上界是 64×64 = 4096，每个尺寸最多长长一次，
+    // 之后再也不发生零填充。**行趟会把 `residual[..w·h]` 全部写满**（`inv_txfm_rows`
+    // 的 SIMD 段 + 标量尾一起覆盖 `i ∈ [0,h) × j ∈ [0,w)`），所以初值本来也不需要。
+    //
+    // ⚠️ 由此**不能再对整条 `residual` 做遍历** —— 它可能比 `w·h` 长。
+    // 下面一律用 `res`（`&mut residual[..w * h]`）。
+    if residual.len() < w * h {
         residual.resize(w * h, 0);
     }
+    let res: &mut [i64] = &mut residual[..w * h];
     let mut line = [0i64; 64]; // max(w, h) ≤ 64
 
     // 行变换（含 1:2 长方块的 Round2( *2896, 12) 预缩放）。
@@ -1014,7 +1086,7 @@ fn inverse_transform_2d_into(
         unsafe {
             super::simd::inv_txfm_rows(
                 t,
-                residual,
+                res,
                 w,
                 h,
                 kind_code(row_1d(tx_type)),
@@ -1044,14 +1116,14 @@ fn inverse_transform_2d_into(
             forward_1d(row_1d(tx_type), &mut line[..w], log2_w, row_clamp);
         }
         for j in 0..w {
-            residual[i * w + j] = round2(line[j], row_shift);
+            res[i * w + j] = round2(line[j], row_shift);
         }
     }
 
-    // 行列之间的钳位
+    // 行列之间的钳位（只扫 `w·h`，见上面"只增不减"的说明）
     let lo = -(1i64 << (col_clamp - 1));
     let hi = (1i64 << (col_clamp - 1)) - 1;
-    for v in residual.iter_mut() {
+    for v in res.iter_mut() {
         *v = (*v).clamp(lo, hi);
     }
 
@@ -1061,7 +1133,7 @@ fn inverse_transform_2d_into(
         // SAFETY: 已判 AVX2；`residual` 长度 = w·h，形状检查在函数内部。
         unsafe {
             super::simd::inv_txfm_cols(
-                residual,
+                res,
                 w,
                 h,
                 kind_code(col_1d(tx_type)),
@@ -1076,7 +1148,7 @@ fn inverse_transform_2d_into(
     };
     for j in cols_done..w {
         for i in 0..h {
-            line[i] = residual[i * w + j];
+            line[i] = res[i * w + j];
         }
         if lossless {
             inverse_wht(&mut line[..4], 0);
@@ -1084,7 +1156,7 @@ fn inverse_transform_2d_into(
             forward_1d(col_1d(tx_type), &mut line[..h], log2_h, col_clamp);
         }
         for i in 0..h {
-            residual[i * w + j] = round2(line[i], col_shift);
+            res[i * w + j] = round2(line[i], col_shift);
         }
     }
     Ok(())
@@ -1101,6 +1173,9 @@ pub fn debug_inverse_only(
     let mut residual = Vec::new();
     inverse_transform_2d_into(t, tx_sz, tx_type, bit_depth, lossless, &mut residual)
         .unwrap_or_default();
+    // `inverse_transform_2d_into` 现在"只增不减"（见那里的说明）⇒ 返回前按形状截断，
+    // 保持这个诊断入口"长度 = w·h"的老契约。
+    residual.truncate(residual_len(tx_sz));
     residual
 }
 
@@ -1241,6 +1316,79 @@ mod tests {
     ///
     /// 同一个进程里"关 SIMD"靠 [`crate::video::simd::FORCE_SCALAR`]。
     #[cfg(target_arch = "x86_64")]
+    /// `dq_denom` 只返回 1/2/4 ⇒ `(非负数) / denom == >> log2(denom)`。
+    ///
+    /// 这条把 `dequantize` 里那次"除法改移位"的等价性钉死：分子是
+    /// `Abs(dq) & 0xFFFFFF`（恒非负），所以对 2 的幂除数，右移与除法**逐值相同**。
+    /// 改错了会让所有系数按错的步长缩放 —— 画面整体变亮/变暗，**从像素差几乎定位不到**。
+    /// `cos128` 的**直查表版**必须与"四象限分支"版逐值相同（全 256 项 + 越界角）。
+    ///
+    /// 这张表是 `COS128_FULL` 的构造式直接写出来的 —— 但"构造式"和"查表"分居两处，
+    /// 改一处忘一处就是全帧错（三角函数错一位 ⇒ 所有变换系数都偏），所以逐项钉住。
+    #[test]
+    fn cos128_full_table_matches_the_quadrant_version() {
+        let quad = |angle: i32| -> i32 {
+            let a = (angle & 255) as usize;
+            if a <= 64 {
+                COS128_LOOKUP[a]
+            } else if a <= 128 {
+                -COS128_LOOKUP[128 - a]
+            } else if a <= 192 {
+                -COS128_LOOKUP[a - 128]
+            } else {
+                COS128_LOOKUP[256 - a]
+            }
+        };
+        // 全 256 个相位 + 负角 + 多圈
+        for a in -512i32..=768 {
+            assert_eq!(cos128(a), quad(a), "cos128({a})");
+            // sin128(a) == cos128(a - 64)
+            assert_eq!(sin128(a), quad(a - 64), "sin128({a})");
+        }
+        // 两个恒等式（规范 §7.13.1.2 的 cos128(0)=4096、cos128(64)=0）
+        assert_eq!(cos128(0), 4096);
+        assert_eq!(cos128(64), 0);
+        assert_eq!(cos128(128), -4096);
+    }
+
+    /// `brev` 的**查表版**必须与"逐位拼"版在每个 `numBits`、每个下标上相同。
+    #[test]
+    fn brev_table_matches_the_bitwise_version() {
+        let bitwise = |num_bits: u32, x: usize| -> usize {
+            let mut t = 0usize;
+            for i in 0..num_bits {
+                t += ((x >> i) & 1) << (num_bits - 1 - i);
+            }
+            t
+        };
+        for num_bits in 0..=6u32 {
+            for x in 0..(1usize << num_bits) {
+                assert_eq!(brev(num_bits, x), bitwise(num_bits, x), "brev({num_bits}, {x})");
+            }
+            // 表会掩到 6 位：下标大于 2^num_bits 时结果只看低位
+            for x in 0..64usize {
+                assert_eq!(brev(num_bits, x), bitwise(num_bits, x & ((1 << num_bits) - 1)));
+            }
+        }
+    }
+
+    #[test]
+    fn dequant_uses_a_shift_not_a_division() {
+        for tx_sz in 0..=TX_SIZES_ALL as u8 {
+            let d = dq_denom(tx_sz);
+            assert!(d > 0 && d & (d - 1) == 0, "tx_sz={tx_sz} 的 dqDenom={d} 不是 2 的幂");
+            let sh = d.trailing_zeros();
+            for v in 0i64..4096 {
+                let mag = (v << 8) | 0xFF;
+                assert_eq!(mag >> sh, mag / d, "tx_sz={tx_sz} mag={mag}");
+            }
+            // 边界：24 位满量程附近
+            for mag in [(1i64 << 24) - 1, (1i64 << 23) + 12345, 0, 1, 0xFF_FFFE] {
+                assert_eq!(mag >> sh, mag / d, "tx_sz={tx_sz} mag={mag}");
+            }
+        }
+    }
+
     #[test]
     fn simd_transform_matches_scalar_bit_for_bit() {
         use crate::video::block::TX_4X4;
