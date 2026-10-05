@@ -214,3 +214,93 @@ fn real_files_are_merged_losslessly() {
     );
     let _ = std::fs::remove_file(&out);
 }
+
+/// 把一个**真实文件**按轨拆成"画面流 + 声音流"，再做多输入合并。
+///
+/// 这条补的是另外两条真实素材用例的缺口：`real_single_file_remux_is_lossless` 只走
+/// 单输入路径，`real_files_are_merged_losslessly` 要调用方自己准备一对文件。
+/// 而宿主的实际调用**就是"画面流 + 声音流两个文件"**（扩展/下载器把 DASH 的
+/// 两条轨分别落盘），所以它才是生产路径。
+///
+/// 拆分用引擎自己的解封装 + 封装（素材仍是真实的），因此它验证的是
+/// **多输入合并这条链**在真实采样上的无损性，不能替代"读别人的文件"那一半。
+#[test]
+#[ignore = "需要 LERXU_VERIFY_SINGLE 指向一个真实的音视频文件（拆轨后再合并）"]
+fn real_file_split_into_tracks_then_merged_is_lossless() {
+    let src = PathBuf::from(std::env::var("LERXU_VERIFY_SINGLE").expect("LERXU_VERIFY_SINGLE"));
+    let dir = tmp_dir("split");
+
+    // 1) 从真实文件里按轨取出完整采样（保留时基 / duration / keyframe）
+    let source: Arc<dyn ReadAt> = Arc::new(FileSource::open(&src).expect("打开输入"));
+    let info = me_container::probe(source.clone(), &src.to_string_lossy()).expect("探测");
+    let v_track = info
+        .tracks
+        .iter()
+        .find(|t| t.kind == MediaKind::Video)
+        .expect("真实素材里没有画面轨")
+        .clone();
+    let a_track = info
+        .tracks
+        .iter()
+        .find(|t| t.kind == MediaKind::Audio)
+        .expect("真实素材里没有声音轨")
+        .clone();
+    let kinds: Vec<(u32, MediaKind)> = info.tracks.iter().map(|t| (t.id, t.kind)).collect();
+    let mut d = demux::open(source, &src.to_string_lossy()).expect("开解封装器");
+    let (mut vpackets, mut apackets) = (Vec::new(), Vec::new());
+    while let Some(p) = d.next_packet().expect("读采样") {
+        match kinds.iter().find(|(id, _)| *id == p.track_id).map(|(_, k)| *k) {
+            Some(MediaKind::Video) => vpackets.push(p),
+            Some(MediaKind::Audio) => apackets.push(p),
+            _ => {}
+        }
+    }
+    assert!(
+        !vpackets.is_empty() && !apackets.is_empty(),
+        "真实素材必须同时含画面与声音（{} 条画面 / {} 条声音）",
+        vpackets.len(),
+        apackets.len()
+    );
+
+    // 2) 按轨各写一个文件 —— 这就是宿主实际交给引擎的那两个输入
+    let v = dir.join("video.mp4");
+    let a = dir.join("audio.mp4");
+    let mut m = Mp4Muxer::new();
+    m.set_fragment_duration_us(1_000_000);
+    m.set_tracks(&[v_track]).unwrap();
+    for p in &vpackets {
+        m.write_packet(p).unwrap();
+    }
+    std::fs::write(&v, m.finish().unwrap()).unwrap();
+
+    let mut m = Mp4Muxer::new();
+    m.set_fragment_duration_us(1_000_000);
+    m.set_tracks(&[a_track]).unwrap();
+    for p in &apackets {
+        m.write_packet(p).unwrap();
+    }
+    std::fs::write(&a, m.finish().unwrap()).unwrap();
+
+    // 3) 多输入合并（生产路径）
+    let out = dir.join("out.mp4");
+    let t0 = std::time::Instant::now();
+    run_mux(&out, &[&v, &a]);
+    let merge_ms = t0.elapsed().as_millis();
+
+    // 4) 逐字节比对
+    let (iv, _) = samples_by_kind(&v);
+    let (_, ia) = samples_by_kind(&a);
+    let (ov, oa) = samples_by_kind(&out);
+    let vb = assert_sample_exact("真实素材-画面", &iv, &ov);
+    let ab = assert_sample_exact("真实素材-声音", &ia, &oa);
+
+    println!(
+        "真实素材「拆轨 → 多输入合并」无损校验通过（{} ms）：\n  画面 {} 条采样 / {} 字节\n  声音 {} 条采样 / {} 字节",
+        merge_ms,
+        iv.len(),
+        vb,
+        ia.len(),
+        ab
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

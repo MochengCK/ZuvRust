@@ -223,8 +223,14 @@ fn run(
 
     let mut reporter = Progress::new(progress, "mux");
     let mut packets_out = 0u64;
-    // 时间轴：段起点（微秒）+ 每条输出轨已见到的末尾（微秒）
-    let mut seg_start_us = 0i64;
+    // 时间轴：**每条输出轨各自**的"下一段起点"与"已见末尾"（微秒）。
+    //
+    // ⚠️ 平移量必须**按轨**算，不能全片共用一个起点。段数不等时（一整条画面 +
+    // 三段声音、或画面 3 段 + 声音 2 段）用全片最大末尾会把少的那一方的后续段
+    // 推到对方的末尾之后 —— 产物里那一轨中间整整一段是空的（用户听到的是
+    // "合并完中间有几分钟没声音"）。按轨平移下，每条轨都接在自己的上一段末尾，
+    // 各自的 `tfdt` 仍然严格递增（fMP4 的硬要求是**每轨**递增，不是跨轨）。
+    let mut track_start_us: HashMap<u32, i64> = HashMap::new();
     let mut track_end_us: HashMap<u32, i64> = HashMap::new();
 
     for seg in &segments {
@@ -270,6 +276,8 @@ fn run(
                         let base = *first_dts
                             .entry((si.input_index, p.track_id))
                             .or_insert(p.dts);
+                        // 这一段里**这条轨**的起点（别的轨走到哪了与它无关）
+                        let seg_start_us = *track_start_us.get(&out_id).unwrap_or(&0);
 
                         let mut q = p;
                         q.track_id = out_id;
@@ -323,14 +331,20 @@ fn run(
             }
         }
 
-        // 段末把剩下的一次性取完，然后**把时间轴推到现在的末尾**：
-        // 下一段从这里接着走，`tfdt` 因此严格递增（倒退会被 fMP4 封装器当场拒绝）
+        // 段末把剩下的一次性取完，然后**把每条轨各自推到自己的末尾**：
+        // 这一段的每一轨都从自己上一段的末尾接着走，`tfdt` 因此严格递增
+        // （倒退会被 fMP4 封装器当场拒绝），而段数不等的那一方也不会被推走。
         interleaver.flush();
         while let Some(p) = interleaver.pop() {
             muxer.write(&p)?;
             packets_out += 1;
         }
-        seg_start_us = track_end_us.values().copied().max().unwrap_or(seg_start_us).max(seg_start_us);
+        for t in &out_tracks {
+            if let Some(end) = track_end_us.get(&t.id) {
+                let cur = *track_start_us.get(&t.id).unwrap_or(&0);
+                track_start_us.insert(t.id, (*end).max(cur));
+            }
+        }
     }
 
     // ── 6. 收尾 ──
