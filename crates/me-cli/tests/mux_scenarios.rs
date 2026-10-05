@@ -191,6 +191,90 @@ fn ac3_packet(id: u32, dts: i64) -> Packet {
     Packet::new(id, dts, dts, 1536, data)
 }
 
+// ───────────────────────── Matroska 输入 ─────────────────────────
+
+/// 造一个最小的 Matroska（`.mkv`）：H.264 画面 + AAC 声音。
+///
+/// 只拼测试需要的那几个元素（EBML 头 / Segment / Info / Tracks / Cluster），
+/// 但容器识别 → 轨道解析 → 块解析 → 合并这一整条链路都会被它走一遍。
+fn write_mkv(path: &Path, frames: usize) {
+    fn elen(n: u64) -> Vec<u8> {
+        let mut v = [0u8; 8];
+        v[0] = 0x01;
+        v[1..].copy_from_slice(&n.to_be_bytes()[1..]);
+        v.to_vec()
+    }
+    fn el(id: u32, body: &[u8]) -> Vec<u8> {
+        let mut v = id.to_be_bytes().to_vec();
+        while v.len() > 1 && v[0] == 0 {
+            v.remove(0);
+        }
+        v.extend_from_slice(&elen(body.len() as u64));
+        v.extend_from_slice(body);
+        v
+    }
+    fn uint(v: u64) -> Vec<u8> {
+        let b = v.to_be_bytes();
+        let s = b.iter().position(|x| *x != 0).unwrap_or(b.len() - 1);
+        b[s..].to_vec()
+    }
+
+    // avcC：第 4 字节低 2 位 + 1 = NAL 长度宽度（这里 4 字节）
+    let avcc = vec![1u8, 0x42, 0x00, 0x1E, 0xFF, 0xE0, 0x00, 0x00];
+    // AudioSpecificConfig（AAC-LC / 44.1k / 立体声）
+    let asc = vec![0x12u8, 0x10];
+
+    let mut vt = el(0xD7, &uint(1)); // TrackNumber
+    vt.extend_from_slice(&el(0x83, &uint(1))); // TrackType = video
+    vt.extend_from_slice(&el(0x86, b"V_MPEG4/ISO/AVC"));
+    vt.extend_from_slice(&el(0x63A2, &avcc));
+    let mut vsub = el(0xB0, &uint(640));
+    vsub.extend_from_slice(&el(0xBA, &uint(360)));
+    vt.extend_from_slice(&el(0xE0, &vsub));
+
+    let mut at = el(0xD7, &uint(2));
+    at.extend_from_slice(&el(0x83, &uint(2))); // TrackType = audio
+    at.extend_from_slice(&el(0x86, b"A_AAC"));
+    at.extend_from_slice(&el(0x63A2, &asc));
+    let mut asub = el(0xB5, &44_100f64.to_be_bytes());
+    asub.extend_from_slice(&el(0x9F, &uint(2)));
+    at.extend_from_slice(&el(0xE1, &asub));
+
+    let mut tracks = el(0xAE, &vt);
+    tracks.extend_from_slice(&el(0xAE, &at));
+
+    let mut info = el(0x2AD7B1, &uint(1_000_000)); // TimestampScale = 1 ms
+    info.extend_from_slice(&el(0x4489, &((frames as f64) * 33.4).to_be_bytes()));
+
+    // 一个 Cluster：每帧一个 SimpleBlock（无 lacing）
+    let mut cluster = el(0xE7, &uint(0)); // ClusterTimestamp
+    for i in 0..frames {
+        let mut vb = vec![0x81u8]; // track 1
+        vb.extend_from_slice(&((i as i16) * 33).to_be_bytes());
+        vb.push(if i == 0 { 0x80 } else { 0x00 });
+        vb.extend_from_slice(&3u32.to_be_bytes());
+        vb.extend_from_slice(&[0x65, 0x11, 0x22]);
+        cluster.extend_from_slice(&el(0xA3, &vb));
+
+        let mut ab = vec![0x82u8]; // track 2
+        ab.extend_from_slice(&((i as i16) * 33).to_be_bytes());
+        ab.push(0x80);
+        ab.extend_from_slice(&[0x21, 0x10, 0x05]);
+        cluster.extend_from_slice(&el(0xA3, &ab));
+    }
+
+    let mut ebml = el(0x4282, b"matroska"); // DocType
+    ebml.extend_from_slice(&el(0x4286, &uint(1))); // EBMLVersion
+
+    let mut seg = el(0x1549A966, &info);
+    seg.extend_from_slice(&el(0x1654AE6B, &tracks));
+    seg.extend_from_slice(&el(0x1F43B675, &cluster));
+
+    let mut out = el(0x1A45DFA3, &ebml);
+    out.extend_from_slice(&el(0x18538067, &seg));
+    std::fs::write(path, out).expect("落盘");
+}
+
 fn tmp_dir(tag: &str) -> PathBuf {
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -441,6 +525,50 @@ fn fmp4_input_merges_into_ts() {
     assert!(probe.contains("\"codec\":\"h264\""), "TS 产物里的画面：{probe}");
     assert!(probe.contains("\"codec\":\"aac\""), "TS 产物里的声音：{probe}");
     assert_eq!(track_count(&probe, "audio"), 1, "AAC 必须能读回来（ADTS 写对了）：{probe}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ───────────────────────── 3.5 Matroska 输入 ─────────────────────────
+
+/// **`.mkv` / `.webm` 合并成 MP4** —— 在此之前引擎连容器都认不出来
+/// （`probe` 会直接说"无法识别的容器"）。
+///
+/// 两条轨道都要能出来，且 H.264 的采样要从 MKV 的长度前缀布局变成 Annex-B
+/// （解封装那一步做的），否则产物是"能生成但解不了"。
+#[test]
+fn matroska_input_merges_into_mp4() {
+    let dir = tmp_dir("mkv");
+    let src = dir.join("in.mkv");
+    write_mkv(&src, 30);
+    let out = dir.join("out.mp4");
+
+    // 先确认探测认得出这个容器（能力探测契约里也要有它）
+    let (ok_probe, probe_src, err) = run(&["probe", src.to_string_lossy().as_ref(), "--json"]);
+    assert!(ok_probe, "probe 应当认出 Matroska：{err}");
+    assert!(
+        probe_src.contains("\"container\":\"matroska\""),
+        "容器名应当是 matroska：{probe_src}"
+    );
+
+    mux_ok(&out, &[&src]);
+    let probe = probe_json(&out);
+    assert!(probe.contains("\"codec\":\"h264\""), "画面应当仍是 H.264：{probe}");
+    assert!(probe.contains("\"codec\":\"aac\""), "声音应当仍是 AAC：{probe}");
+    assert_eq!(track_count(&probe, "video"), 1, "{probe}");
+    assert_eq!(track_count(&probe, "audio"), 1, "{probe}");
+
+    let packets = read_dts(&out);
+    assert!(!packets.is_empty(), "产物里应当有采样");
+    for id in [1u32, 2u32] {
+        let mut prev: Option<i64> = None;
+        for (_, dts) in packets.iter().filter(|(t, _)| *t == id) {
+            if let Some(p) = prev {
+                assert!(*dts > p, "轨 {id} 的 dts 回退了：{p} → {dts}");
+            }
+            prev = Some(*dts);
+        }
+    }
 
     let _ = std::fs::remove_dir_all(&dir);
 }

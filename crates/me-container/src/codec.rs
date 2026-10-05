@@ -33,6 +33,52 @@ pub struct SpsInfo {
 
 /// 拆出 Annex-B 里的每个 NAL（**返回的切片含起始码**）。
 ///
+/// 长度前缀布局（`avcC` / `hvcC` 那种「[4 字节长度][NAL]…」）→ Annex-B。
+///
+/// **唯一实现**：fMP4 解封装（`mp4.rs`）与 Matroska 解封装（`mkv.rs`）共用。
+/// Matroska 的 H.264/H.265 采样就是长度前缀布局，与 fMP4 一模一样 —— 两处各写
+/// 一份的话，将来修"长度越界"这类边界只会修到一边。
+///
+/// `nal_len == 0` 表示这条轨道**不是**长度前缀布局（音频、VP8/VP9、AV1 的 OBU），
+/// 原样返回 —— **不做"顺手也加个起始码"这种事**：那会把裸 AAC 帧变成噪声。
+pub fn length_prefixed_to_annexb(data: &[u8], nal_len: u8) -> Vec<u8> {
+    if nal_len == 0 {
+        return data.to_vec();
+    }
+    let n = nal_len as usize;
+    let mut out = Vec::with_capacity(data.len() + 32);
+    let mut pos = 0usize;
+    while pos + n <= data.len() {
+        let mut len = 0usize;
+        for i in 0..n {
+            len = (len << 8) | data[pos + i] as usize;
+        }
+        pos += n;
+        if len == 0 {
+            continue;
+        }
+        if pos + len > data.len() {
+            // 长度越界：这个采样坏了。把剩下的字节当最后一个 NAL 带上，
+            // 让解码器自己丢 —— 因为一个坏采样就让整条流报错，代价太大。
+            // 注意 `pos` 本身也可能已经越界（长度前缀都不完整），
+            // 那时切片会 panic，所以必须先判一下
+            if pos < data.len() {
+                out.extend_from_slice(&[0, 0, 0, 1]);
+                out.extend_from_slice(&data[pos..]);
+            }
+            break;
+        }
+        out.extend_from_slice(&[0, 0, 0, 1]);
+        out.extend_from_slice(&data[pos..pos + len]);
+        pos += len;
+    }
+    if out.is_empty() && !data.is_empty() {
+        // 全是零长度（畸形）：宁可原样交出去，也不要把数据变成空包
+        return data.to_vec();
+    }
+    out
+}
+
 /// 为什么连起始码一起返回：重封装时要原样搬运，把起始码剥掉再拼回去
 /// 只是多两次分配；而"要不要剥"是个策略问题，交给用的人决定。
 ///

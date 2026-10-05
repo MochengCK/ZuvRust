@@ -36,6 +36,7 @@ pub fn open(src: Arc<dyn ReadAt>, source: &str) -> Result<Box<dyn Demuxer>> {
     match sniff(&*src)? {
         ContainerFormat::MpegTs => Ok(Box::new(crate::ts::TsDemuxer::new(src, source)?)),
         ContainerFormat::IsoBmff => Ok(Box::new(crate::mp4::Mp4Demuxer::new(src, source)?)),
+        ContainerFormat::Matroska => Ok(Box::new(crate::mkv::MkvDemuxer::new(src, source)?)),
         ContainerFormat::Flac => Ok(Box::new(crate::flac_stream::FlacStreamDemuxer::new(src, source)?)),
         ContainerFormat::Ogg => Ok(Box::new(crate::ogg::OggOpusDemuxer::new(src, source)?)),
         ContainerFormat::Adts => Ok(Box::new(crate::adts::AdtsDemuxer::new(src, source)?)),
@@ -43,7 +44,7 @@ pub fn open(src: Arc<dyn ReadAt>, source: &str) -> Result<Box<dyn Demuxer>> {
             Ok(Box::new(crate::mpeg_audio::MpegAudioDemuxer::new(src, source)?))
         }
         ContainerFormat::Unknown => Err(me_core::MediaError::container(
-            "无法识别的容器，既不是 MPEG-TS、ISO BMFF、Ogg，也不是裸 FLAC / ADTS AAC / MPEG 音频",
+            "无法识别的容器，既不是 MPEG-TS、ISO BMFF、Matroska，也不是 Ogg / 裸 FLAC / ADTS AAC / MPEG 音频",
         )),
     }
 }

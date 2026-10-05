@@ -60,7 +60,7 @@
                      ▼
         ┌──────────────────────────────────┐
         │  me-container  容器与裸流解封装  │
-        │  TS / BMFF / Ogg / 裸流三种      │
+        │  TS / BMFF / MKV / Ogg / 裸流    │
         └──────────────────────────────────┘
                      ▲
                      │
@@ -72,7 +72,7 @@
 | crate | 职责 | 关键点 |
 |---|---|---|
 | `me-core` | 时间基/轨道/采样/字节读写/随机访问字节源 | 只有"数据形状"，没有算法与 IO |
-| `me-container` | MPEG-TS / ISO BMFF / Ogg / 裸流（MPEG 音频、ADTS AAC、FLAC）的探测与解封装 | 探测只读头部，绝不读 `mdat`；封面这类大元数据块只跳块头不读载荷 |
+| `me-container` | MPEG-TS / ISO BMFF / **Matroska（`.mkv` `.webm`）** / Ogg / 裸流（MPEG 音频、ADTS AAC、FLAC）的探测与解封装 | 探测只读头部，绝不读 `mdat`；封面这类大元数据块只跳块头不读载荷 |
 | `me-decode` | 自研解码（AAC / MP3 / FLAC / Opus / **AV1 软解进行中**）+ 平台硬解（VideoToolbox：H.264、AV1）| 硬解优先、自研软解兜底；完全不依赖任何第三方解码库 |
 | `me-mux` | 多轨交织 + TS / fMP4 封装 + 形态转换 | 只搬字节，不重编码 |
 | `me-net` | HLS / DASH / HTTP / 自研 AES / URL / XML | 不碰容器解析 |
@@ -88,7 +88,7 @@
 | crate | 状态 | 测试 |
 |---|---|---|
 | `me-core` | 完成 | 47 |
-| `me-container` | 完成（TS 188/192/204、ISO BMFF、fMP4 分片、Ogg/Opus、裸 MP3 / ADTS AAC / FLAC） | 118 |
+| `me-container` | 完成（TS 188/192/204、ISO BMFF、fMP4 分片、**Matroska / WebM**、Ogg/Opus、裸 MP3 / ADTS AAC / FLAC） | 133 |
 | `me-decode` | 完成（AAC / MP3 / FLAC / **Opus 全链**：CELT 与 SILK 两条编码路径 + 混合模式 + 冗余帧 + 两侧丢包隐藏与舒适噪声）；**AV1 硬解已接、自研软解已能出像素**（OBU / 序列头 / 颜色配置 / **整段非压缩帧头** / **瓦片切分与算术解码器（§8.2）** / **分区树（§5.11.4）** / **块级语法（§5.11.1/§5.11.5 + 系数）** ✅ 14 条真实参照流逐位精确 / **帧内预测（§7.11.2）** / **反量化 + 反变换（§7.12.4/§7.13）** / **环路滤波：去块（§7.14）+ CDEF（§7.15）+ 环路恢复（§7.17）** / **超分上采样（§7.16）** / **帧间预测（含复合、局部仿射与全局 warp、OBMC、interintra）** / **胶片颗粒合成（§7.18.3）** / **屏幕内容流：`intrabc`（§5.11.5）与 palette（§5.11.18/19）** ✅ 与 dav1d 逐像素一致） | 380 |
 | `me-mux` | 完成（交织、TS、fMP4、Annex-B↔AVCC、Opus/VP9 配置盒） | 54 |
 | `me-net` | 完成（HLS 全标签+LL-HLS、DASH+自研 XML、HTTP、自研 AES） | 104 + 2 |
@@ -386,12 +386,20 @@ cargo test --workspace > /tmp/me.log 2>&1; echo "exit=$?"; grep -E "test result|
   - **FLAC 的高采样率**（Hi-Res 的 96k/192k）装不进 `AudioSampleEntry` 那个
     16.16 定点字段（整数部分只有 16 位），此时写 0，真实采样率在 `dfLa` 的
     STREAMINFO 里 —— 解封装侧也从 STREAMINFO 读回来。
-- **VP9 在本引擎里没有输入源**：引擎还没有 WebM 解封装，所以 VP9 in fMP4 的验证走
-  "真实 WebM 的帧 + 外部播放器"（`crates/me-mux/tests/vp9_from_webm_manual.rs`，默认
-  `#[ignore]`，素材是 test-videos.co.uk 的 Big Buck Bunny VP9 360p）。顺手确认了两件事：
-  Matroska 的 VP9 `CodecPrivate` **就是** `vpcC` 的载荷（将来做 WebM 解封装时这条链零转换）；
-  而**常见 WebM 根本没有 `CodecPrivate`**，那时只能从第一帧的帧头读 profile/位深 ——
-  将来接 WebM 输入必须补这个"从帧头推导配置"的转换，否则真实文件会被"缺 vpcC"全部挡在门外。
+- **VP9 / Matroska 的两条已知缺口**（2026-10-05 接上 Matroska 解封装后更新）：
+  `.mkv` / `.webm` 现在**读得进来**（`me-container/src/mkv.rs`），VP9 in fMP4 的验证也
+  不必再绕道外部素材。但要注意两件事：
+  1. **常见 WebM 没有 `CodecPrivate`** —— 那时 VP9 轨的 `extradata` 是空的，
+     合并进 fMP4 会以"缺少 vpcC 配置"失败（这是**故意的**：宁可报错，也不要写一个
+     profile / 位深猜错的 `vpcC` 出去）。要支持这类文件，得补"从第一帧帧头推导
+     profile / 位深 / 色彩"的转换 —— 文档里那条 handoff 仍然有效。
+  2. Matroska 的 VP9 `CodecPrivate` **就是** `vpcC` 的载荷，有它的文件零转换可用。
+  - 另外 **Vorbis 与 FLAC-in-MKV 还不支持**：前者引擎没有解码器、`CodecId` 里也没有
+    这个变体；后者的 `CodecPrivate`（`fLaC` 头 + 元数据块序列）与内部的 `dfLa` 载荷
+    形态不同，转换还没做。两者都会**明确报错**（并指出是哪个 CodecID），不会静默跳过。
+  - 字幕轨与非音视频轨**直接跳过**（`.mkv` 带字幕是常态）；一条能用的轨都没有时才报错。
+  - `seek` 目前是"重头顺序扫到目标附近的关键帧"：没有 Cues 索引，这样**一定对**但慢。
+    合并路径基本不用 seek，要优化得读 `Cues`。
 - 分片 fMP4 **不写 `sidx` / `mehd` / `mfra`**（`mvhd.duration` 是 0），时长与 seek 索引要靠
   播放器自己扫分片。实测：Chromium 打开时先只能按**已读到的分片**估时长（一开始就是第一个
   分片的 2 秒），随播放一路上涨到真值；此期间 seek 到"还没读到的位置"会被夹回开头，

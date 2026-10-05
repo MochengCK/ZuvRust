@@ -66,8 +66,9 @@ fn cmd_version(args: &[String]) -> Result<u8> {
         "version": env!("CARGO_PKG_VERSION"),
         // 这两个列表是宿主"能力探测"的依据：界面据此决定哪些按钮可点。
         // `flac` / `adts` / `mpeg-audio` 是"裸流"（没有容器壳，只有一串首尾相接的音频帧）；
-        // `ogg` 是真正的容器（页序列，`.opus` 就是它装 Opus）。
-        "containers": ["mpeg-ts", "iso-bmff", "ogg", "flac", "adts", "mpeg-audio"],
+        // `ogg` 是真正的容器（页序列，`.opus` 就是它装 Opus）；
+        // `matroska` 是 EBML 家族（`.mkv` / `.webm` / `.mka`）。
+        "containers": ["mpeg-ts", "iso-bmff", "matroska", "ogg", "flac", "adts", "mpeg-audio"],
         "protocols": ["http", "hls", "dash"],
         // `concat` = mux 能把同角色的多个输入（分片/分段）按顺序接成一条连续时间轴
         "features": ["probe", "remux", "mux", "concat", "download", "play", "growing-file"],

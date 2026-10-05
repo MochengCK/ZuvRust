@@ -42,6 +42,8 @@ pub enum ContainerFormat {
     MpegTs,
     /// ISO BMFF（普通 MP4 与分段 fMP4）。
     IsoBmff,
+    /// Matroska / WebM（EBML 家族：`.mkv` / `.webm` / `.mka`）。
+    Matroska,
     /// 裸 FLAC 流（`fLaC` + 元数据块 + 音频帧）。
     Flac,
     /// Ogg 容器（页序列；本引擎目前只认里面装 Opus 的逻辑流）。
@@ -60,6 +62,7 @@ impl ContainerFormat {
         match self {
             ContainerFormat::MpegTs => "mpeg-ts",
             ContainerFormat::IsoBmff => "iso-bmff",
+            ContainerFormat::Matroska => "matroska",
             ContainerFormat::Flac => "flac",
             ContainerFormat::Ogg => "ogg",
             ContainerFormat::Adts => "adts",
@@ -94,6 +97,11 @@ pub fn sniff(src: &dyn ReadAt) -> Result<ContainerFormat> {
 
 /// 纯函数版的探测（测试与"数据已在手"的场景用它）。
 pub fn sniff_bytes(head: &[u8]) -> ContainerFormat {
+    // EBML 魔数（`1A 45 DF A3`）是 4 字节定值，比后面那些"要算一算才敢认"的
+    // 特征强得多，直接排最前
+    if mkv::looks_like_mkv(head) {
+        return ContainerFormat::Matroska;
+    }
     if looks_like_bmff(head) {
         return ContainerFormat::IsoBmff;
     }
@@ -143,19 +151,21 @@ pub fn probe(src: Arc<dyn ReadAt>, source: &str) -> Result<MediaInfo> {
     match sniff(&*src)? {
         ContainerFormat::MpegTs => Ok(ts::TsDemuxer::probe_reader(src, source)?.1),
         ContainerFormat::IsoBmff => Ok(mp4::Mp4Demuxer::probe_reader(src, source)?.1),
+        ContainerFormat::Matroska => Ok(mkv::MkvDemuxer::new(src, source)?.info()),
         ContainerFormat::Flac => Ok(flac_stream::FlacStreamDemuxer::probe_reader(src, source)?.1),
         ContainerFormat::Ogg => Ok(ogg::OggOpusDemuxer::probe_reader(src, source)?.1),
         ContainerFormat::Adts => Ok(adts::AdtsDemuxer::probe_reader(src, source)?.1),
         ContainerFormat::MpegAudio => Ok(mpeg_audio::MpegAudioDemuxer::probe_reader(src, source)?.1),
         ContainerFormat::Unknown => Err(MediaError::container(format!(
-            "无法识别的容器（看了 {} 字节，既不是 MPEG-TS、ISO BMFF、Ogg，也不是裸 FLAC / ADTS AAC / MPEG 音频）",
+            "无法识别的容器（看了 {} 字节，既不是 MPEG-TS、ISO BMFF、Matroska，也不是 Ogg / 裸 FLAC / ADTS AAC / MPEG 音频）",
             src.read_range(0, SNIFF_BYTES)?.len()
         ))),
     }
 }
 
 // 让 `sniff_bytes` 与 `probe` 能复用子模块里的实现，又不把内部细节暴露到 crate 外。
-use crate::{adts, flac_stream, mp4, mpeg_audio, ogg, ts};
+use crate::demux::Demuxer;
+use crate::{adts, flac_stream, mkv, mp4, mpeg_audio, ogg, ts};
 
 #[cfg(test)]
 mod tests {
@@ -328,9 +338,20 @@ mod tests {
     }
 
     #[test]
+    fn detects_matroska_by_the_ebml_magic() {
+        // EBML 头：`1A 45 DF A3` + 长度 + DocType 之类，这里只要魔数够判
+        let head = [0x1A, 0x45, 0xDF, 0xA3, 0x9F, 0x42, 0x86, 0x81, 0x01];
+        assert_eq!(sniff_bytes(&head), ContainerFormat::Matroska);
+        // 魔数差一个字节就不是（不能把任意 EBML 都当 Matroska）
+        let other = [0x1A, 0x45, 0xDF, 0xA2, 0x9F, 0x42, 0x86, 0x81, 0x01];
+        assert_ne!(sniff_bytes(&other), ContainerFormat::Matroska);
+    }
+
+    #[test]
     fn format_names_are_the_external_contract() {
         assert_eq!(ContainerFormat::MpegTs.name(), "mpeg-ts");
         assert_eq!(ContainerFormat::IsoBmff.name(), "iso-bmff");
+        assert_eq!(ContainerFormat::Matroska.name(), "matroska");
         assert_eq!(ContainerFormat::Flac.name(), "flac");
         assert_eq!(ContainerFormat::Adts.name(), "adts");
         assert_eq!(ContainerFormat::MpegAudio.name(), "mpeg-audio");

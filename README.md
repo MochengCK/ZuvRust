@@ -34,7 +34,7 @@
 
 ## 支持范围
 
-**容器**：MPEG-TS、ISO BMFF（mp4 / mov / m4s）、Ogg、FLAC、ADTS、MPEG 音频
+**容器**：MPEG-TS、ISO BMFF（mp4 / mov / m4s）、Matroska / WebM（mkv / webm）、Ogg、FLAC、ADTS、MPEG 音频
 
 **协议**：HTTP(S)、HLS、DASH
 
