@@ -477,7 +477,7 @@ fn predict_intrabc(
         // 规范里 intrabc 的裁剪边界是 `MiCols*MI_SIZE` / `MiRows*MI_SIZE`（按平面
         // 折一下），可以比 `FrameWidth` / `FrameHeight` **大**（最多差 7）。
         // 我们的当前帧平面只开到可见尺寸，没有那段按 MI 对齐的填充，所以再取一次
-        // min —— 只有帧宽/高不是 8 的倍数时两者才不等（与 README 里"帧右边界超块
+        // min —— 只有帧宽/高不是 8 的倍数时两者才不等（与 DEVELOPMENT.md 里"帧右边界超块
         // 伸出区"是同一类已知问题）。
         let spec_last_x = ((fh.mi_cols as i64) * 4 + i64::from(sub_x)) >> sub_x;
         let spec_last_y = ((fh.mi_rows as i64) * 4 + i64::from(sub_y)) >> sub_y;

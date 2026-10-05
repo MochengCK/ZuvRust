@@ -14,7 +14,7 @@
 | **环路恢复按 64 像素一档**（`lr.rs::LR_CHUNK`，原先按 4×4 块调用、`box_filter` 的 A/B 重复算 4~6 倍）      | 滤波阶段 8 线程 **46→32 ms**；整帧 **1.10x**（196.6→178.8） | 真素材 20 帧对 dav1d 逐像素、13 条受控流、384 单测、`ME_NO_SIMD` 开/关逐字节 |
 | **row-mt 等待 `yield_now`→20µs 短睡**（`block.rs::wait_until`，4 物理核/8 逻辑核上 yield 仍在烧前端） | ≈1.03x                                           | row-mt 顺序/并行回放逐字节一致                                    |
 
-- 文档已同步：`crates/me-decode/src/video/mod.rs` 抬头的"第十六轮"、`README.md` 性能段（⑬）。
+- 文档已同步：`crates/me-decode/src/video/mod.rs` 抬头的"第十六轮"、`DEVELOPMENT.md` 性能段（⑬）。
 - 已回填 `extra/darwin/x64/engine/zuvrust`，备份 `/tmp/me-extra-prev-20261003-perf-round16`。
 
 ## 二、当前水位（拆账，单线程；本机噪声大，只信同一时间窗内的交替对比）

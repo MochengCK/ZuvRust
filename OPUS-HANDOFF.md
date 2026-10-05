@@ -132,7 +132,7 @@ OPUS_TV_DIR=/tmp/opus_tv_pkts cargo test -p me-decode --test opus_plc_ref -- --i
 Opus 这条线**没有已知缺口了**。工程上还能做的（都不是"修 bug"）：
 
 - **fMP4 里写 Opus / VP9**（`dOps` / `vpcC` 配置盒）：现在 `remux` 到 fMP4 会明确
-  报不支持（见 README「已知限制」）。解码器做完之后，这项才算真正可用。
+  报不支持（见 DEVELOPMENT.md「已知限制」）。解码器做完之后，这项才算真正可用。
 - `me-decode` 的 clippy 还有约 60 条风格 warning（`operator precedence might not be
   obvious` 之类，集中在 `bands.rs` / `celt.rs` / `rate.rs`），纯清理。
 - 其它编解码器（Vorbis 等）仍明确报 `Unsupported`。

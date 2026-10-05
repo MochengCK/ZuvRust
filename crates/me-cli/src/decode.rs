@@ -2360,7 +2360,7 @@ fn decode_audio(input: &str, opts: DecodeOptions) -> Result<u8> {
 
     // `--seek` 在音频模式过去**被静默忽略**（只有视频路径接了它），校验时容易以为是
     // "定位到这儿解出来就是不一样"。这里与视频路径对齐：先定位再解。
-    // 裸流（mp3 / flac）没有索引，落点是"字节比例插值 + 同步到真帧头"（见 README 七）。
+    // 裸流（mp3 / flac）没有索引，落点是"字节比例插值 + 同步到真帧头"（见 DEVELOPMENT.md 七）。
     let seeked_to_us = match opts.seek_us {
         Some(us) => Some(player.seek_us(us)?),
         None => None,

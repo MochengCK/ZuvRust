@@ -3,7 +3,7 @@
 > **状态：fMP4 现在支持 H.264 / H.265 / AV1 / VP9 + AAC / FLAC / Opus。**
 > 解码器侧的权威进度表仍在 `crates/me-decode/src/audio/opus/mod.rs` 顶部（`OPUS-HANDOFF.md`
 > 是解码器的交接）；本文档说的是**容器与封装**这一侧。
-> README 的「各层状态」与「七、已知限制」已经同步更新。
+> DEVELOPMENT.md 的「各层状态」与「七、已知限制」已经同步更新。
 
 ---
 
