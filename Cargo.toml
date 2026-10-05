@@ -31,7 +31,7 @@ opt-level = 1
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
-license = "Apache-2.0"
+license = "GPL-3.0-only"
 description = "ZuvRust —— 完全自研的 Rust 媒体引擎（不依赖任何老牌媒体引擎）"
 
 [workspace.dependencies]
