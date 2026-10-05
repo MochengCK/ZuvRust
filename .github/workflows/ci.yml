@@ -17,11 +17,34 @@ name: CI
 #
 # 为什么 `verify` 不能省：`build` 验的是"这棵树"，`verify` 验的是"这个二进制"。
 # 中间隔着打包这一步（选错文件、漏拷、架构不对、tar 坏掉），而后者才是要发出去的东西。
+# 触发路径：**只有会改变产物的文件才触发构建**。
+#
+# 为什么用白名单（`paths:`）而不是黑名单（`paths-ignore:`）：漏掉一个该触发
+# 的路径，症状是"推上去了但 CI 没跑"，而且是**静默的** —— 比多跑一次构建贵得多。
+# 所以这里把"会进产物 / 会被 CI 用到"的东西逐个列出来，加新的构建输入时
+# 必须一起加这里。
+#
+# 不触发的（故意的）：`*.md`（README / AV1-AUDIT / *-HANDOFF）、`LICENSE`、
+# `.gitignore`、`tools/`（分析脚本，不参与构建与测试）。
+# ⚠️ 代价要说清楚：只改文档时 `release` 作业也不会跑，草稿 Release 的说明不会更新。
+#    需要更新时用 Actions 页面的 "Run workflow"（`workflow_dispatch`）手动触发。
 on:
   push:
     branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/**'          # CI 会调用这里的脚本
+      - '.github/workflows/**'
   pull_request:
     branches: [main]
+    paths:
+      - 'crates/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'scripts/**'
+      - '.github/workflows/**'
   workflow_dispatch:
 
 concurrency:
