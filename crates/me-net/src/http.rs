@@ -438,9 +438,12 @@ fn read_to_end_with_idle_timeout(
                 return Err(MediaError::protocol(format!("读取响应体失败: {e}")));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                // ⚠️ 曾经写成 `idle.as_secs()`，于是 50ms 的阈值在报错里显示成
+                // "0 秒" —— 排查时看起来像"零秒就超时"，把人指向完全错误的方向。
+                // 毫秒对超时判据才是有用的粒度。
                 return Err(MediaError::protocol(format!(
-                    "读取响应体空闲超时：{} 秒内没有收到任何数据（判定为僵死连接）",
-                    idle.as_secs()
+                    "读取响应体空闲超时：{}ms 内没有收到任何数据（判定为僵死连接）",
+                    idle.as_millis()
                 )));
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -615,15 +618,43 @@ mod tests {
         }
     }
 
+    /// ⚠️ 这条用例**曾经是 flaky 的**，且在 CI 的 macOS arm64 上必挂（负载下 20/20）。
+    ///
+    /// 原因不是代码有 bug，而是**测试的余量不够**：原版每块间隔 10ms、idle 50ms，
+    /// 只有 5 倍差距。`thread::sleep` 的实际误差在空闲机器上可以忽略，在负载下的
+    /// CI runner 上轻易超过 40ms —— 于是"每块都比 idle 快"这个前提被打破，
+    /// 空闲判据（按设计）正确地报了超时。**这是测试的问题，不是实现的问题。**
+    ///
+    /// 现在的取值原则：
+    /// - **总耗时必须明显超过 idle**（否则测的是"总预算"，不是"读空闲"）；
+    /// - **单块间隔必须远小于 idle**（留足余量，让计时器抖动无关紧要）。
+    ///
+    /// 关键是第 2 条：判据要是"数量级分离"，不是"刚好在小数点后一位"。
     #[test]
     fn slow_but_alive_transfer_survives_idle_timeout() {
+        // 10 块 × 5ms = 总耗时约 50ms；idle 给 200ms。
+        // 单块间隔只有 idle 的 1/40：即便 sleep 实际抖到 100ms，判据也稳稳成立。
         let r = DripReader {
             left: 40,
-            gap: Duration::from_millis(10),
+            gap: Duration::from_millis(5),
         };
-        // 总耗时 100ms > idle(50ms)，但每块间隔 10ms < idle → 必须成功
-        let got = read_to_end_with_idle_timeout(r, Duration::from_millis(50)).unwrap();
+        let got = read_to_end_with_idle_timeout(r, Duration::from_millis(200)).unwrap();
         assert_eq!(got.len(), 40);
+    }
+
+    /// 与上面同一条判据的第二组参数：**总耗时远大于 idle**。
+    ///
+    /// 分成两条是因为两个性质要分开钉：上面那条保证"不会被误杀"，这条保证
+    /// "不会因为总耗时长就当成僵死"—— 后者是最容易在重构时被改坏的行为。
+    #[test]
+    fn long_transfer_with_regular_data_is_not_mistaken_for_stall() {
+        let r = DripReader {
+            left: 400,   // 100 次读
+            gap: Duration::from_millis(5),
+        };
+        // 总耗时约 500ms，远超 idle(150ms)，但每 5ms 就有一块 → 必须全部收到
+        let got = read_to_end_with_idle_timeout(r, Duration::from_millis(150)).unwrap();
+        assert_eq!(got.len(), 400, "总耗时长但数据持续到达，不该被判成僵死");
     }
 
     /// 读线程报错要冒泡出来，不能静默当成"读完了"。

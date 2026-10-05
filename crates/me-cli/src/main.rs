@@ -70,9 +70,32 @@ fn main() -> ExitCode {
         return ExitCode::from(exit_code::OK);
     }
 
-    init_tracing(&args);
+    // `--version` / `-V`：与 `version` 子命令等价。
+    //
+    // 为什么必须认这两种写法：几乎每个命令行工具都同时提供两者（GNU 惯例），
+    // 而**冒烟脚本与 CI 会本能地写 `--version`** —— 让人以为"工具坏了"的成本
+    // 远高于多认两个参数。判据是"**第一个**参数就是它"，而不是"参数里含它"：
+    // 后者会把 `probe clip--version.mkv` 这类**文件名里带 --version** 的输入
+    // 误当成版本查询。
+    //
+    // ⚠️ 关键点：只换掉第一个参数，**其余参数原样带过去** ——
+    // `--version --json` 必须仍然是 `--json` 模式。丢掉它们的话调用方会拿到
+    // 没有 `{ok, result}` 包装的裸载荷，而它是按 `result.tracks` 这类路径读结果的
+    // —— 少一层包装就是"字段全是 null"，且**不报任何错**（最难查的一类回归）。
+    if matches!(args.first().map(String::as_str), Some("--version") | Some("-V")) {
+        let mut rest: Vec<String> = args[1..].to_vec();
+        rest.insert(0, "version".to_string());
+        init_tracing(&rest);
+        return dispatch_exit(&rest);
+    }
 
-    match commands::dispatch(&args) {
+    init_tracing(&args);
+    dispatch_exit(&args)
+}
+
+/// 执行分发并把结果翻译成退出码（`--version` 与常规路径共用这一段）。
+fn dispatch_exit(args: &[String]) -> ExitCode {
+    match commands::dispatch(args) {
         Ok(code) => ExitCode::from(code),
         Err(e) => {
             // 错误统一走 stderr，且是**一行 JSON**（宿主不必区分"正常输出"与"错误输出"
@@ -138,6 +161,7 @@ fn print_usage() {
   version                      打印版本与支持的容器/协议
 
 通用选项:
+  --version, -V                与 `version` 子命令等价（GNU 惯例）
   --json                       所有输出为一行 JSON（宿主按行解析）
   --log=<级别>                 打开日志到 stderr（默认 warn）
   --help                       显示这份说明

@@ -56,7 +56,7 @@ jobs:
           - os: macos-13
             name: macos-x86_64
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -119,7 +119,7 @@ jobs:
             artifact: windows-x86_64
             target: ""
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -176,7 +176,7 @@ jobs:
             -czf "zuvrust-${{ matrix.artifact }}.tar.gz" "zuvrust$EXT" LICENSE README.md
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: build-${{ matrix.artifact }}
           path: zuvrust-*.tar.gz
@@ -195,10 +195,10 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download all build artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts/
           merge-multiple: true

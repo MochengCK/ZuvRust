@@ -72,13 +72,50 @@ fn tmpdir(tag: &str) -> PathBuf {
     d
 }
 
-/// stdout 里的第一行 JSON（`--json` 契约：每个子命令的输出都以一行 JSON 开头）。
+/// stdout 里的第一段 JSON。
+///
+/// `--json` 契约下是一行；**不带 `--json` 时引擎会输出缩进过的多行 JSON**
+/// （人直接看更舒服，宿主走 `--json`）。所以两种形态都要认 —— 只按"取第一行"
+/// 解析会在不带 `--json` 时炸在一个看似莫名其妙的位置（EOF while parsing）。
+///
+/// 判据用"从第一个 `{` 到括号配平"而不是"按行猜"：后者对多行 JSON 天然不成立，
+/// 对一行 JSON 才成立 —— 也就是**恰好在 CI 冒烟那种"人不带 --json 调用"的
+/// 场景下才暴露**。
 fn first_json(stdout: &str) -> Value {
-    let line = stdout
-        .lines()
-        .find(|l| l.trim_start().starts_with('{'))
-        .unwrap_or_else(|| panic!("stdout 没有 JSON 行：{stdout:?}"));
-    serde_json::from_str(line).unwrap_or_else(|e| panic!("第一行不是合法 JSON（{e}）：{line:?}"))
+    let start = stdout
+        .find('{')
+        .unwrap_or_else(|| panic!("stdout 没有 JSON：{stdout:?}"));
+    let mut depth = 0i32;
+    let mut in_str = false;
+    let mut escaped = false;
+    for (i, ch) in stdout[start..].char_indices() {
+        let idx = start + i;
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else if ch == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match ch {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            // 字符串里的 '}' 不影响嵌套深度（上面已由 in_str 吃掉）
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let text = &stdout[start..=idx];
+                    return serde_json::from_str(text)
+                        .unwrap_or_else(|e| panic!("这段不是合法 JSON（{e}）：{text:?}"));
+                }
+            }
+            _ => {}
+        }
+    }
+    panic!("stdout 里的 JSON 没闭合：{stdout:?}");
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -99,6 +136,79 @@ fn version_reports_engine_name_and_version() {
         ver.starts_with(|c: char| c.is_ascii_digit()),
         "版本号应形如 0.1.0，实际 {ver:?}"
     );
+}
+
+/// `--version` / `-V` 必须与 `version` 子命令等价。
+///
+/// 这条是**被 CI 抓出来的**：冒烟步骤本能地写了 `--version`，而引擎只认 `version`
+/// 子命令，于是五个构建任务全部以"未知子命令"（退出码 2）失败。几乎每个命令行
+/// 工具都同时提供两种写法，缺失的那个会让人第一反应是"工具坏了"。
+#[test]
+fn version_flag_matches_the_version_subcommand() {
+    // 载荷位置按 `emit()` 的约定分两种：`--json` 才是 `{ok, result}` 包装的一行，
+    // 裸模式是**缩进过的裸载荷**（人直接看更舒服）。两者都要能读出来。
+    for (args, wrapped) in [
+        (vec!["--version", "--json"], true),
+        (vec!["-V", "--json"], true),
+        (vec!["version", "--json"], true),
+        (vec!["--version"], false),
+        (vec!["-V"], false),
+        (vec!["version"], false),
+    ] {
+        let (code, out, err) = run(&args);
+        assert_eq!(code, 0, "{args:?} 应成功退出，stderr={err:?}");
+        let parsed = first_json(&out);
+        let payload = if wrapped {
+            assert_eq!(
+                parsed["ok"],
+                serde_json::json!(true),
+                "{args:?} 应有 ok:true 包装：{parsed:?}"
+            );
+            parsed["result"].clone()
+        } else {
+            parsed
+        };
+        assert_eq!(payload["name"], "ZuvRust", "{args:?}：{payload:?}");
+        assert!(
+            payload["version"].as_str().is_some_and(|v| !v.is_empty()),
+            "{args:?} 应回报版本号：{payload:?}"
+        );
+    }
+
+    // ⚠️ 判据必须是"第一个参数就是它"，不能是"参数里含它"：后者会把
+    // `probe my--version.mkv` 这类**文件名里带 --version** 的输入误当成版本查询。
+    let dir = tmpdir("version-flag");
+    let tricky = dir.join("clip--version.mkv");
+    let (code, _, _) = run(&["probe", tricky.to_str().unwrap(), "--json"]);
+    assert_ne!(
+        code, 0,
+        "文件名带 --version 时不该被当成版本查询（却返回了成功）"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 裸模式与 `--json` 模式的形态差异本身就是契约（`emit()` 的行为）。
+///
+/// 单独立一条是因为它**此前完全没有测试覆盖**，而差异真实存在且容易改坏：
+/// 裸模式是缩进多行、没有 `ok`/`result` 包装；`--json` 是一行、有包装。
+/// 谁按"取第一行"的思路去解析裸输出，会在 `EOF while parsing` 上卡住 ——
+/// 而调用方里"人不带 --json 手工探测能力"正是最常见的用法。
+#[test]
+fn bare_output_is_pretty_and_json_output_is_wrapped_single_line() {
+    let (_, bare, _) = run(&["version"]);
+    assert!(
+        bare.lines().count() > 1,
+        "裸模式应输出缩进后的多行（便于人读），实际只有一行：{bare:?}"
+    );
+    assert!(
+        !bare.trim_start().starts_with("{\"ok\""),
+        "裸模式不该带 ok/result 包装（那是 --json 的形态）：{bare:?}"
+    );
+
+    let (_, wrapped, _) = run(&["version", "--json"]);
+    let lines: Vec<&str> = wrapped.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert_eq!(lines.len(), 1, "--json 模式必须**恰好一行**（宿主按行读）：{wrapped:?}");
+    assert!(lines[0].starts_with('{') && lines[0].ends_with('}'));
 }
 
 #[test]
