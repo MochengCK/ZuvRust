@@ -280,7 +280,8 @@ pub struct VtDecoder {
 impl VtDecoder {
     /// 用 `avcC`（H.264 的解码器初始化数据）建会话。
     pub fn open_h264(avcc: &[u8]) -> Result<Self> {
-        let (sps_list, pps_list) = parse_avcc(avcc)?;
+        // 参数集解析在 `h264` 里（三个平台共用；VA-API 那条路要靠它做整段解析）
+        let (sps_list, pps_list) = crate::h264::parse_avcc(avcc)?;
         // VT 要的是"参数集数组 + 长度数组"。SPS/PPS 各取第一条即可（多 SPS 是
         // 码流切换用的，播放路径上第一条就是当前序列的）。
         let mut sets: Vec<&[u8]> = Vec::new();
@@ -777,59 +778,6 @@ fn copy_nv12(image: CVImageBufferRef, pts: CmTime) -> Result<VideoFrame> {
     }
 }
 
-/// `avcC` 里拆出来的 SPS / PPS 列表：每一项是一段 NAL 负载。
-///
-/// 起个别名不只是为了压 clippy 的类型复杂度告警 —— `(Vec<Vec<u8>>, Vec<Vec<u8>>)`
-/// 光看签名分不清哪个是 SPS、哪个是 PPS，起了名字调用点才好读。
-type ParameterSets = (Vec<Vec<u8>>, Vec<Vec<u8>>);
-
-/// 从 `avcC` 里拆出 SPS / PPS 列表。
-///
-/// avcC 结构（ISO 14496-15 §5.2.4.1.1）：
-/// `[0]=1` `[1..4]=profile/compat/level` `[4]=0xFC|lengthSizeMinusOne`
-/// `[5]=0xE0|numSPS` 之后是 `u16 长度 + 内容`，再 `numPPS` + 同样的序列。
-fn parse_avcc(avcc: &[u8]) -> Result<ParameterSets> {
-    if avcc.len() < 7 || avcc[0] != 1 {
-        return Err(MediaError::Bitstream("avcC 头不合法".into()));
-    }
-    let mut pos = 5usize;
-    let num_sps = (avcc[pos] & 0x1F) as usize;
-    pos += 1;
-    let mut sps = Vec::new();
-    for _ in 0..num_sps {
-        let len = read_u16(avcc, pos)?;
-        pos += 2;
-        if pos + len > avcc.len() {
-            return Err(MediaError::Bitstream("avcC 里的 SPS 越界".into()));
-        }
-        sps.push(avcc[pos..pos + len].to_vec());
-        pos += len;
-    }
-    if pos >= avcc.len() {
-        return Err(MediaError::Bitstream("avcC 里没有 PPS".into()));
-    }
-    let num_pps = avcc[pos] as usize;
-    pos += 1;
-    let mut pps = Vec::new();
-    for _ in 0..num_pps {
-        let len = read_u16(avcc, pos)?;
-        pos += 2;
-        if pos + len > avcc.len() {
-            return Err(MediaError::Bitstream("avcC 里的 PPS 越界".into()));
-        }
-        pps.push(avcc[pos..pos + len].to_vec());
-        pos += len;
-    }
-    Ok((sps, pps))
-}
-
-fn read_u16(buf: &[u8], pos: usize) -> Result<usize> {
-    if pos + 2 > buf.len() {
-        return Err(MediaError::Bitstream("avcC 读长度越界".into()));
-    }
-    Ok(u16::from_be_bytes([buf[pos], buf[pos + 1]]) as usize)
-}
-
 /// 让 `CString` 在本文件被用到的编译单元里不报未使用（诊断信息里保留能力）。
 #[allow(dead_code)]
 fn _unused(_s: CString) {}
@@ -838,29 +786,6 @@ fn _unused(_s: CString) {}
 mod tests {
     use super::*;
     use crate::VideoDecoder;
-
-    #[test]
-    fn parses_sps_and_pps_from_avcc() {
-        // 手工造一个 avcC：[1, profile, compat, level, 0xFF, 0xE1, len=3, SPS..., 0x01, len=2, PPS...]
-        let mut avcc = vec![1u8, 0x64, 0x00, 0x28, 0xFF, 0xE1];
-        avcc.extend_from_slice(&3u16.to_be_bytes());
-        avcc.extend_from_slice(&[0x67, 0x64, 0x00]);
-        avcc.push(0x01);
-        avcc.extend_from_slice(&2u16.to_be_bytes());
-        avcc.extend_from_slice(&[0x68, 0xEE]);
-        let (sps, pps) = parse_avcc(&avcc).unwrap();
-        assert_eq!(sps, vec![vec![0x67, 0x64, 0x00]]);
-        assert_eq!(pps, vec![vec![0x68, 0xEE]]);
-    }
-
-    #[test]
-    fn rejects_garbage_avcc() {
-        assert!(parse_avcc(&[]).is_err());
-        assert!(parse_avcc(&[0u8; 8]).is_err(), "version 不是 1 要拒绝");
-        // 长度越界
-        let bad = vec![1u8, 0x64, 0x00, 0x28, 0xFF, 0xE1, 0xFF, 0xFF, 0x67];
-        assert!(parse_avcc(&bad).is_err());
-    }
 
     #[test]
     fn h264_session_opens_with_real_parameter_sets() {
