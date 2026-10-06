@@ -630,7 +630,12 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
     let client = me_stream::default_client()?;
     let opened = me_stream::open_input(&client, input, &opts.open)?;
     let (src, dash_note) = pick_source(opened)?;
-    let cfg = PlayerConfig { max_buffer_us: 1_000_000, max_buffer_packets: 1024 };
+    // ⚠️ 缓冲窗口给到 **6 秒**（原来 1 秒）：见下面"音频优先"的长注释 ——
+    // 宿主最多愿意把音频预读到播放头前 4 秒（`MAX_AUDIO_AHEAD_SEC`），
+    // 引擎要能把这段音频"读出来"就得先读到它后面的视频采样。1 秒的窗口
+    // 会让音频最多只能跑到视频解码进度前 ~1 秒，宿主的 4 秒余量永远填不满。
+    // 代价：多缓存 ~6 秒的采样（这条素材 ~0.8 MB）。
+    let cfg = PlayerConfig { max_buffer_us: 6_000_000, max_buffer_packets: 4096 };
     let mut player = Player::open(src, input, cfg)?;
     let info = player.info();
     // 视频（可选）：没有视频轨时只发声音 —— "有什么发什么"比"必须有画面"更合用
@@ -737,6 +742,29 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
     let stderr = std::io::stderr();
     let mut frames = 0u64;
     let mut audio_chunks = 0u64;
+    // ⚠️ **音频优先**（2026-10-06，修"AV1+AAC 播放时音频跳帧"）：
+    //
+    // 解码是这条循环里最慢的一环（1080p AV1 软解 ~80ms/帧，比 33ms 的实时
+    // 需求慢一倍多）。而采样在文件里是**按时间交织**的：视频采样夹在音频
+    // 采样中间。原来"读一个解一个"，于是音频的出厂速度被视频解码**卡在同一个
+    // 节拍上** —— 宿主那点音频余量（几十毫秒）一眨眼就耗干，听感上就是
+    // 断断续续 / 跳帧。
+    //
+    // 现在把视频采样先攒进 `pending_video`（只读不解），**音频到了立刻解、立刻发**：
+    // 读包本身很便宜，所以音频可以很快跑到"宿主愿意预读的上限"（4 秒），
+    // 之后宿主自带背压（`canReadMore`）会让我们自然慢下来。等攒够上限再解最老的
+    // 视频帧 —— 视频解码慢只影响**画面**的及时性，不再连累声音。
+    //
+    // 上限取"够填满宿主 4 秒音频余量 + 一点抖动余量"：150 帧 ≈ 5 秒视频，
+    // 24 MB 是硬顶（这条素材 5 秒 ≈ 0.6 MB，离顶很远）。
+    //
+    // 没有活跃音频时**不进队列**（照旧"读一个解一个"）—— 纯视频流没有要抢路的
+    // 东西，白攒只会给慢源（边下边播）添无用停顿。
+    const PENDING_VIDEO_MAX_FRAMES: usize = 150;
+    const PENDING_VIDEO_MAX_BYTES: usize = 24 << 20;
+    let mut pending_video: std::collections::VecDeque<(i64, Vec<u8>)> =
+        std::collections::VecDeque::new();
+    let mut pending_bytes = 0usize;
     let stdout = std::io::stdout();
     loop {
         let pkt = match player.next_packet() {
@@ -799,34 +827,46 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
             continue;
         }
         let pts_us = video_timebase.ticks_to_us(pkt.pts);
-        let decoded = match vdec.decode(&sample, pts_us) {
-            Ok(v) => v,
-            // 管道被对端关掉（前端换 seek / 关窗）：正常收尾，不是错误
-            Err(e) if is_broken_pipe(&e) => return Ok(crate::exit_code::OK),
-            Err(e) => return Err(e),
-        };
-        for frame in decoded {
-            let mut head = [0u8; FRAME_HEADER_BYTES];
-            head[0..4].copy_from_slice(FRAME_MAGIC);
-            head[4..8].copy_from_slice(&KIND_VIDEO.to_le_bytes());
-            head[8..12].copy_from_slice(&frame.width.to_le_bytes());
-            head[12..16].copy_from_slice(&frame.height.to_le_bytes());
-            head[16..24].copy_from_slice(&frame.pts_us.to_le_bytes());
-            head[24..28].copy_from_slice(&(frame.nv12.len() as u32).to_le_bytes());
-            let mut lock = stdout.lock();
-            if lock.write_all(&head).is_err() || lock.write_all(&frame.nv12).is_err() {
-                // 对端走了：正常收尾（与 stream 的 broken pipe 语义一致）
+        // 音频还在跟的时候，视频先攒着（见上面"音频优先"的长注释）。
+        let audio_waiting = audio_track.is_some() && audio_decoder.is_some();
+        if !audio_waiting {
+            // 没有音频要抢路：把攒着的先清掉，再照旧"读一个解一个"
+            while let Some((pts, s)) = pending_video.pop_front() {
+                pending_bytes -= s.len();
+                if !decode_and_emit_video(vdec.as_mut(), &s, pts, &mut frames)? {
+                    return Ok(crate::exit_code::OK);
+                }
+                if frames.is_multiple_of(30) {
+                    report_playhead(&stderr, opts.progress, &player, frames, audio_chunks, "playing");
+                }
+            }
+        }
+        pending_bytes += sample.len();
+        pending_video.push_back((pts_us, sample));
+        while pending_video.len() > PENDING_VIDEO_MAX_FRAMES
+            || pending_bytes > PENDING_VIDEO_MAX_BYTES
+        {
+            let Some((pts, s)) = pending_video.pop_front() else {
+                break;
+            };
+            pending_bytes -= s.len();
+            if !decode_and_emit_video(vdec.as_mut(), &s, pts, &mut frames)? {
                 return Ok(crate::exit_code::OK);
             }
-            let _ = lock.flush();
-            drop(lock);
-            frames += 1;
             if frames.is_multiple_of(30) {
                 report_playhead(&stderr, opts.progress, &player, frames, audio_chunks, "playing");
             }
         }
     }
-    // 收尾：解码器里排队的帧/段
+    // 收尾：先把攒着的视频采样解完，再让解码器冲刷内部排队的帧/段
+    if let Some(vdec) = decoder.as_mut() {
+        while let Some((pts, s)) = pending_video.pop_front() {
+            pending_bytes -= s.len();
+            if !decode_and_emit_video(vdec.as_mut(), &s, pts, &mut frames)? {
+                return Ok(crate::exit_code::OK);
+            }
+        }
+    }
     for frame in decoder.as_mut().map(|d| d.flush()).transpose()?.unwrap_or_default() {
         let mut head = [0u8; FRAME_HEADER_BYTES];
         head[0..4].copy_from_slice(FRAME_MAGIC);
@@ -862,6 +902,40 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
     }
     report_playhead(&stderr, opts.progress, &player, frames, audio_chunks, "ended");
     Ok(crate::exit_code::OK)
+}
+
+/// 解一个视频采样并把解出的帧写进 stdout；`frames` 是累计计数（调用方按它报播放头）。
+///
+/// 返回 `false` = 对端把管道关了（前端换 seek / 关窗）—— 调用方按**正常收尾**处理
+/// （与 `stream` 的 broken pipe 语义一致），不是错误。
+fn decode_and_emit_video(
+    vdec: &mut dyn me_decode::VideoDecoder,
+    sample: &[u8],
+    pts_us: i64,
+    frames: &mut u64,
+) -> Result<bool> {
+    let decoded = match vdec.decode(sample, pts_us) {
+        Ok(v) => v,
+        Err(e) if is_broken_pipe(&e) => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    for frame in decoded {
+        let mut head = [0u8; FRAME_HEADER_BYTES];
+        head[0..4].copy_from_slice(FRAME_MAGIC);
+        head[4..8].copy_from_slice(&KIND_VIDEO.to_le_bytes());
+        head[8..12].copy_from_slice(&frame.width.to_le_bytes());
+        head[12..16].copy_from_slice(&frame.height.to_le_bytes());
+        head[16..24].copy_from_slice(&frame.pts_us.to_le_bytes());
+        head[24..28].copy_from_slice(&(frame.nv12.len() as u32).to_le_bytes());
+        let mut lock = std::io::stdout().lock();
+        if lock.write_all(&head).is_err() || lock.write_all(&frame.nv12).is_err() {
+            return Ok(false);
+        }
+        let _ = lock.flush();
+        drop(lock);
+        *frames += 1;
+    }
+    Ok(true)
 }
 
 /// 原始位深的交织采样 → S16LE（前端音频输出用）。
