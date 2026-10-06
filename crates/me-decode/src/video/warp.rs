@@ -246,8 +246,91 @@ pub fn warp_estimate(
 ///
 /// 返回 `w×h` 的预测值，**精度与 `block_inter_prediction` 一致**（还要再按
 /// `InterPostRound` 收尾），所以复合/非复合两条路都能直接用它。
+///
+/// ## 两条路径（2026-10-06，第四十刀）
+///
+/// * [`block_warp_x86`]：AVX2 版（`vpmaddwd`，一次算 8 个输出）；
+/// * [`block_warp_scalar`]：逐样本标量版 —— **既是回落路径，也是判据的参照系**
+///   （`warp_simd_matches_scalar_bit_for_bit` 拿它逐值对拍）。
+///
+/// 走 SIMD 的条件（任何一条不满足就回落，结果**逐位相同**）：
+/// `ME_NO_SIMD` 未开、AVX2 可用、平面是 `u16` 存储、`bit_depth <= 10`
+/// （12bit 的中间量会超出 `i16`）、`InterRound0 >= 3`、且两个诊断开关
+/// （`AV1_WARP_REFFMT` / `AV1_WARP_SIGNED`）都关着（它们是**改语义**的旋钮，
+/// SIMD 只实现规范默认那一套）。
 #[allow(clippy::too_many_arguments)]
 pub fn block_warp(
+    dst: &mut [i32],
+    ref_plane: &Plane,
+    sub_x: u8,
+    sub_y: u8,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    params: &[i32; 6],
+    inter_round0: u32,
+    inter_round1: u32,
+) -> Result<()> {
+    debug_assert_eq!(dst.len(), (w * h) as usize, "warp 的输出缓冲长度不对");
+    #[cfg(target_arch = "x86_64")]
+    {
+        if !flags::no_simd()
+            && !ref_plane.is_u8()
+            && ref_plane.bit_depth <= 10
+            && inter_round0 >= 3
+            && !flags::warp_reffmt()
+            && !flags::warp_signed()
+            && super::simd::avx2_available()
+        {
+            let shear = setup_shear(params);
+            debug_assert!(shear.valid, "block_warp 只应当在 warpValid 时被调用");
+            // SAFETY: 已判 AVX2；`ref_plane.px16()` 的非 u8 已判；
+            //   `shear` 已过 `warpValid` ⇒ 所有 `offs` 落在 `Warped_Filters` 内
+            //   （SIMD 里另有一次整块范围校验，不成立就回落标量）。
+            if unsafe {
+                warp_x86::block_warp(
+                    dst,
+                    ref_plane.px16(),
+                    ref_plane.stride,
+                    ref_plane.w as i64 - 1,
+                    ref_plane.h as i64 - 1,
+                    x,
+                    y,
+                    w,
+                    h,
+                    sub_x,
+                    sub_y,
+                    params,
+                    shear.alpha,
+                    shear.beta,
+                    shear.gamma,
+                    shear.delta,
+                    inter_round0,
+                    inter_round1,
+                )
+            }? {
+                return Ok(());
+            }
+        }
+    }
+    block_warp_scalar(
+        dst,
+        ref_plane,
+        sub_x,
+        sub_y,
+        x,
+        y,
+        w,
+        h,
+        params,
+        inter_round0,
+        inter_round1,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn block_warp_scalar(
     dst: &mut [i32],
     ref_plane: &Plane,
     sub_x: u8,
@@ -428,9 +511,444 @@ fn round2_i64_to_i32_with(r2: &impl Fn(i64, u32) -> i64, x: i64, n: u32) -> i32 
     r2(x, n).clamp(i64::from(i32::MIN), i64::from(i32::MAX)) as i32
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// §7.11.3.5 的 AVX2 实现（2026-10-06，第四十刀）
+// ─────────────────────────────────────────────────────────────────────────────
+//
+// ## 标量版在算什么
+//
+// 每个 8×8 子块：横向 15 行 × 8 列、纵向 8 行 × 8 列，**每个输出各 8 个抽头**，
+// 而 `Warped_Filters` 是按亚像素相位查表的 ⇒ **同一行里 8 个输出的滤波器互不
+// 相同**。合计 1472 次 `imul` + 1472 次 `add`；`imul` 在这台机器上吞吐就是
+// 1 条/周期 ⇒ 光乘法 ~1500 周期/块。另外每块还有 184 次 `filter_row()`
+// （`try_from` + `filter` + `Result`）。
+//
+// ## 为什么 `vpmaddwd` 一次能吃掉 8 个抽头
+//
+// `vpmaddwd(a, b)` 把 16 个 `i16` 通道两两配对成 8 个 `i32`：
+// `out[m] = a[2m]·b[2m] + a[2m+1]·b[2m+1]`。抽头 ∈ `[-127, 127]`、样本 ∈ `[0, 4095]`
+// ⇒ 一个输出的 8 个乘积和 ≤ `4095·222 = 908,890`，`i32` 装得下。
+//
+// ## 关键：8 个**不同**的滤波器怎么共享一次 `pmaddwd`
+//
+// 输出 `j` 的源窗口是 `src[j .. j+8]` —— **相邻输出只差一个样本**。于是把两个输出
+// `(2p, 2p+1)` 的 8 抽头系数放进 256 位寄存器的两个 128 位道（`set_m128i`），
+// 源窗口用 `_mm256_loadu2_m128i(src + 2p + 1, src + 2p)` 一次载入两个错开一个样本
+// 的窗口 —— `madd` 出的 8 个 `i32` 正好是「低道 4 个部分和 = 输出 2p、高道 4 个
+// = 输出 2p+1」。4 组 `madd`（8 个输出）+ 3 次 `hadd` 把每组的 4 个部分和收成 1 个：
+//
+// ```text
+//   t01 = hadd(m0, m1)   t23 = hadd(m2, m3)   u = hadd(t01, t23)
+//   u = [ s0, s2, s4, s6,   s1, s3, s5, s7 ]     ← 偶数输出在低道、奇数在高道
+// ```
+//
+// 取整（`Round2(·, r)`）在向量里做（`add` + `sra`），再 `packs_epi32` 收成 `i16`、
+// `pshufb` 摆回 `[s0..s7]`，一次 16 字节存进中间缓冲。
+//
+// ## 纵向：先把中间缓冲转置
+//
+// 纵向第 `i1v` 个输出用 `inter[i1v + k][i2v]` —— 沿**行**方向取抽头，在行主序里跨
+// `stride`。把 15×8 的中间缓冲转置成 `interT[列][行]`（两个 8×8 `i16` 转置）之后，
+// 每一列的 8 个抽头就**连续**了 ⇒ 纵向原样复用横向那一套。
+//
+// ## 值域与前提（任何一条不满足 ⇒ 返回 `Ok(false)`，调用方回落标量）
+//
+// * 中间量 = `Round2(Σ c·x, r0)`，上界 `4095·222 >> r0`：**8bit 7076、10bit 28388**
+//   ⇒ 装得进 `i16`；**12bit 113612 装不下**（由调用方的 `bit_depth <= 10` 挡住）。
+// * 纵向的和 ≤ `222 · 28388 = 6.3e6`，`madd` 的 `i32` 结果够。
+// * `offs` 的范围由「`sx`/`sy` 是线性的、极值在角点」推出 —— 越界就回落标量
+//   （标量路径会给出原来那条精确的报错）。
+//
+// 判据：[`tests::warp_simd_matches_scalar_bit_for_bit`]。
+#[cfg(target_arch = "x86_64")]
+mod warp_x86 {
+    use super::super::warp_tables::WARPED_FILTERS_I16;
+    use super::{WARPEDMODEL_PREC_BITS, WARPEDPIXEL_PREC_SHIFTS};
+    use me_core::Result;
+    use std::arch::x86_64::*;
+
+    /// `Warped_Filters` 的合法下标上界。
+    const OFF_MAX: i64 = 192;
+
+    /// 8×8 的 **`i16` 转置**（`x[i]` = 第 i 行 → 返回第 i 列）。转置自逆。
+    ///
+    /// 24 条 shuffle —— 与去块那次的 `dbl_transpose8` 同一套（那版已被逐位对拍验过）。
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn transpose8(x: [__m128i; 8]) -> [__m128i; 8] {
+        let a0 = _mm_unpacklo_epi16(x[0], x[1]);
+        let a1 = _mm_unpackhi_epi16(x[0], x[1]);
+        let a2 = _mm_unpacklo_epi16(x[2], x[3]);
+        let a3 = _mm_unpackhi_epi16(x[2], x[3]);
+        let a4 = _mm_unpacklo_epi16(x[4], x[5]);
+        let a5 = _mm_unpackhi_epi16(x[4], x[5]);
+        let a6 = _mm_unpacklo_epi16(x[6], x[7]);
+        let a7 = _mm_unpackhi_epi16(x[6], x[7]);
+        let b0 = _mm_unpacklo_epi32(a0, a2);
+        let b1 = _mm_unpackhi_epi32(a0, a2);
+        let b2 = _mm_unpacklo_epi32(a1, a3);
+        let b3 = _mm_unpackhi_epi32(a1, a3);
+        let b4 = _mm_unpacklo_epi32(a4, a6);
+        let b5 = _mm_unpackhi_epi32(a4, a6);
+        let b6 = _mm_unpacklo_epi32(a5, a7);
+        let b7 = _mm_unpackhi_epi32(a5, a7);
+        [
+            _mm_unpacklo_epi64(b0, b4),
+            _mm_unpackhi_epi64(b0, b4),
+            _mm_unpacklo_epi64(b1, b5),
+            _mm_unpackhi_epi64(b1, b5),
+            _mm_unpacklo_epi64(b2, b6),
+            _mm_unpackhi_epi64(b2, b6),
+            _mm_unpacklo_epi64(b3, b7),
+            _mm_unpackhi_epi64(b3, b7),
+        ]
+    }
+
+    /// 把 8 个滤波器（每个 8 个 `i16`）拼成 4 个 256 位寄存器：`p` 号寄存器装
+    /// `[f_{2p} | f_{2p+1}]`（低道 = 偶数号输出）。
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn gather_filters(offs: &[usize; 8]) -> [__m256i; 4] {
+        let f = |j: usize| -> __m128i {
+            _mm_loadu_si128(WARPED_FILTERS_I16[offs[j]].as_ptr() as *const __m128i)
+        };
+        [
+            _mm256_set_m128i(f(1), f(0)),
+            _mm256_set_m128i(f(3), f(2)),
+            _mm256_set_m128i(f(5), f(4)),
+            _mm256_set_m128i(f(7), f(6)),
+        ]
+    }
+
+    /// 4 组 `madd` + 3 次 `hadd`：`u = [s0,s2,s4,s6, s1,s3,s5,s7]`。
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn dot8(c: &[__m256i; 4], a: &[__m256i; 4]) -> __m256i {
+        let m0 = _mm256_madd_epi16(c[0], a[0]);
+        let m1 = _mm256_madd_epi16(c[1], a[1]);
+        let m2 = _mm256_madd_epi16(c[2], a[2]);
+        let m3 = _mm256_madd_epi16(c[3], a[3]);
+        _mm256_hadd_epi32(_mm256_hadd_epi32(m0, m1), _mm256_hadd_epi32(m2, m3))
+    }
+
+    /// `Block warp process` 的 AVX2 版。返回 `Ok(false)` = **这条流不能走 SIMD**
+    /// （相位越出 `Warped_Filters`），调用方应当回落 [`super::block_warp_scalar`]。
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "avx2")]
+    pub(super) unsafe fn block_warp(
+        dst: &mut [i32],
+        data: &[u16],
+        stride: usize,
+        last_x: i64,
+        last_y: i64,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        sub_x: u8,
+        sub_y: u8,
+        params: &[i32; 6],
+        alpha: i32,
+        beta: i32,
+        gamma: i32,
+        delta: i32,
+        inter_round0: u32,
+        inter_round1: u32,
+    ) -> Result<bool> {
+        debug_assert!(inter_round0 >= 1 && inter_round0 <= 14);
+        debug_assert!(inter_round1 >= 1 && inter_round1 <= 14);
+        let prec_bits = WARPEDMODEL_PREC_BITS as i64;
+        let prec_mask = (1i64 << prec_bits) - 1;
+        let shifts = i64::from(WARPEDPIXEL_PREC_SHIFTS);
+        let r0 = _mm_cvtsi32_si128(inter_round0 as i32);
+        let r1 = _mm_cvtsi32_si128(inter_round1 as i32);
+        let half0 = _mm256_set1_epi32(1i32 << (inter_round0 - 1));
+        let half1 = _mm256_set1_epi32(1i32 << (inter_round1 - 1));
+        // `packs_epi32` 之后 `i16` 通道顺序是 `[s0,s2,s4,s6,s1,s3,s5,s7]`，
+        // 用 `pshufb` 摆成 `[s0..s7]`。
+        let reorder = _mm_setr_epi8(0, 1, 8, 9, 2, 3, 10, 11, 4, 5, 12, 13, 6, 7, 14, 15);
+
+        for i8 in 0..((h - 1) >> 3) + 1 {
+            for j8 in 0..((w - 1) >> 3) + 1 {
+                let src_x = i64::from((x + j8 * 8 + 4) << sub_x);
+                let src_y = i64::from((y + i8 * 8 + 4) << sub_y);
+                let dst_x = i64::from(params[2]) * src_x
+                    + i64::from(params[3]) * src_y
+                    + i64::from(params[0]);
+                let dst_y = i64::from(params[4]) * src_x
+                    + i64::from(params[5]) * src_y
+                    + i64::from(params[1]);
+                let x4 = dst_x >> sub_x;
+                let y4 = dst_y >> sub_y;
+                let ix4 = x4 >> prec_bits;
+                let iy4 = y4 >> prec_bits;
+                let sx4 = x4 & prec_mask;
+                let sy4 = y4 & prec_mask;
+
+                let i1_end = 4i64.min(i64::from(h) - i64::from(i8) * 8 - 4);
+                let i2_end = 4i64.min(i64::from(w) - i64::from(j8) * 8 - 4);
+                let nrow = (i1_end + 4).clamp(0, 8) as usize;
+                let ncol = (i2_end + 4).clamp(0, 8) as usize;
+                if nrow == 0 || ncol == 0 {
+                    continue;
+                }
+
+                // ── 相位范围校验：`sx`/`sy` 对 (i1,i2) 是线性的 ⇒ 极值在角点 ──
+                // 横向 `i2 ∈ [-4,3]`、`i1 ∈ [-7,7]`；纵向两者都 ∈ `[-4,3]`
+                // （用满区间是**超集**，只会多回落、不会算错）。
+                let ext = |s: i32, lo_coef: i64, hi_coef: i64| -> (i64, i64) {
+                    let v = i64::from(s);
+                    if s >= 0 {
+                        (v * lo_coef, v * hi_coef)
+                    } else {
+                        (v * hi_coef, v * lo_coef)
+                    }
+                };
+                let (amin, amax) = ext(alpha, -4, 3);
+                let (bmin, bmax) = ext(beta, -7, 7);
+                let (gmin, gmax) = ext(gamma, -4, 3);
+                let (dmin, dmax) = ext(delta, -4, 3);
+                let off_lo_h = ((sx4 + amin + bmin + 512) >> 10) + shifts;
+                let off_hi_h = ((sx4 + amax + bmax + 512) >> 10) + shifts;
+                let off_lo_v = ((sy4 + gmin + dmin + 512) >> 10) + shifts;
+                let off_hi_v = ((sy4 + gmax + dmax + 512) >> 10) + shifts;
+                if off_lo_h < 0 || off_hi_h > OFF_MAX || off_lo_v < 0 || off_hi_v > OFF_MAX {
+                    return Ok(false);
+                }
+
+                // ── 横向：15 行 × 8 列（结果存 `i16`）────────────────────────
+                // `inter[i1v]` 的第 `j` 个 `i16` = 输出列 `j` 的中间值。
+                // 第 15 行只是转置时的填充（纵向最多取到下标 14）。
+                let mut inter = [[0i16; 8]; 16];
+                let mut win = [0u16; 16];
+                let interior = ix4 - 7 >= 0
+                    && ix4 + 7 <= last_x
+                    && iy4 - 7 >= 0
+                    && iy4 + 7 <= last_y;
+                for i1v in 0..15i64 {
+                    let mut offs = [0usize; 8];
+                    let mut sx = sx4 + i64::from(alpha) * -4 + i64::from(beta) * (i1v - 7);
+                    for o in offs.iter_mut() {
+                        *o = (((sx + 512) >> 10) + shifts) as usize;
+                        sx += i64::from(alpha);
+                    }
+                    let row: *const u16 = if interior {
+                        data.as_ptr()
+                            .add((iy4 - 7 + i1v) as usize * stride + (ix4 - 7) as usize)
+                    } else {
+                        let r = (iy4 + i1v - 7).clamp(0, last_y) as usize * stride;
+                        for t in 0..16i64 {
+                            let c = (ix4 - 7 + t).clamp(0, last_x) as usize;
+                            win[t as usize] = *data.get_unchecked(r + c);
+                        }
+                        win.as_ptr()
+                    };
+                    let c = gather_filters(&offs);
+                    let a = [
+                        _mm256_loadu2_m128i(
+                            row.add(1) as *const __m128i,
+                            row as *const __m128i,
+                        ),
+                        _mm256_loadu2_m128i(
+                            row.add(3) as *const __m128i,
+                            row.add(2) as *const __m128i,
+                        ),
+                        _mm256_loadu2_m128i(
+                            row.add(5) as *const __m128i,
+                            row.add(4) as *const __m128i,
+                        ),
+                        _mm256_loadu2_m128i(
+                            row.add(7) as *const __m128i,
+                            row.add(6) as *const __m128i,
+                        ),
+                    ];
+                    let v = _mm256_sra_epi32(_mm256_add_epi32(dot8(&c, &a), half0), r0);
+                    let p16 = _mm_packs_epi32(
+                        _mm256_castsi256_si128(v),
+                        _mm256_extracti128_si256::<1>(v),
+                    );
+                    _mm_storeu_si128(
+                        inter[i1v as usize].as_mut_ptr() as *mut __m128i,
+                        _mm_shuffle_epi8(p16, reorder),
+                    );
+                }
+
+                // ── 转置 15×8 → `interT[列][行]`（两个 8×8 转置）─────────────
+                let mut inter_t = [[0i16; 16]; 8];
+                for grp in 0..2usize {
+                    let mut g = [_mm_setzero_si128(); 8];
+                    for (r, slot) in g.iter_mut().enumerate() {
+                        *slot = _mm_loadu_si128(
+                            inter[grp * 8 + r].as_ptr() as *const __m128i
+                        );
+                    }
+                    let t = transpose8(g);
+                    for (c, col) in t.iter().enumerate() {
+                        _mm_storeu_si128(
+                            inter_t[c].as_mut_ptr().add(grp * 8) as *mut __m128i,
+                            *col,
+                        );
+                    }
+                }
+
+                // ── 纵向：8 行 × 8 列 ────────────────────────────────────────
+                let mut rowbuf = [0i32; 8];
+                for i1v in 0..nrow {
+                    let mut offs = [0usize; 8];
+                    let mut sy = sy4 + i64::from(gamma) * -4 + i64::from(delta) * (i1v as i64 - 4);
+                    for o in offs.iter_mut() {
+                        *o = (((sy + 512) >> 10) + shifts) as usize;
+                        sy += i64::from(gamma);
+                    }
+                    let c = gather_filters(&offs);
+                    let a = [
+                        _mm256_loadu2_m128i(
+                            inter_t[1].as_ptr().add(i1v) as *const __m128i,
+                            inter_t[0].as_ptr().add(i1v) as *const __m128i,
+                        ),
+                        _mm256_loadu2_m128i(
+                            inter_t[3].as_ptr().add(i1v) as *const __m128i,
+                            inter_t[2].as_ptr().add(i1v) as *const __m128i,
+                        ),
+                        _mm256_loadu2_m128i(
+                            inter_t[5].as_ptr().add(i1v) as *const __m128i,
+                            inter_t[4].as_ptr().add(i1v) as *const __m128i,
+                        ),
+                        _mm256_loadu2_m128i(
+                            inter_t[7].as_ptr().add(i1v) as *const __m128i,
+                            inter_t[6].as_ptr().add(i1v) as *const __m128i,
+                        ),
+                    ];
+                    let v = _mm256_sra_epi32(_mm256_add_epi32(dot8(&c, &a), half1), r1);
+                    let lo = _mm256_castsi256_si128(v);
+                    let hi = _mm256_extracti128_si256::<1>(v);
+                    _mm_storeu_si128(
+                        rowbuf.as_mut_ptr() as *mut __m128i,
+                        _mm_unpacklo_epi32(lo, hi),
+                    );
+                    _mm_storeu_si128(
+                        rowbuf.as_mut_ptr().add(4) as *mut __m128i,
+                        _mm_unpackhi_epi32(lo, hi),
+                    );
+                    let base = ((i8 * 8 + i1v as i32) * w + j8 * 8) as usize;
+                    dst[base..base + ncol].copy_from_slice(&rowbuf[..ncol]);
+                }
+            }
+        }
+        Ok(true)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// AVX2 的 `block_warp` 与标量版**逐位对拍**（第四十刀）。
+    ///
+    /// 覆盖面：`bit_depth ∈ {8, 10}` × 平面尺寸 `{64×48, 16×16, 9×13}` × 6 组
+    /// `warpParams`（恒等 / 纯平移 / 小剪切 / 对角剪切 / **大平移** —— 后者把取样
+    /// 窗口推出帧外，逼出**非内点**那条逐样本钳位分支）× 3 组块位置与尺寸
+    /// （含贴着右/下边界、以及 9×13 这种"`i8`/`j8` 两组都只走一半"的）× 3 档取整。
+    ///
+    /// 每组都断言 SIMD **真的接手了**（`Ok(true)`）—— 否则"对拍通过"可能只是
+    /// 两边都没跑（回落标量时是自己跟自己比）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn warp_simd_matches_scalar_bit_for_bit() {
+        if !super::super::simd::avx2_available() {
+            return;
+        }
+        let param_sets: [[i32; 6]; 6] = [
+            [0, 0, 1 << 16, 0, 0, 1 << 16],
+            [37, -21, 1 << 16, 0, 0, 1 << 16],
+            [0, 0, (1 << 16) + 8192, 0, 0, 1 << 16],
+            [0, 0, (1 << 16) + 4096, 3072, -2048, 1 << 16],
+            [-3_000_000, 2_000_000, 1 << 16, 0, 0, 1 << 16],
+            [0, 0, 1 << 16, 0, 0, (1 << 16) + 2048],
+        ];
+        for &bd in &[8u8, 10] {
+            let max = (1i32 << bd) - 1;
+            let mut ran = 0usize;
+            let mut shears_ok = 0usize;
+            for &(pw, ph) in &[(64usize, 48usize), (16, 16), (9, 13)] {
+                let mut plane = Plane::new(pw, ph, bd);
+                if plane.is_u8() {
+                    // u8 存储的迁移还没做完；SIMD 这一路只吃 u16 平面。
+                    return;
+                }
+                {
+                    let d = plane.px16_mut();
+                    let mut s = 0x1234_5678u32;
+                    for v in d.iter_mut() {
+                        s ^= s << 13;
+                        s ^= s >> 17;
+                        s ^= s << 5;
+                        *v = (s & max as u32) as u16;
+                    }
+                }
+                for params in &param_sets {
+                    let shear = setup_shear(params);
+                    if !shear.valid {
+                        continue;
+                    }
+                    shears_ok += 1;
+                    for &(bx, by, bw, bh) in &[
+                        (0i32, 0i32, 16i32, 16i32),
+                        (16, 8, 32, 24),
+                        (pw as i32 - 9, ph as i32 - 13, 9, 13),
+                    ] {
+                        if bw <= 0 || bh <= 0 || bx + bw > pw as i32 || by + bh > ph as i32 {
+                            continue;
+                        }
+                        for &(r0, r1) in &[(3u32, 11u32), (3, 7), (5, 9)] {
+                            let n = (bw * bh) as usize;
+                            let mut a = vec![0i32; n];
+                            let mut b = vec![0i32; n];
+                            block_warp_scalar(&mut a, &plane, 0, 0, bx, by, bw, bh, params, r0, r1)
+                                .unwrap();
+                            // SAFETY: 已判 AVX2；参数与标量路径同一份（`shear` 已过
+                            //   `warpValid`），相位范围校验不通过时函数会返回 `Ok(false)`
+                            //   而不是算错。
+                            let ok = unsafe {
+                                warp_x86::block_warp(
+                                    &mut b,
+                                    plane.px16(),
+                                    plane.stride,
+                                    pw as i64 - 1,
+                                    ph as i64 - 1,
+                                    bx,
+                                    by,
+                                    bw,
+                                    bh,
+                                    0,
+                                    0,
+                                    params,
+                                    shear.alpha,
+                                    shear.beta,
+                                    shear.gamma,
+                                    shear.delta,
+                                    r0,
+                                    r1,
+                                )
+                            }
+                            .unwrap();
+                            assert!(ok, "SIMD 回落了（相位越界）：{params:?}");
+                            ran += 1;
+                            assert_eq!(
+                                a, b,
+                                "bd={bd} plane={pw}x{ph} params={params:?} \
+                                 block=({bx},{by},{bw},{bh}) r=({r0},{r1})"
+                            );
+                        }
+                    }
+                }
+            }
+            // ⚠️ 防止"空跑"：`shear.valid` 全为假或块全被跳过时，上面的断言一次都
+            // 不会执行、测试会**假绿**。这里把规模钉死。
+            assert!(shears_ok >= 3, "参数集几乎都没过 `warpValid`：{shears_ok}");
+            assert!(ran >= 40, "对拍组合太少（{ran}），测试可能在空跑");
+        }
+    }
 
     #[test]
     fn resolve_divisor_matches_the_spec_worked_example() {

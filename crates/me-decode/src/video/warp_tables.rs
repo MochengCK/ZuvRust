@@ -205,6 +205,26 @@ pub const WARPED_FILTERS: [[i32; 8]; 193] = [
     [   0,    0,    0,    0,    2,  127,   -1,    0],
 ];
 
+/// [`WARPED_FILTERS`] 的 **`i16` 版**（2026-10-06，给 AVX2 的 `vpmaddwd` 用）。
+///
+/// 表里的抽头值域是 `[-127, 127]`、`Σ|c| ≤ 222`（全部 193 行扫过一遍），
+/// 所以 `i16` 绰绰有余 —— 而 `i16` 正是 `pmaddwd` 要求的宽度（一次 16 个 i16 通道
+/// ⇒ 一拍算完一个输出的 8 个抽头）。**内容由 [`WARPED_FILTERS`] 派生**，
+/// 仍然不需要手改（改表只改上面那一张）。
+pub const WARPED_FILTERS_I16: [[i16; 8]; 193] = {
+    let mut out = [[0i16; 8]; 193];
+    let mut i = 0;
+    while i < 193 {
+        let mut k = 0;
+        while k < 8 {
+            out[i][k] = WARPED_FILTERS[i][k] as i16;
+            k += 1;
+        }
+        i += 1;
+    }
+    out
+};
+
 /// `Div_Lut[DIV_LUT_NUM]`（§7.11.3.7）：`Div_Lut[0] = 16384 = 2^DIV_LUT_PREC_BITS`。
 pub const DIV_LUT: [i32; 257] = [
     16384, 16320, 16257, 16194, 16132, 16070, 16009, 15948, 15888, 15828, 15768,

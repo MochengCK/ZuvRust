@@ -1610,17 +1610,23 @@ fn scratch_of_i16(v: &mut Vec<i16>, n: usize) -> &mut [i16] {
 ///
 /// 抽出来是因为**两条横向路径都要用它**（8bit 走整块内核、10/12bit 走逐行），
 /// 复制一份迟早会漂。
+///
+/// ⚠️ `interp_rows` 是**显式传进来的**，不在这里 `intermediate.len() / wu` 现算：
+/// 那是一次**变量除数**的整数除法（~25 周期），而本函数每个预测块调一次
+/// （1080p 一帧 3 万多次 ⇒ 约 0.5 ms/帧）。调用方本来就知道这个值
+/// （`interp_h`），直接给就行。
 #[allow(clippy::too_many_arguments)]
 fn mc_vertical_pass(
     intermediate: &[i16],
     dst: &mut [i32],
     wu: usize,
     h: usize,
+    interp_rows: usize,
     fy: &[i16; 8],
     inter_round1: u32,
     simd: bool,
 ) -> Result<()> {
-    let rows = intermediate.len() / wu;
+    let rows = interp_rows;
     // 原实现是逐行判 `r + 8 > rows`；`r` 最大 `h-1` ⇒ 等价于开头判一次 `h + 7 > rows`。
     if h + 7 > rows {
         return Err(MediaError::Bitstream("帧间预测的中间缓冲越界".into()));
@@ -1712,19 +1718,34 @@ fn block_inter_prediction(
             // 推导与全值域验证见 `simd::mc_shift8` 的说明）。用化简后的内核，
             // 每 8 个通道省掉两轮 `slli`+`add`+`srai`。
             let post_round = 2 * FILTER_BITS - (inter_round0 + inter_round1);
-                        for r in 0..h as usize {
+            // **整块一次调**（2026-10-05 第三十七轮）：原来是逐行调 `mc_shift_row`，
+            // 而它是 `#[target_feature]` ⇒ 不能被这里内联 ⇒ 1080p 一帧约 20 万次
+            // 真实函数调用。与第二十九轮 `mc_horiz_rows_8bpc` 同一个改法。
+            let c_end = if simd {
+                // SAFETY: 已判 AVX2；行下标由内核 `clip(y0 + r, last_y)` 现算
+                // （每一行都在 `data` 内）、`dst` 恰好 `h * wu` 项。
+                debug_assert!((h as usize) <= MAX_SB_SIZE, "整数相位快路径的块高超出最大块");
+                unsafe {
+                    simd::mc_shift_rows(
+                        data,
+                        stride,
+                        y0,
+                        last_y,
+                        h as usize,
+                        x0 as isize,
+                        post_round,
+                        wu,
+                        dst.as_mut_ptr(),
+                    )
+                }
+            } else {
+                0
+            };
+            for r in 0..h as usize {
                 let sy = clip(y0 + r as i64, last_y) as usize;
                 let row = &data[sy * stride..];
                 let out = &mut dst[r * wu..r * wu + wu];
-                let mut c = 0usize;
-                if simd {
-                    // **整行一次**（2026-10-05）：原来每 8 个像素一次跨 `target_feature`
-                    // 调用，1920 宽的一行要付 240 次函数调用。
-                    // SAFETY: 已判 AVX2；`interior` 保证 `[x0, x0+wu)` 全在帧内。
-                    c = unsafe {
-                        simd::mc_shift_row(row, x0 as isize, post_round, wu, out)
-                    };
-                }
+                let mut c = c_end;
                 while c < wu {
                     let sx = clip(x0 + c as i64, last_x) as usize;
                     // ⚠️ 这里**不能**直接写 `row[sx]`：δ 只保证"每趟只剩乘 128"，
@@ -1759,19 +1780,18 @@ fn block_inter_prediction(
         let simd = simd::avx2_available();
         if simd && plane_data.bit_depth == 8 {
             // **整块**的横向趟（一次调用做完全部行，见 `simd::mc_horiz_rows_8bpc`）。
-            // 源行下标在这里一次钳好（原来在行循环里逐行做 `i64` 钳位）。
-            let mut row_idx = [0usize; MAX_SB_SIZE + 16];
-            debug_assert!(interp_h <= row_idx.len(), "interp_h 超出预期的最大块高");
-            for (r, slot) in row_idx[..interp_h].iter_mut().enumerate() {
-                *slot = clip(y0 + r as i64 - 3, last_y) as usize;
-            }
-            // SAFETY: 已判 AVX2；`data` 覆盖 `row_idx` 指到的每一行、`intermediate`
+            // 行下标**由内核现算**（`clip(y0 + r - 3, last_y)`）—— 这里原先为它开一个
+            // `[0usize; MAX_SB_SIZE + 16]` 的数组，等于每次调用先把 1.1 KB 清零
+            // （1080p 一帧约 7.6 万次调用 ≈ 88 MB 白写，2026-10-05 第三十七轮去掉）。
+            // SAFETY: 已判 AVX2；行下标由内核钳到 `last_y`、`intermediate`
             // 至少有 `interp_h * wu` 项（`need` 就是按它算的）。
             unsafe {
                 simd::mc_horiz_rows_8bpc(
                     data,
                     stride,
-                    &row_idx[..interp_h],
+                    y0,
+                    last_y,
+                    interp_h,
                     x0 as isize,
                     wu,
                     fx,
@@ -1782,7 +1802,16 @@ fn block_inter_prediction(
                 )
             };
             
-                        mc_vertical_pass(intermediate, dst, wu, h as usize, fy, inter_round1, true)?;
+                        mc_vertical_pass(
+                            intermediate,
+                            dst,
+                            wu,
+                            h as usize,
+                            interp_h,
+                            fy,
+                            inter_round1,
+                            true,
+                        )?;
             
             return Ok(());
         }
@@ -1822,7 +1851,16 @@ fn block_inter_prediction(
             }
         }
         
-                mc_vertical_pass(intermediate, dst, wu, h as usize, fy, inter_round1, simd)?;
+                mc_vertical_pass(
+                    intermediate,
+                    dst,
+                    wu,
+                    h as usize,
+                    interp_h,
+                    fy,
+                    inter_round1,
+                    simd,
+                )?;
         
         return Ok(());
     }
