@@ -320,17 +320,47 @@ impl<'a> SymbolDecoder<'a> {
     /// `read_symbol` 的本体；`update` 决定是否做 CDF 自适应。
     #[track_caller]
     fn read_symbol_inner(&mut self, cdf: &mut [u16], update: bool) -> Result<u32> {
-        let smb_before = self.symbol_max_bits;
-        let trace = Self::trace_sym()
+        // ── 诊断开销（2026-10-06 第四十三刀）────────────────────────────────
+        //
+        // 这是**每符号一次**的路径，而 1080p 真素材实测**一帧 43.4 万个符号**
+        // （用 `AV1_TRACE_SYM` 数的：`--count=2` 共 867,730 个）⇒ 这里每多一条
+        // 指令，一帧就是 43 万条。
+        //
+        // 原来无条件做的事：查 3 个静态开关（`trace_sym` / `trace_sym_limit` /
+        // `in_traced_frame`）、读 `trace_n`、读 `symbol_range`/`symbol_value`/
+        // `label`/`tag` 四个字段、`trace_n += 1`，再加**环形缓冲那一笔 48 字节
+        // 写入**（6 个 store + 一次取模）。粗算 25~30 uop/符号。
+        //
+        // 实测：**`AV1_SYNTAX_ONLY=1` 隔离语法 −1.9%（16/24）与 −1.2%（26/48）**；
+        // 默认全流程 +0.5%（10/24）**是噪声** —— 本函数占整帧只 3.2%、占语法阶段
+        // 11%，削掉约 20% uop ⇒ 整帧预期只 −0.6%，**低于本机测量地板**。
+        // ⇒ 用 `AV1_SYNTAX_ONLY` 隔离阶段来测，信噪比高约 3 倍。
+        //
+        // 改法：**两个总开关各只查一次**（`OnceLock<bool>` 的 acquire load），
+        // 其余全部门控。⚠️ **第一次改漏了 `trace_id` 与 `smb_before` 两处无条件
+        // 读**，反汇编里新版本反而多出 47 条指令（prologue 多一轮栈溢出/重载）
+        // ⇒ 收益被吃掉。教训：**改完必须反汇编对比热路径，别只看源码"看起来更少"**。
+        //
+        // 正确性：`trace_n` 只在开着 trace 时递增，trace 开着时它与原来**逐符号
+        // 相同**（原式也是每符号 +1）；环形缓冲只在 `AV1_RECENT=1` 时记录，而它
+        // 只在越界报错时被读（报错正文会提示加这个开关重跑）。
+        let trace_sym = Self::trace_sym();
+        let record_recent = Self::record_recent();
+
+        let trace = trace_sym
             && self.trace_n < Self::trace_sym_limit()
             && super::block::in_traced_frame();
-        // 先记下读之前的算术状态：符号要等解码完才知道，而状态会变。
-        // 与 libaom 的符号级 trace 逐项对拍时用的就是这几个值。
-        let trace_id = self.trace_n;
-        let (trace_range, trace_value) = (self.symbol_range, self.symbol_value);
-        let (trace_label, trace_tag) = (self.label, self.tag);
-        let trace_nsym = cdf.len().saturating_sub(1);
-        self.trace_n += 1;
+        // 快照必须在下面改动 `symbol_range` / `symbol_value` **之前**取
+        // （trace 记的是"读这个符号之前"的算术状态，与 libaom 的符号级 trace 对拍用）。
+        let (trace_id, trace_range, trace_value, trace_label, trace_tag) = if trace {
+            let id = self.trace_n;
+            self.trace_n += 1;
+            (id, self.symbol_range, self.symbol_value, self.label, self.tag)
+        } else {
+            (0, 0, 0, "", 0)
+        };
+        // `smb_before` 只给环形缓冲用 ⇒ 同样门控掉（否则又是一次无条件读）。
+        let smb_before = if record_recent { self.symbol_max_bits } else { 0 };
         if cdf.len() < 2 {
             return Err(MediaError::Bitstream("CDF 至少要有 2 项（1 个符号 + 计数器）".into()));
         }
@@ -372,6 +402,11 @@ impl<'a> SymbolDecoder<'a> {
             // `Location::caller()` 靠上面一串 `#[track_caller]` 一直传到真正的
             // 调用点 —— 这样 trace 里每一行都能直接对上源码行号，不用再猜
             // "这个符号是哪段语法读的"。
+            //
+            // `trace_nsym` 就是上面算好的符号个数 `n`（到这里 `cdf.len() >= 2`
+            // 已经保证过，二者相等）。原来它在**函数开头**无条件算一次，属于
+            // 每符号的固定开销，现已并入这个分支。
+            let trace_nsym = n;
             let at = std::panic::Location::caller();
             println!(
                 "  SYM#{} [{} txb{}] range={} value={} n={} sym={} cdf={:?} at={}:{}",
@@ -444,7 +479,13 @@ impl<'a> SymbolDecoder<'a> {
                     required
                         .map(|r| (self.consumed_bits() - r).to_string())
                         .unwrap_or_else(|| "?".into()),
-                    recent_report(&self.recent, self.recent_n)
+                    // "最近读过的符号"默认不记（`AV1_RECENT`）⇒ 空时给一句提示，
+                    // 否则报错正文里只有一片空白，看不出是"没记"还是"没符号"。
+                    if self.recent_n == 0 {
+                        "（未记录；加 `AV1_RECENT=1` 重跑即可拿到）".to_string()
+                    } else {
+                        recent_report(&self.recent, self.recent_n)
+                    }
                 )));
             }
         }
@@ -478,16 +519,20 @@ impl<'a> SymbolDecoder<'a> {
             }
         }
 
-        // 诊断：把这次符号记进环形缓冲（越界时报错会倒出来）
-        self.recent[self.recent_n % RECENT_SYMBOLS] = RecentSym {
-            tag: self.tag,
-            label: self.label,
-            symbol: symbol as u32,
-            smb: self.symbol_max_bits,
-            n: n as u16,
-            smb_before,
-        };
-        self.recent_n = self.recent_n.wrapping_add(1);
+        // 诊断：把这次符号记进环形缓冲（越界时报错会倒出来）。
+        // ⚠️ **默认关闭**（`AV1_RECENT=1` 才记）—— 这是每符号一次的 48 字节写入，
+        // 一帧 43.4 万个符号下就是每帧几 MB 的纯诊断开销。详见 `record_recent`。
+        if record_recent {
+            self.recent[self.recent_n % RECENT_SYMBOLS] = RecentSym {
+                tag: self.tag,
+                label: self.label,
+                symbol: symbol as u32,
+                smb: self.symbol_max_bits,
+                n: n as u16,
+                smb_before,
+            };
+            self.recent_n = self.recent_n.wrapping_add(1);
+        }
 
         if trace {
             println!(
@@ -499,9 +544,33 @@ impl<'a> SymbolDecoder<'a> {
     }
 
     /// trace 开关（`AV1_TRACE_SYM`）。
+    ///
+    /// ⚠️ **只允许在 `read_symbol_inner` 开头调用一次**（同上）。
+    #[inline]
     fn trace_sym() -> bool {
         static T: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         *T.get_or_init(|| std::env::var("AV1_TRACE_SYM").is_ok())
+    }
+
+    /// 是否记录"最近符号"环形缓冲（`AV1_RECENT=1`；**默认关闭**）。
+    ///
+    /// ## 为什么默认关（2026-10-06 第四十三刀）
+    ///
+    /// 这条记录是**每符号一次**的：`RecentSym` 有 6 个字段（含一个 `&'static str`
+    /// 和一个 `i64`）⇒ 48 字节，加取模与计数器递增，一符号约 5 条微指令。
+    /// 而 1080p 真素材实测**一帧 43.4 万个符号**（用 `AV1_TRACE_SYM` 数过：
+    /// `--count=2` 共 867,730 个）⇒ 光这一项就是**每帧几 MB 的纯诊断写入**。
+    ///
+    /// 它**只在算术流越界时**被读（[`recent_report`]，填进错误正文），
+    /// 所以改成显式打开：遇到越界报错时，报错正文里会提示用 `AV1_RECENT=1`
+    /// 重跑一遍就能拿到同样的上下文。与本模块既有的 `AV1_TRACE_*` 一族同一个套路。
+    ///
+    /// ⚠️ **只允许在 `read_symbol_inner` 开头调用一次** —— 那里把结果缓存成局部量，
+    /// 循环体里走的是局部量（否则每符号一次 `OnceLock` load 就把收益吃回去了）。
+    #[inline]
+    fn record_recent() -> bool {
+        static R: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *R.get_or_init(|| std::env::var("AV1_RECENT").is_ok())
     }
 
     /// 符号 trace 的上限（`AV1_TRACE_SYM_LIMIT`，默认 400）。
