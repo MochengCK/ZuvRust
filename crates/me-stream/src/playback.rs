@@ -73,6 +73,21 @@ pub struct Player {
     first_buffered_us: Option<i64>,
     /// 缓冲区里最后一条采样的结束时间（微秒）。
     last_buffered_end_us: i64,
+    /// **轨道时基快照**（只建一次）。
+    ///
+    /// ## 为什么必须快照
+    ///
+    /// `next_packet` / `fill_buffer` / `refresh_buffer_window` / `span_of` 加起来
+    /// **每个采样要问 4~6 次**"这条采样属于哪条轨道、时基是多少"，而
+    /// `demuxer.info()` 每次都**重建整个 [`MediaInfo`]**（`Vec<Track>` + 每轨的
+    /// `codec`/`extradata`/`language` 克隆），并且 `Mp4Demuxer` 里还会顺带调一次
+    /// `src.len()` —— 那是 **`stat(2)` 系统调用**。`sample` 采样里 `stat` 单个符号
+    /// 就占了整帧 **1.5%**，调用者正是这条链
+    /// （`Player::span_of` → `Mp4Demuxer::info` → `GrowingFileSource::len` → `stat`）。
+    ///
+    /// 一次播放里**轨道集合与时基不变**（`frame_rate` 这类字段可能在解析到后续
+    /// `moof` 之后变化，但时基不变 —— 这里只快照时基，正是为了不碰那个）。
+    tb: std::sync::OnceLock<Vec<(u32, me_core::Timebase)>>,
 }
 
 impl Player {
@@ -89,7 +104,32 @@ impl Player {
             read_offset: 0,
             first_buffered_us: None,
             last_buffered_end_us: 0,
+            tb: std::sync::OnceLock::new(),
         })
+    }
+
+    /// 轨道时基快照（见 [`Player::tb`] 上的长注释）。
+    #[inline]
+    fn track_timebases(&self) -> &[(u32, me_core::Timebase)] {
+        self.tb.get_or_init(|| {
+            self.demuxer
+                .info()
+                .tracks
+                .iter()
+                .map(|t| (t.id, t.timebase))
+                .collect()
+        })
+    }
+
+    /// 一条采样的**显示时间**（微秒）。
+    ///
+    /// 与 [`PacketTime::pts_us_approx`] **逐位相同**（包括"找不到轨道时按 90kHz
+    /// 兜底"这一支），只是时基取自快照、不再每次重建 `MediaInfo`。
+    fn pts_us_of(&self, p: &Packet) -> i64 {
+        match self.track_timebases().iter().find(|(id, _)| *id == p.track_id) {
+            Some((_, tb)) => tb.ticks_to_us(p.pts),
+            None => p.pts * 1_000_000 / 90_000,
+        }
     }
 
     /// 轨道与总览信息（合并器/宿主都会先读它）。
@@ -118,14 +158,14 @@ impl Player {
     pub fn next_packet(&mut self) -> Result<Option<Packet>> {
         if let Some(p) = self.buffer.pop_front() {
             self.emitted += 1;
-            self.playhead_us = self.playhead_us.max(p.pts_us_approx(&self.info()));
+            self.playhead_us = self.playhead_us.max(self.pts_us_of(&p));
             self.refresh_buffer_window();
             return Ok(Some(p));
         }
         self.fill_buffer()?;
         if let Some(p) = self.buffer.pop_front() {
             self.emitted += 1;
-            self.playhead_us = self.playhead_us.max(p.pts_us_approx(&self.info()));
+            self.playhead_us = self.playhead_us.max(self.pts_us_of(&p));
             self.refresh_buffer_window();
             return Ok(Some(p));
         }
@@ -136,7 +176,7 @@ impl Player {
     fn refresh_buffer_window(&mut self) {
         match (self.buffer.front(), self.buffer.back()) {
             (Some(front), Some(back)) => {
-                self.first_buffered_us = Some(front.pts_us_approx(&self.info()));
+                self.first_buffered_us = Some(self.pts_us_of(front));
                 let (_, end) = self.span_of(back);
                 self.last_buffered_end_us = end;
             }
@@ -201,9 +241,9 @@ impl Player {
 
     /// 一条采样覆盖的时间区间（微秒）。
     fn span_of(&self, p: &Packet) -> (i64, i64) {
-        let start = p.pts_us_approx(&self.info());
-        let end = match self.info().tracks.iter().find(|t| t.id == p.track_id) {
-            Some(t) => t.pts_to_us(p.pts + p.duration as i64),
+        let start = self.pts_us_of(p);
+        let end = match self.track_timebases().iter().find(|(id, _)| *id == p.track_id) {
+            Some((_, tb)) => tb.ticks_to_us(p.pts + p.duration as i64),
             None => start,
         };
         (start, end)

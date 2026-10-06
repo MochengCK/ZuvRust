@@ -220,7 +220,23 @@ impl GrowingFileSource {
     }
 
     /// 现在磁盘上的长度（文件不存在算 0）。
+    ///
+    /// ⚠️ **优先用缓存的读句柄做 `fstat`**：`std::fs::metadata(path)` 要在 VFS 层
+    /// 重新走一遍路径解析（每次几个微秒），而本函数在解码热路径上被反复调用
+    /// （`ReadAt::len` → 容器层 → 播放器每采样 4~6 次；`sample` 采样里 `stat` 单个
+    /// 符号就占整帧 **1.5%**）。句柄没开时才退回按路径 `stat`。
+    ///
+    /// 用句柄还有一层**语义**上的好处：`read_once` 本来就是从这个 fd 读的，
+    /// 长度与读到的内容因此来自**同一个 inode** —— 路径上的文件被换掉时不会
+    /// 出现"长度按新文件、数据按旧 fd"的错配。
     fn current_len(&self) -> u64 {
+        if let Ok(g) = self.handle.lock() {
+            if let Some(f) = g.as_ref() {
+                if let Ok(m) = f.metadata() {
+                    return m.len();
+                }
+            }
+        }
         std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0)
     }
 
