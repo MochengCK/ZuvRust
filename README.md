@@ -46,7 +46,7 @@ H.264、H.265、AV1、VP9、VP8、AAC、MP3、Opus、FLAC、AC-3、E-AC-3
 | 编码 | 解码方式 |
 | --- | --- |
 | AV1 | **自研软解**（完整实现，逐像素与参考解码器对拍过）；Apple Silicon（M3 及以后）优先走 VideoToolbox **硬解** |
-| H.264 | macOS 走 VideoToolbox **硬解** |
+| H.264 | **三个平台都走系统硬解**：macOS 用 VideoToolbox、Windows 用 Media Foundation（硬件 MFT + D3D11）、Linux 用 VA-API |
 | Opus / AAC / FLAC / MP3 | **自研软解** |
 
 ⚠️ **AV1 软解目前还不是实时性能**：1080p 单线程约 50 ms/帧（约 20 fps），
