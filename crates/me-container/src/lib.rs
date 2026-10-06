@@ -18,6 +18,7 @@ pub use adts::AdtsDemuxer;
 pub use codec::{is_random_access_nal, parse_h264_sps, parse_h265_sps, split_annexb, SpsInfo};
 pub use demux::{open, Demuxer};
 pub use flac_stream::FlacStreamDemuxer;
+pub use mkv::MkvDemuxer;
 pub use mp4::Mp4Demuxer;
 pub use mpeg_audio::MpegAudioDemuxer;
 pub use ogg::OggOpusDemuxer;

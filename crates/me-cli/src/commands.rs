@@ -248,7 +248,25 @@ fn mux_files(args: &[String], output: &str, inputs: &[&str]) -> Result<u8> {
         .iter()
         .map(|(n, s, i)| (n.as_str(), s.clone(), i.clone()))
         .collect();
-    let outcome = mux::mux_to_file(output, &refs, has_flag(args, "--progress"), &cancel)?;
+    // 「视频」设置项 → 引擎选项：分片时长与"只留声音/只留画面"
+    let (a_only, v_only) = (has_flag(args, "--audio-only"), has_flag(args, "--video-only"));
+    if a_only && v_only {
+        return Err(MediaError::Unsupported(
+            "`--audio-only` 与 `--video-only` 只能二选一".into(),
+        ));
+    }
+    let tracks = if a_only {
+        mux::TrackChoice::AudioOnly
+    } else if v_only {
+        mux::TrackChoice::VideoOnly
+    } else {
+        mux::TrackChoice::Both
+    };
+    let opts = mux::MergeOptions {
+        fragment_us: opt(args, "fragment-ms").and_then(|v| v.parse::<i64>().ok()).map(|ms| ms.clamp(20, 30_000) * 1000),
+        tracks,
+    };
+    let outcome = mux::mux_to_file(output, &refs, opts, has_flag(args, "--progress"), &cancel)?;
     emit(args, &mux::outcome_json(&outcome));
     Ok(exit_code::OK)
 }

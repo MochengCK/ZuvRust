@@ -5,7 +5,8 @@
 //! - [`interleave`]：把多条轨道的采样按时间交织成一条流（容器要求数据大致按时间排列）；
 //! - [`convert`]：`Annex-B ↔ 长度前缀`、`extradata` 的两种形态互转；
 //! - [`ts`]：MPEG-TS 封装（PAT/PMT/PCR 周期、AAC 补 ADTS、关键帧重发参数集）；
-//! - [`mp4`]：分片 fMP4 封装（`moov` + `moof/mdat`）。
+//! - [`mkv`]：Matroska 封装（`EBML + Segment{Info, Tracks, Cluster*}`）；
+//! - [`mp4`]：分片 fMP4 封装（`moov` + `[sidx + moof/mdat]*`）。
 //!
 //! 约定（与全引擎一致）：
 //! - 时间一律**整数刻度 + 时基**，跨时基比较先换算成微秒；
@@ -16,6 +17,7 @@
 
 pub mod convert;
 pub mod interleave;
+pub mod mkv;
 pub mod mp4;
 pub mod sink;
 pub mod ts;
@@ -25,6 +27,7 @@ pub use convert::{
     extradata_to_annexb, extradata_to_avcc, looks_like_avcc, nal_length_size,
 };
 pub use interleave::{interleave_all, Interleaver};
+pub use mkv::MkvMuxer;
 pub use mp4::Mp4Muxer;
 pub use sink::Sink;
 pub use ts::TsMuxer;

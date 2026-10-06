@@ -1,4 +1,4 @@
-//! 分片 fMP4 封装（`ftyp + moov(mvex) + [moof + mdat]*`）。
+//! 分片 fMP4 封装（`ftyp + moov(mvex) + [sidx + moof + mdat]*`）。
 //!
 //! ## 为什么产出分片形态而不是普通 MP4
 //!
@@ -30,6 +30,12 @@
 //! 7. **VP9 的采样不做任何转换**（与 AV1 一样）：它没有起始码/长度前缀可言，
 //!    `.webm` 与 fMP4 里的字节完全一致，走 H.264/H.265 那条路会以
 //!    "找不到起始码"报错。
+//! 8. **每个分片带一个 `sidx`**（就在它的 `moof` 前面，见 [`write_sidx`]）：
+//!    分片形态的 `mvhd.duration` 是 0（写 moov 时还不知道总时长），播放器只能
+//!    扫全文件或"边读边涨"地猜时长与 seek 目标；`sidx` 把"这一段覆盖多少字节、
+//!    多少媒体时间"直接写在段首，播放器（Chromium 的 MSE、dash.js、ffmpeg 系工具）
+//!    读一段就能建索引。它是**在 moof 之前**写的，所以流式直写（管道）也支持 ——
+//!    前提是分片在内存里先组好、字节数已知（本文件就是这么做的）。
 
 use std::io::Write;
 
@@ -459,12 +465,54 @@ impl Mp4Muxer {
             }
         }
         box_close(&mut mdat, mdat_at);
+        let mdat = mdat.into_vec();
+
+        // ── `sidx`（SegmentIndexBox，§8.16.3）：**每个分片一个**，紧贴在 `moof` 前 ──
+        //
+        // 分片 fMP4 的 `moov` 里 `mvhd.duration` 是 0（写 moov 时还不知道总时长），
+        // 没有索引时播放器只能"扫全文件"或"边读边涨"地猜时长与 seek 目标。
+        // DASH 的标准答案就是每个分片带一个 `sidx`：它给出**这一段覆盖的字节数**
+        // 与**这一段的媒体时长**，播放器（Chromium 的 MSE、dash.js、ffmpeg 系工具）
+        // 读一个分片就能把索引建起来 —— 于是 seek 能精确落到分片边界、
+        // 时长也不必等整条流读完。它**不**解决"一眼知道整片总长"（那要 `mehd`，
+        // 而 moov 写在全文件最前面，写它的时候还不知道总时长）。
+        //
+        // 引用哪条轨：本分片里**第一条有采样的轨**（一般是视频）—— 分片时长由它
+        // 代表（视频分片的时长就是它的帧数 × 帧间隔）；`referenced_size` 覆盖
+        // `moof + mdat` 全部字节（多轨复用的分片就是这么标的，DASH 侧同样如此）。
+        let (ref_idx, reference) = self
+            .tracks
+            .iter()
+            .enumerate()
+            .find(|(_, t)| !t.samples.is_empty())
+            .expect("上面刚判过：至少一条轨有采样");
+        let reference_id = (ref_idx + 1) as u32;
+        // 本分片的**呈现**跨度：B 帧下首条的 pts 可能不是最小，按 min/max 取。
+        let mut earliest_pts = i64::MAX;
+        let mut end_pts = i64::MIN;
+        for (i, s) in reference.samples.iter().enumerate() {
+            let pts = reference.sample_dts[i] + s.cts as i64;
+            earliest_pts = earliest_pts.min(pts);
+            end_pts = end_pts.max(pts + s.duration as i64);
+        }
+        let starts_with_sap = reference.samples.first().is_some_and(|s| s.keyframe);
+        let mut idx = ByteWriter::with_capacity(64);
+        write_sidx(
+            &mut idx,
+            reference.timescale,
+            reference_id,
+            earliest_pts,
+            (end_pts - earliest_pts).max(0),
+            starts_with_sap,
+            moof_len + mdat.len() as i64,
+        );
 
         // 分片一写完就落盘：**内存占用只与一个分片有关，与产物总大小无关**。
         // `moof` 与 `mdat` 的大小在这里都已确定（没有任何回头要改的字段），
         // 所以不需要"先占位再回填"，也就不需要把产物攒在内存里。
+        self.sink.write_all(&idx.into_vec())?;
         self.sink.write_all(&moof)?;
-        self.sink.write_all(&mdat.into_vec())?;
+        self.sink.write_all(&mdat)?;
 
         // 清空各轨缓冲，准备下一个分片（`frag_start_dts` 也要清：下一片的 tfdt
         // 由它自己的第一条采样决定）
@@ -482,14 +530,65 @@ impl Mp4Muxer {
 // box 拼装
 // ---------------------------------------------------------------------------
 
+/// `sidx`（`SegmentIndexBox`，§8.16.3）—— **一个分片一条引用**。
+///
+/// 载荷（`FullBox`，version 0/1）：
+/// ```text
+/// u32 reference_ID          引用的轨（我们写本分片第一条有采样的轨）
+/// u32 timescale             下面所有时间刻度的时基
+/// v0: u32 earliest_presentation_time | u64 first_offset
+/// v1: u64 earliest_presentation_time | u64 first_offset
+/// u16 reserved = 0 ; u16 reference_count = 1
+/// 引用项条（32 位）：reference_type(1) | referenced_size(31)
+///                     subsegment_duration(32)
+///                     starts_with_SAP(1) | SAP_type(3) | SAP_delta_time(28)
+/// ```
+///
+/// 细节：
+/// * `first_offset = 0`：引用数据就在本 `sidx` 之后紧接着开始（我们就是这么写的）；
+/// * `starts_with_SAP` **如实反映**该轨本分片的首条是不是关键帧 —— 我们的分片
+///   按**时长**切（2 秒一段，`DEFAULT_FRAGMENT_US`），并不是每段都从关键帧起，
+///   所以不能无条件写"是 SAP"（那会让 seek 到这一段直接就解码出花屏）；
+/// * version 取 0/1 由**数值是否越过 u32** 决定（大时基的源，比如 1e9 的
+///   `mdhd.timescale`，20 分钟就能越过 32 位）。
+fn write_sidx(
+    w: &mut ByteWriter,
+    timescale: u32,
+    reference_id: u32,
+    earliest_presentation_time: i64,
+    subsegment_duration: i64,
+    starts_with_sap: bool,
+    referenced_size: i64,
+) {
+    let ept = earliest_presentation_time.max(0);
+    let dur = subsegment_duration.clamp(0, u32::MAX as i64);
+    let version: u8 = if ept > u32::MAX as i64 { 1 } else { 0 };
+    let at = full_box_open(w, b"sidx", version, 0);
+    w.u32_be(reference_id);
+    w.u32_be(timescale.max(1));
+    if version == 1 {
+        w.u64_be(ept as u64);
+        w.u64_be(0); // first_offset：引用数据紧跟本 box
+    } else {
+        w.u32_be(ept as u32);
+        w.u32_be(0);
+    }
+    w.u16_be(0); // reserved
+    w.u16_be(1); // reference_count
+    // 引用项：reference_type = 0（直接指向媒体），referenced_size ≤ 2³¹−1（分片不会更大）
+    w.u32_be((referenced_size.max(0) as u32) & 0x7fff_ffff);
+    w.u32_be(dur as u32);
+    // `starts_with_SAP=1, SAP_type=1, SAP_delta_time=0` = 0x9000_0000（与 ffmpeg 同口径）
+    w.u32_be(if starts_with_sap { 0x9000_0000 } else { 0 });
+    box_close(w, at);
+}
+
 fn box_open(w: &mut ByteWriter, kind: &[u8; 4]) -> usize {
     let at = w.len();
     w.u32_be(0);
     w.bytes(kind);
     at
-}
-
-fn box_close(w: &mut ByteWriter, at: usize) {
+}fn box_close(w: &mut ByteWriter, at: usize) {
     let size = (w.len() - at) as u32;
     let _ = w.patch_u32_be(at, size);
 }
@@ -1010,7 +1109,7 @@ fn build_moof<F: Fn(usize) -> i64>(tracks: &[EsTrack], seq: u32, data_offset_of:
 }
 
 /// 剥掉 ADTS 头（fMP4 里的 AAC 是裸帧）。
-fn strip_adts(data: &[u8]) -> Vec<u8> {
+pub(crate) fn strip_adts(data: &[u8]) -> Vec<u8> {
     if data.len() >= 7 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0 {
         let header_len = if data[1] & 0x01 == 1 { 7 } else { 9 };
         if data.len() > header_len {
@@ -1182,6 +1281,98 @@ mod tests {
         assert_eq!(&video_data[0][..4], &[0, 0, 0, 1]);
         assert_eq!(video_data[0][4], 0x65);
         assert_eq!(video_data[1][4], 0x41);
+    }
+
+    /// 走一遍顶层 box 列表，把每个 `sidx` 与它后面那一对 `moof + mdat` 对起来。
+    ///
+    /// 返回 `(referenced_size, timescale, ept, duration, sap, reference_id)` 五元组
+    /// （按出现顺序），并断言 `referenced_size` 正好等于 `moof + mdat` 的字节数。
+    #[allow(clippy::type_complexity)]
+    fn walk_sidx(data: &[u8]) -> Vec<(u32, u32, u32, u32, u32, u32)> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 8 <= data.len() {
+            let size = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            assert!(size >= 8 && off + size <= data.len(), "box 尺寸不合法（{size}）");
+            let kind = &data[off + 4..off + 8];
+            if kind == b"sidx" {
+                let body = &data[off + 8..off + size];
+                assert_eq!(body[0], 0, "这条用例的时基不该触发 v1");
+                let reference_id = u32::from_be_bytes(body[4..8].try_into().unwrap());
+                let timescale = u32::from_be_bytes(body[8..12].try_into().unwrap());
+                let ept = u32::from_be_bytes(body[12..16].try_into().unwrap());
+                let first_offset = u32::from_be_bytes(body[16..20].try_into().unwrap());
+                let count = u16::from_be_bytes(body[22..24].try_into().unwrap());
+                assert_eq!(first_offset, 0, "引用数据紧跟 sidx");
+                assert_eq!(count, 1, "一个分片一条引用");
+                let referenced =
+                    u32::from_be_bytes(body[24..28].try_into().unwrap()) & 0x7fff_ffff;
+                let dur = u32::from_be_bytes(body[28..32].try_into().unwrap());
+                let sap = u32::from_be_bytes(body[32..36].try_into().unwrap());
+                // 紧跟其后的 moof + mdat
+                let moof_at = off + size;
+                assert_eq!(&data[moof_at + 4..moof_at + 8], b"moof", "sidx 后面必须是 moof");
+                let moof_size =
+                    u32::from_be_bytes(data[moof_at..moof_at + 4].try_into().unwrap()) as usize;
+                let mdat_at = moof_at + moof_size;
+                assert_eq!(&data[mdat_at + 4..mdat_at + 8], b"mdat", "moof 后面必须是 mdat");
+                let mdat_size =
+                    u32::from_be_bytes(data[mdat_at..mdat_at + 4].try_into().unwrap()) as usize;
+                assert_eq!(
+                    referenced as usize,
+                    moof_size + mdat_size,
+                    "referenced_size 必须覆盖整个分片（moof + mdat）"
+                );
+                out.push((referenced, timescale, ept, dur, sap, reference_id));
+                off = mdat_at + mdat_size;
+                continue;
+            }
+            off += size;
+        }
+        out
+    }
+
+    #[test]
+    fn every_fragment_carries_a_sidx() {
+        let data = mux_av(3);
+        let idx = walk_sidx(&data);
+        // ⚠️ 4 个分片而不是 3：`mux_av` 每片先写 30 帧视频、再写 43 包音频，
+        // 第三片在最后那批音频**之前**就按视频跨度落盘了 ⇒ 末尾剩下一片纯音频
+        // （它反过来验证了"参考轨要挑本片里第一条有采样的轨"这条）。
+        assert_eq!(idx.len(), 4, "3 个视频分片 + 1 个音频尾片");
+        for (i, &(_, timescale, ept, dur, sap, reference_id)) in idx.iter().take(3).enumerate() {
+            assert_eq!(reference_id, 1, "引用的是第一条轨（视频）");
+            assert_eq!(timescale, 30_000, "用参考轨的时基");
+            assert_eq!(ept, i as u32 * 30_000, "第 {i} 片的呈现起点");
+            assert_eq!(dur, 30_000, "第 {i} 片的时长 = 30 帧 × 1000 刻度");
+            // `mux_av` 里每一片的第一条视频采样都是关键帧
+            assert_eq!(sap, 0x9000_0000, "第 {i} 片从关键帧起 ⇒ starts_with_SAP");
+        }
+        // 尾片只有音频：引用必须切到音频轨，时长按音频跨度算
+        let (_, timescale, ept, dur, sap, reference_id) = idx[3];
+        assert_eq!(reference_id, 2, "纯音频片引用音频轨");
+        assert_eq!(timescale, 44_100);
+        assert_eq!(ept, 2 * 43 * 1024, "第三批音频的第一条 dts");
+        assert_eq!(dur, 43 * 1024, "43 包 × 1024 刻度");
+        assert_eq!(sap, 0, "音频包不是关键帧 ⇒ 不能写 SAP");
+    }
+
+    /// 分片不是从关键帧切的时候，`sidx` 必须**如实报** `starts_with_SAP = 0`
+    /// （否则播放器 seek 到这一段直接解码会出花屏）。
+    #[test]
+    fn sidx_reports_sap_honestly_when_a_fragment_starts_mid_gop() {
+        let mut m = Mp4Muxer::new();
+        m.set_fragment_duration_us(1_000_000);
+        // 只留视频轨：分片边界就只由视频跨度决定，数得清
+        m.set_tracks(&[video_track()]).unwrap();
+        for i in 0..60 {
+            // 只有第 0 条是关键帧 ⇒ 第 2 片从"P 帧"起
+            m.write_packet(&video_packet(i as i64 * 1000, i == 0)).unwrap();
+        }
+        let idx = walk_sidx(&m.finish().unwrap());
+        assert_eq!(idx.len(), 2, "60 帧 = 2 片");
+        assert_eq!(idx[0].4, 0x9000_0000, "第一片从关键帧起");
+        assert_eq!(idx[1].4, 0, "第二片从 P 帧起 ⇒ 不能写 SAP");
     }
 
     #[test]

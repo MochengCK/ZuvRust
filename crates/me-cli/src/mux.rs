@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use me_container::Demuxer;
 use me_core::{CodecId, MediaError, MediaInfo, MediaKind, Packet, ReadAt, Result, Timebase, Track};
-use me_mux::{Interleaver, Mp4Muxer, TsMuxer};
+use me_mux::{Interleaver, MkvMuxer, Mp4Muxer, TsMuxer};
 
 use crate::progress::Progress;
 
@@ -47,6 +47,7 @@ use crate::progress::Progress;
 pub enum OutputContainer {
     MpegTs,
     Fmp4,
+    Matroska,
 }
 
 impl OutputContainer {
@@ -57,8 +58,10 @@ impl OutputContainer {
         match ext {
             "ts" | "m2ts" | "mts" => Ok(OutputContainer::MpegTs),
             "mp4" | "m4s" | "m4v" | "mov" | "m4a" => Ok(OutputContainer::Fmp4),
+            // `.mka` = 只有声音的 Matroska，容器规则完全一样
+            "mkv" | "mka" => Ok(OutputContainer::Matroska),
             other => Err(MediaError::Unsupported(format!(
-                "不认识的输出容器 `.{other}`（支持 .ts / .mp4 / .m4s / .mov）"
+                "不认识的输出容器 `.{other}`（支持 .ts / .mp4 / .m4s / .mov / .mkv / .mka）"
             ))),
         }
     }
@@ -67,6 +70,7 @@ impl OutputContainer {
         match self {
             OutputContainer::MpegTs => "mpeg-ts",
             OutputContainer::Fmp4 => "fmp4",
+            OutputContainer::Matroska => "matroska",
         }
     }
 }
@@ -127,14 +131,36 @@ struct SegInput {
     map: Vec<(u32, u32)>,
 }
 
+/// 合并的可选项（宿主「视频」设置项映射到这里）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MergeOptions {
+    /// 分片/簇的目标时长（微秒）。`None` = 用容器默认值（都是 2 秒）。
+    pub fragment_us: Option<i64>,
+    /// 要哪些内容（默认画面与声音都要）。
+    pub tracks: TrackChoice,
+}
+
+/// 合并产物保留哪些内容。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TrackChoice {
+    /// 画面 + 声音（默认）。
+    #[default]
+    Both,
+    /// 只留声音（"提取音频"）。
+    AudioOnly,
+    /// 只留画面。
+    VideoOnly,
+}
+
 /// 把若干输入合并成一个文件。
 pub fn mux_to_file(
     output: &str,
     inputs: &[(&str, Arc<dyn ReadAt>, MediaInfo)],
+    opts: MergeOptions,
     progress: bool,
     cancel: &me_stream::source::CancelFlag,
 ) -> Result<MuxOutcome> {
-    match run(output, inputs, progress, cancel) {
+    match run(output, inputs, opts, progress, cancel) {
         Ok(o) => Ok(o),
         Err(e) => {
             // 半截产物必须清掉：留着它，用户会以为"合并好了"，
@@ -148,6 +174,7 @@ pub fn mux_to_file(
 fn run(
     output: &str,
     inputs: &[(&str, Arc<dyn ReadAt>, MediaInfo)],
+    opts: MergeOptions,
     progress: bool,
     cancel: &me_stream::source::CancelFlag,
 ) -> Result<MuxOutcome> {
@@ -164,10 +191,19 @@ fn run(
             audio_inputs.push(i);
         }
     }
+    // 「只留声音 / 只留画面」：把不要的那一路整个摘掉 —— 下游（输出轨、分段、
+    // 采样映射）都是按这两个列表推的，摘掉即生效；未被映射的采样会被自然跳过。
+    match opts.tracks {
+        TrackChoice::Both => {}
+        TrackChoice::AudioOnly => video_inputs.clear(),
+        TrackChoice::VideoOnly => audio_inputs.clear(),
+    }
     if video_inputs.is_empty() && audio_inputs.is_empty() {
-        return Err(MediaError::Container(
-            "输入里既没有视频轨也没有音频轨，没有可合并的内容".into(),
-        ));
+        return Err(MediaError::Container(match opts.tracks {
+            TrackChoice::Both => "输入里既没有视频轨也没有音频轨，没有可合并的内容".into(),
+            TrackChoice::AudioOnly => "输入里没有音频轨，没得可提取".into(),
+            TrackChoice::VideoOnly => "输入里没有视频轨，没得可提取".into(),
+        }));
     }
 
     // ── 2. 输出轨：每个角色一条，沿用第一条源轨的时基与编解码参数 ──
@@ -265,11 +301,19 @@ fn run(
         segments.push(seg);
     }
 
+    // 声明总时长：各输入 duration 之和（**不是 min**：多段串接的总时长是加起来）。
+    // 它只作参考（分片源常常没有声明时长），但 MKV 的 `Info.Duration` 可以先用它 ——
+    // 播放器/探针就不用先扫全文件才知道有多长（fMP4 那边靠每段的 `sidx` 解决）。
+    let declared_us: i64 = inputs.iter().filter_map(|(_, _, i)| i.duration_us).sum();
+
     // ── 4. 产物直写目标（不攒内存） ──
     let file = std::fs::File::create(output)?;
     // 1 MiB 缓冲：合并是顺序写，缓冲再大收益有限，而 1 MiB 已经能把 syscall 压到可忽略
     let writer = Box::new(std::io::BufWriter::with_capacity(1 << 20, file));
-    let mut muxer = Muxer::with_writer(container, &out_tracks, writer)?;
+    let mut muxer = Muxer::with_writer(container, &out_tracks, (declared_us > 0).then_some(declared_us), writer)?;
+    if let Some(us) = opts.fragment_us {
+        muxer.set_fragment_us(us);
+    }
 
     // 每个输入一个解封装器（懒开：没被任何一段用到的输入不必打开）
     let mut demuxers: Vec<Option<Box<dyn Demuxer>>> = (0..inputs.len()).map(|_| None).collect();
@@ -277,9 +321,6 @@ fn run(
     // ── 5. 进度口径 ──
     // 输入总字节：只搬字节的任务里，它是最准的分母（媒体的声明时长常常是 0）。
     let input_bytes: u64 = inputs.iter().map(|(_, s, _)| s.len().unwrap_or(0)).sum();
-    // 声明总时长：各输入 duration 之和（**不是 min**：多段串接的总时长是加起来）
-    let declared_us: i64 = inputs.iter().filter_map(|(_, _, i)| i.duration_us).sum();
-
     let mut reporter = Progress::new(progress, "mux");
     let mut packets_out = 0u64;
     // 时间轴：**每条输出轨各自**的"下一段起点"与"已见末尾"（微秒）。
@@ -482,6 +523,18 @@ fn check_codec_support(container: OutputContainer, tracks: &[Track]) -> Result<(
                 ),
                 _ => false,
             },
+            // Matroska：视频四种都认；音频除 FLAC 都认
+            //（FLAC 在 MKV 里要 `fLaC` 头形态的 CodecPrivate，转换还没做，见 me-mux/src/mkv.rs）
+            OutputContainer::Matroska => match t.kind {
+                MediaKind::Video => {
+                    matches!(t.codec, CodecId::H264 | CodecId::H265 | CodecId::Av1 | CodecId::Vp9)
+                }
+                MediaKind::Audio => matches!(
+                    t.codec,
+                    CodecId::Aac | CodecId::Mp3 | CodecId::Opus | CodecId::Ac3 | CodecId::Eac3
+                ),
+                _ => false,
+            },
         };
         if !ok {
             return Err(MediaError::Unsupported(format!(
@@ -499,12 +552,14 @@ fn check_codec_support(container: OutputContainer, tracks: &[Track]) -> Result<(
 enum Muxer {
     Ts(TsMuxer),
     Mp4(Mp4Muxer),
+    Mkv(MkvMuxer),
 }
 
 impl Muxer {
     fn with_writer(
         container: OutputContainer,
         tracks: &[Track],
+        duration_hint_us: Option<i64>,
         writer: Box<dyn Write + Send>,
     ) -> Result<Self> {
         match container {
@@ -518,6 +573,22 @@ impl Muxer {
                 m.set_tracks(tracks)?;
                 Ok(Muxer::Mp4(m))
             }
+            OutputContainer::Matroska => {
+                let mut m = MkvMuxer::with_writer(writer);
+                // ⚠️ 必须在 `set_tracks`（它会把 `Info` 写进产物）**之前**设好
+                m.set_duration_hint_us(duration_hint_us);
+                m.set_tracks(tracks)?;
+                Ok(Muxer::Mkv(m))
+            }
+        }
+    }
+
+    /// 分片/簇的目标时长（微秒）。TS 没有分片概念，忽略。
+    fn set_fragment_us(&mut self, us: i64) {
+        match self {
+            Muxer::Ts(_) => {}
+            Muxer::Mp4(m) => m.set_fragment_duration_us(us),
+            Muxer::Mkv(m) => m.set_cluster_duration_us(us),
         }
     }
 
@@ -525,6 +596,7 @@ impl Muxer {
         match self {
             Muxer::Ts(m) => m.write_packet(p),
             Muxer::Mp4(m) => m.write_packet(p),
+            Muxer::Mkv(m) => m.write_packet(p),
         }
     }
 
@@ -533,6 +605,7 @@ impl Muxer {
         match self {
             Muxer::Ts(m) => m.bytes_written(),
             Muxer::Mp4(m) => m.bytes_written(),
+            Muxer::Mkv(m) => m.bytes_written(),
         }
     }
 
@@ -544,6 +617,10 @@ impl Muxer {
                 Ok(m.bytes_written())
             }
             Muxer::Mp4(mut m) => {
+                m.finish()?;
+                Ok(m.bytes_written())
+            }
+            Muxer::Mkv(mut m) => {
                 m.finish()?;
                 Ok(m.bytes_written())
             }
@@ -795,7 +872,7 @@ mod tests {
             .map(|(n, s, i)| (n.as_str(), s.clone(), i.clone()))
             .collect();
         let output = dir.join(name);
-        mux_to_file(&output.to_string_lossy(), &refs, false, &CancelFlag::new())
+        mux_to_file(&output.to_string_lossy(), &refs, MergeOptions::default(), false, &CancelFlag::new())
             .expect("合并应当成功")
     }
 

@@ -1505,44 +1505,10 @@ fn parse_trun(
 
 /// 长度前缀布局 → Annex-B。
 ///
-/// `nal_len == 0` 表示这条轨道不是长度前缀布局（音频、VP8/VP9、AV1 的 OBU），
-/// 原样返回 —— **不做"顺手也加个起始码"这种事**：那会把裸 AAC 帧变成噪声。
+/// 实现在 [`codec::length_prefixed_to_annexb`]（**唯一实现**，Matroska 那条链
+/// 也要用它）；这里保留这层薄转发只是为了不改动本文件里已有的调用点。
 fn to_annexb(data: &[u8], nal_len: u8) -> Vec<u8> {
-    if nal_len == 0 {
-        return data.to_vec();
-    }
-    let n = nal_len as usize;
-    let mut out = Vec::with_capacity(data.len() + 32);
-    let mut pos = 0usize;
-    while pos + n <= data.len() {
-        let mut len = 0usize;
-        for i in 0..n {
-            len = (len << 8) | data[pos + i] as usize;
-        }
-        pos += n;
-        if len == 0 {
-            continue;
-        }
-        if pos + len > data.len() {
-            // 长度越界：这个采样坏了。把剩下的字节当最后一个 NAL 带上，
-            // 让解码器自己丢 —— 因为一个坏采样就让整条流报错，代价太大。
-            // 注意 `pos` 本身也可能已经越界（长度前缀都不完整），
-            // 那时切片会 panic，所以必须先判一下
-            if pos < data.len() {
-                out.extend_from_slice(&[0, 0, 0, 1]);
-                out.extend_from_slice(&data[pos..]);
-            }
-            break;
-        }
-        out.extend_from_slice(&[0, 0, 0, 1]);
-        out.extend_from_slice(&data[pos..pos + len]);
-        pos += len;
-    }
-    if out.is_empty() && !data.is_empty() {
-        // 全是零长度（畸形）：宁可原样交出去，也不要把数据变成空包
-        return data.to_vec();
-    }
-    out
+    codec::length_prefixed_to_annexb(data, nal_len)
 }
 
 /// Annex-B 里有没有随机访问点（表格/标志说"不是"时的兜底判据）。
@@ -1870,9 +1836,16 @@ impl Mp4Demuxer {
         // 这里的"平局"不是罕见情况：音频与视频的第一条采样都在 0。
         // 不定序的话，输出顺序会随 `HashMap` 的迭代顺序变化（每进程不同），
         // 上层拿到的流会时而"视频在前"时而"音频在前" —— 那是最难复现的一类 bug。
+        //
+        // ⚠️ 比较前必须把 dts 换算到**公共时间轴**（见 `pump_fragment` 里那段长注释：
+        // 各轨时基不同，直接比原始 tick 会把音频推到 1/3 速、播放端音频饿死）。
         let mut best: Option<(i64, u32)> = None;
         for (id, s) in &self.pending {
-            let key = (s.2, *id);
+            let us = match self.track_index.get(id) {
+                Some(&ti) => self.tracks[ti].timebase().ticks_to_us(s.2),
+                None => s.2,
+            };
+            let key = (us, *id);
             if best.map(|(d, i)| key < (d, i)).unwrap_or(true) {
                 best = Some(key);
             }
@@ -1907,7 +1880,25 @@ impl Mp4Demuxer {
                 continue;
             }
             let mut sorted = samples;
-            sorted.sort_by_key(|s| s.decode_time);
+            // ⚠️ 跨轨排序必须先把 `decode_time` 换算到**公共时间轴**（微秒）。
+            //
+            // 各轨的 `mdhd` 时基**通常不同**（这条素材：视频 16000、音频 48000），
+            // 而 `tfdt`/`trun` 出来的 dts 是**各自轨道时基**的 tick —— 直接拿原始
+            // tick 比大小，等于按"tick 数"对齐：时基大的那一轨（音频，48000）
+            // 在输出序里被推到 `16000/48000 = 1/3` 的速度、成串爆发。
+            // 播放端（`stream --video=frames --audio=pcm`）按输出序解码，于是
+            // 每次都先解完一整段视频才收到一小段音频 ⇒ **音频队列饿死 = 听感上的
+            // "跳帧/断音"**（2026-10-06 定位；H.264 硬解因为快而不明显，AV1 软解
+            // 每帧 ~80ms 就压不住了）。
+            //
+            // 同轨之间用原始 tick 兜底，保证**轨内顺序严格不变**；
+            // 跨轨同一微秒时按轨道号定序（确定性，与 `pump_progressive` 的约定一致）。
+            sorted.sort_by_key(|s| {
+                let us = self.tracks[s.track_index]
+                    .timebase()
+                    .ticks_to_us(s.decode_time);
+                (us, s.track_index, s.decode_time)
+            });
             for s in sorted {
                 let pkt = self.build_packet(
                     s.track_index,
