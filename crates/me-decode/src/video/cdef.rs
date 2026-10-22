@@ -601,6 +601,87 @@ fn cdef_filter(
         }
     };
 
+    // u8 内点块：把 (w+2)×(h+2) 的窗口扩宽到 u16 临时缓冲，跑现有 SIMD 内核，
+    // 再把输出收窄写回 u8 平面。边缘块仍走标量（越界候选要排除，见 `interior`）。
+    // 这一步把 u8 的 CDEF 从"每像素 20 个候选的标量"换成整块向量化。
+    if is_u8 && interior && super::simd::avx2_available() {
+        let sw = w + 4;
+        let sh = h + 4;
+        let mut src = [0u16; 12 * 12];
+        let mut out = [0u16; 12 * 12];
+        for yy in 0..sh {
+            let sy = y0 - 2 + yy as i32;
+            for xx in 0..sw {
+                let sx = x0 - 2 + xx as i32;
+                src[yy * sw + xx] = plane_ref.get(sx as usize, sy as usize);
+            }
+        }
+        let mut offs = [0isize; super::simd::CDEF_CANDS];
+        let mut taps = [0i32; super::simd::CDEF_CANDS];
+        let mut n = 0usize;
+        for k in 0..2usize {
+            for sign in [-1i32, 1] {
+                let [dy, dx] = CDEF_DIRECTIONS[dir][k];
+                offs[n] = (sign * dy) as isize * sw as isize + (sign * dx) as isize;
+                taps[n] = pri_taps[k];
+                n += 1;
+            }
+        }
+        for k in 0..2usize {
+            for dir_off in [-2i32, 2] {
+                let d = ((dir as i32 + dir_off) & 7) as usize;
+                let [dy, dx] = CDEF_DIRECTIONS[d][k];
+                for sign in [-1i32, 1] {
+                    offs[n] = (sign * dy) as isize * sw as isize + (sign * dx) as isize;
+                    taps[n] = sec_taps[k];
+                    n += 1;
+                }
+            }
+        }
+        // SAFETY: AVX2 已判；`src` 覆盖内核会读的 2 像素外扩，`out` 是
+        // 同 stride 的输出缓冲；`interior` 保证窗口样本都在平面内。
+        unsafe {
+            if w == 4 && h == 4 {
+                super::simd::cdef_quad8(
+                    &src[..sw * sh],
+                    sw as isize,
+                    2,
+                    2,
+                    &offs,
+                    &taps,
+                    pri_str,
+                    pri_adj as u32,
+                    sec_str,
+                    sec_adj as u32,
+                    out.as_mut_ptr(),
+                    sw as isize,
+                );
+            } else {
+                super::simd::cdef_pair16(
+                    &src[..sw * sh],
+                    sw as isize,
+                    2,
+                    2,
+                    h,
+                    w,
+                    &offs,
+                    &taps,
+                    pri_str,
+                    pri_adj as u32,
+                    sec_str,
+                    sec_adj as u32,
+                    out.as_mut_ptr(),
+                    sw as isize,
+                );
+            }
+        }
+        for r in 0..h {
+            let base = (2 + r) * sw + 2;
+            sink.set_row_u16(x0 as usize, y0 as usize + r, &out[base..base + w]);
+        }
+        return;
+    }
+
     if simd {
         // 12 个候选的偏移（相对块左上角）与抽头：**只跟方向/强度有关**，
         // 与行无关 ⇒ 每块算一次。约定前 4 个是主抽头、后 8 个是次抽头。

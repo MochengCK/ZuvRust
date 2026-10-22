@@ -189,6 +189,28 @@ impl RowsSink {
         }
     }
 
+    /// 同 [`Self::set_row`]，但样本是 **u16**（CDEF 的 u8 快路径输出）。
+    #[inline]
+    pub(crate) fn set_row_u16(&self, x: usize, y: usize, vals: &[u16]) {
+        debug_assert!(y >= self.y0 && y < self.y1, "RowsSink 写到别人那段行了");
+        debug_assert!(y < self.cap_rows && x + vals.len() <= self.stride, "RowsSink 写出行容量外了");
+        let i0 = y * self.stride + x;
+        // SAFETY: 见 `from_base` 的不变量。
+        unsafe {
+            match self.ptr {
+                SinkPtr::U8(p) => {
+                    let base = p.add(i0);
+                    for (i, v) in vals.iter().enumerate() {
+                        *base.add(i) = *v as u8;
+                    }
+                }
+                SinkPtr::U16(p) => {
+                    std::ptr::copy_nonoverlapping(vals.as_ptr(), p.add(i0), vals.len());
+                }
+            }
+        }
+    }
+
     /// 同 [`Self::set_row`]，但样本是 **i16**（[`super::simd::cdef_pair16`] 的 16 通道
     /// 内核产出：两行 × 8 列一次算完）。
     ///
