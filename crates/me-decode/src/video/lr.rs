@@ -689,6 +689,20 @@ pub fn apply(
     seq: &SequenceHeader,
     lr: &LrState,
 ) -> Result<CurrFrame> {
+    // 不做 LR 时输出就是 CdefFrame 本身：**必须**在 u8 桥接之前返回，
+    // 否则会白做 u8→u16→u8 两趟整帧转换。
+    if !fh.params.lr.uses_lr || flags::no_lr() {
+        let out = up_cdef.unwrap_or(up_curr);
+        if !out.planes[0].is_u8() {
+            if let Some(d) = &flags::lr_dump_dir() {
+                let n = super::block::TRACE_FRAME_NO.load(std::sync::atomic::Ordering::Relaxed);
+                lr_dump(&out, d, "prelr", n);
+                lr_dump(&out, d, "postlr", n);
+            }
+        }
+        return Ok(out);
+    }
+
     // `ME_PLANE_U8`：LR 内核还没迁 u8，先用 u16 桥跑完再收窄。
     if up_curr.planes[0].is_u8() {
         let curr16 = to_u16_frame(&up_curr);
@@ -717,16 +731,6 @@ pub fn apply(
     let dump_n = super::block::TRACE_FRAME_NO.load(std::sync::atomic::Ordering::Relaxed);
     if let Some(d) = &dump_dir {
         lr_dump(up_cdef.as_ref().unwrap_or(&up_curr), d, "prelr", dump_n);
-    }
-    if !fh.params.lr.uses_lr || flags::no_lr() {
-        // 这一档的输出**就是** `CdefFrame` 本身 —— 直接移动，不再 `clone()`。
-        // 上一层没做 CDEF 时（`None`）它就是 `CurrFrame`，连"两个缓冲"都不用 ——
-        // `up_curr` 直接当输出，零拷贝、零分配。
-        let out = up_cdef.unwrap_or(up_curr);
-        if let Some(d) = &dump_dir {
-            lr_dump(&out, d, "postlr", dump_n);
-        }
-        return Ok(out);
     }
     // 需要真滤波：两份源都得可读 ⇒ 从所有权降级成借用（`out` 是第三份）。
     // 没做 CDEF 时 `CdefFrame ≡ CurrFrame`，直接借用同一份（规范语义允许）。
