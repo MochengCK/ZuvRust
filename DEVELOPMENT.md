@@ -1299,6 +1299,16 @@ cargo test --workspace > /tmp/me.log 2>&1; echo "exit=$?"; grep -E "test result|
       仍是已知的右边缘残差）；CDEF 6 项单测通过。⚠️ "两阈值都为 0 就早退"试过，
       计数器显示该流 **0 次命中**，已撤掉。
 
+      ㊾ **去块 `filter_strength` 的常量快路径 —— 约 −0.7%**（2026-10-23，第四十九刀）：
+      `filter_strength` 每条边随机读 `seg_ids` / `ref_frames` / `y_modes` /
+      `delta_lfs`，再走分段与 ref/mode delta；`lvl==0` 时还要为另一侧再调一次。
+      没有 delta_lf、没有 ref/mode delta、分段也不调 LF 的帧里，`lvl` 只跟
+      `(plane, pass)` 有关（真素材正是这一档）。现在命中这三个条件就直接返回
+      `lf_derive(lf, lf.level[i])` 的常量，grid 的随机读整段省掉。
+      **实测**（同一二进制、8 轮换序，CPU/100 帧）：中位 **7.085s vs 7.135s，
+      约 −0.7%（7/8 轮更快）**。顺带试过 `nv12_frame` 去清零，A/B 持平
+      （bzero 不来自它，大块分配走惰性零页）⇒ 已回退。
+
     - **已知问题：帧右边界超块伸出区（`coded 宽不是 8 的倍数`时）**：当
       `FrameWidth % 8 != 0`，`MiCols*4 > FrameWidth`，最后一列超块会伸到帧右边界以外。
       参考实现里那块像素是**重建出来的**（帧缓冲的 border 承接），2026-10-03 起我们

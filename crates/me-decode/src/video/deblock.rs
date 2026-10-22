@@ -74,7 +74,7 @@ use super::coeff::{plane_residual_size, MI_SIZE};
 use super::frame_header::FrameHeader;
 use super::intra::CurrFrame;
 use super::mv::{GLOBAL_GLOBALMV, GLOBALMV, INTRA_FRAME, NEARESTMV};
-use super::params::{MAX_LOOP_FILTER, SEG_LVL_ALT_LF_Y_V};
+use super::params::{MAX_LOOP_FILTER, MAX_SEGMENTS, SEG_LVL_ALT_LF_Y_V};
 use super::partition::MiGrid;
 use super::sequence_header::SequenceHeader;
 
@@ -597,9 +597,21 @@ fn filter_strength(
     pass: u8,
 ) -> (i32, i32, i32, i32) {
     let lf = &fh.params.loop_filter;
-    let gi = grid.idx(row, col);
     let i = if plane == 0 { pass as usize } else { plane as usize + 1 };
+    let feature = SEG_LVL_ALT_LF_Y_V + i;
 
+    // **常量快路径**：没有 delta_lf、没有 ref/mode delta、分段也没有 LF 特征时，
+    // `lvl` 只跟 `(plane, pass)` 有关 ⇒ 连 `grid` 的四处随机读都不用做。
+    // 这是很常见的一档（分段关闭或分段不调 LF 的流），而 `filter_strength`
+    // 每条边都会调一次、lvl==0 时还要为另一侧再调一次。
+    let seg_lf = fh.params.segmentation.enabled
+        && (0..MAX_SEGMENTS)
+            .any(|s| fh.params.segmentation.feature_active(s, feature));
+    if !lf.delta_enabled && !fh.params.delta_lf.present && !seg_lf {
+        return lf_derive(lf, lf.level[i] as i32);
+    }
+
+    let gi = grid.idx(row, col);
     let seg = grid.seg_ids[gi] as usize;
     let ref_frame = grid.ref_frames[gi][0];
     let mode = grid.y_modes[gi];
@@ -617,7 +629,6 @@ fn filter_strength(
 
     // §7.14.5：baseFilterLevel → 分割特征 → ref/mode delta
     let mut lvl = (delta_lf + lf.level[i] as i32).clamp(0, MAX_LOOP_FILTER);
-    let feature = SEG_LVL_ALT_LF_Y_V + i;
     let segp = &fh.params.segmentation;
     if segp.feature_active(seg, feature) {
         lvl = (segp.feature_data[seg][feature] + lvl).clamp(0, MAX_LOOP_FILTER);
@@ -633,7 +644,12 @@ fn filter_strength(
         lvl = lvl.clamp(0, MAX_LOOP_FILTER);
     }
 
-    // limit / blimit / thresh 由 sharpness 与 lvl 推出
+    lf_derive(lf, lvl)
+}
+
+/// `limit / blimit / thresh` 由 `sharpness` 与 `lvl` 推出（§7.14.4/§7.14.5）。
+#[inline]
+fn lf_derive(lf: &super::params::LoopFilterParams, lvl: i32) -> (i32, i32, i32, i32) {
     let sharp = lf.sharpness as i32;
     let shift = if sharp > 4 {
         2

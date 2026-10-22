@@ -1,9 +1,9 @@
 # 性能线交接（2026-10-03 下午，用户："播放 AV1 还一卡一卡"）
 
 > 目标：把 1080p AV1 软解从"能用"推到"能实时播"（33 ms/帧）。  
-> **最新（2026-10-23，第四十八刀）**：1080p 单线程约 **63 ms/帧**（CPU 时间口径；
-> 第四十六刀折算 64.0 ms，第四十八刀同窗口再 −2.0% 后折算）。相比 10-06 的
-> 76.2 ms 累计约 **−17%**，目标 33 ms 还差约 1.9×。
+> **最新（2026-10-23，第四十九刀）**：1080p 单线程约 **62~63 ms/帧**（CPU 时间口径；
+> 第四十八刀折算 ~63 ms，第四十九刀同窗口再 −0.7% 后折算）。相比 10-06 的
+> 76.2 ms 累计约 **−18%**，目标 33 ms 还差约 1.9×。
 >
 > 现在（2026-10-03 晚，36 帧 8 线程，同窗口交替取最优）：**inline 201 ms/帧、  
 > row-mt 并行 186 ms/帧（~5.4 fps）**。⚠️ 本机噪声大，绝对值与下午那轮不可直接比，  
@@ -2552,3 +2552,61 @@ PGO 重训后复测（避免"新二进制 + 旧 profile"的偏差）：
 先试过"`pri_str == 0 && sec_str == 0` 直接返回"（CdefFrame 已是整帧拷贝，
 输出就是 cur）。逻辑上严格等价，但计数器显示**这条流 0 次命中**（UV 强度都不为 0），
 A/B 那 ~1% 是噪声 ⇒ 已撤掉，不留无证据的分支。
+
+## 三十、第四十九刀：去块 `filter_strength` 的常量快路径 —— 约 −0.7%（2026-10-23）
+
+### 动机
+
+`filter_strength` 每条边都从 `grid` 随机读 `seg_ids` / `ref_frames` / `y_modes` /
+`delta_lfs`，再走分段特征与 ref/mode delta；`lvl == 0` 时还要为另一侧
+（`prev_row/prev_col`）再调一次。1080p 一帧的去块边数在十万量级。
+
+但真素材的帧头（`AV1_TRACE_DBL=1` 可见）是：
+
+```text
+level=[16,16,8,4] sharpness=0 delta_enabled=false
+ref_deltas=[1,0,0,0,-1,0,-1,-1] mode_deltas=[0,0]
+delta_lf_present=false multi=false seg_enabled=false
+```
+
+⇒ 没有 delta_lf、没有 ref/mode delta、分段也不调 LF ⇒ `lvl` 只跟
+`(plane, pass)` 有关，整段 grid 读取都是白做。
+
+### 改法
+
+在 `filter_strength` 开头先判：
+
+```rust
+let seg_lf = seg.enabled && (0..MAX_SEGMENTS).any(|s| seg.feature_active(s, feature));
+if !lf.delta_enabled && !fh.params.delta_lf.present && !seg_lf {
+    return lf_derive(lf, lf.level[i] as i32);
+}
+```
+
+`limit / blimit / thresh` 的推导抽成 `lf_derive`，两条路共用一份（原来那段
+代码在函数尾部，现在只留一个调用点）。条件不满足的流仍走原完整路径，语义不变。
+
+### 实测
+
+同一二进制、8 轮轮内换序（CPU 时间 / 100 帧）：
+
+| 路径 | 各轮 user（秒） | 中位 |
+|---|---|---|
+| 快路径 | 7.05 / 7.04 / 7.10 / 7.11 / 6.97 / 7.16 / 7.07 / 7.10 | **7.085s** |
+| 原路径（cut48） | 7.10 / 7.12 / 7.36 / 7.60 / 7.17 / 7.41 / 7.13 / 7.10 | **7.135s** |
+
+⇒ **约 −0.7%（7/8 轮更快）**。收益不大，但这是"整段随机读"变成"读一个常量"，
+不依赖运气；条件不满足时只多几次布尔判断。
+
+### 验收
+
+- 24/60 帧与改前**逐字节相同**；
+- `ME_NO_SIMD=1`、`ME_ROW_MT=1 + ME_ROW_MT_PAR=1`（4 线程）逐字节相同；
+- `me-decode` lib **476 passed / 0 failed**。
+
+### 顺带否掉的一条
+
+试过 `nv12_frame` 把 `vec![0u8; w·h·3/2]` 换成 `with_capacity + set_len`
+（省 3.1 MB/帧的 `bzero`）：A/B **持平**（8 轮中位差 ~0.1%）。`sample` 里
+`bzero` 的调用方根本没有 `nv12_frame` —— 大块分配走的是惰性零页，清零本来
+就不花钱。已回退，不留 `set_len` 的 unsafe。

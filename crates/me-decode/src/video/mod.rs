@@ -1845,6 +1845,23 @@
 //! ⚠️ 先试过"两个阈值都为 0 就早退"，但计数器显示这条流 **0 次命中**
 //! （A/B 的 ~1% 是噪声），已撤掉。
 //!
+//! ### 第四十九刀（2026-10-23）：去块 `filter_strength` 的常量快路径 —— **约 −0.7%**
+//!
+//! `filter_strength` 每条边都要从 `grid` 随机读 `seg_ids` / `ref_frames` /
+//! `y_modes` / `delta_lfs`，再走一遍分段特征与 ref/mode delta；`lvl == 0` 时
+//! 还要为另一侧再调一次。而**没有 delta_lf、没有 ref/mode delta、分段也不调
+//! LF** 的帧里，`lvl` 只跟 `(plane, pass)` 有关 —— 真素材正是这一档
+//! （`AV1_TRACE_DBL` 可见 `delta_enabled=false`、`delta_lf_present=false`、
+//! `seg_enabled=false`）。
+//!
+//! 现在先判这三个条件，命中就直接返回 `lf_derive(lf, lf.level[i])` 的常量；
+//! 不读 `grid`、不算模式。`limit/blimit/thresh` 的推导抽成 `lf_derive` 共用。
+//!
+//! **实测**（同一二进制、8 轮换序，CPU 时间 / 100 帧）：中位 **7.085s vs
+//! 7.135s，约 −0.7%（7/8 轮更快）**。收益不大，但这条路径的随机读确实整段省掉。
+//! 顺带试过 `nv12_frame` 去掉 `vec![0u8]` 清零，A/B 持平（bzero 不来自它，
+//! 大块分配走的是惰性零页）⇒ 已回退。
+//!
 //! 硬解那一路在 [`crate::macos`]：AV1 会**先试硬解**（M3+ 成功），失败才落到这里。
 //! 这不是"回退到浏览器"，而是同一个引擎里的两个后端（DEVELOPMENT.md 的"硬解优先、自研
 //! 软解兜底"）。
