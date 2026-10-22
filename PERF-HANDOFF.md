@@ -2753,3 +2753,47 @@ LR 桥”的成本；审计早已指出 MC 的 u8 源+加宽可能更慢，混�
 变换写回全部迁移），并重新评估 MC；那是多轮结构改造。
 参考成熟方案（dav1d / libaom）时**只学算法与结构，自己实现**——不抄代码、
 不做逐行翻译、不引入第三方代码或许可声明（与项目一贯口径一致）。
+
+## 三十五、下一步（设计评估，未实施）：两帧流水线
+
+**为什么是它**（2026-10-23，8 线程 row-mt、100 帧真实素材）：
+
+| 量 | 中位 | p90 |
+|---|---|---|
+| tiles（语法+回放） | **28.5ms** | 55.2ms |
+| filters（去块/CDEF/超分/LR） | **13.9ms** | 33.5ms |
+| 整帧（tiles+filters+ref+out+setup） | **49.9ms** | 93.3ms |
+
+单瓦片 1×1 ⇒ 没有瓦片并行；row-mt 8 线程只有 1.6×。**语法是串行硬底，滤镜已经
+可以并行**，两者现在却严格串行执行（`finish_frame` 里 tiles → filters → ref → out）。
+
+**目标流水线**：
+
+```text
+主线程：  语法 N+1  ──────────────► 回放 N+1 ──► 语法 N+2 …
+滤镜线程：          滤镜 N（去块/CDEF/超分/LR）
+参考帧：            滤镜 N 完成 → store_pixels(N) → 回放 N+1 才能开始
+```
+
+- N+1 的**帧头/语法**不依赖 N 的像素（只依赖参考元数据/CDF），可以和滤镜 N 重叠；
+- N+1 的**回放/重建**依赖参考像素（可能包含 N），必须等 `store_pixels(N)`；
+- N+1 的语法期间不能改 `store.pixels`/CDF：CDF 用独立的帧上下文，
+  参考元数据 `refresh()` 提前到滤镜前完成，像素/CDF 存档在滤镜后提交。
+
+**必须先做的重构**（这是本轮没直接开工的原因）：
+
+1. 把 `block.rs::decode_tile` 拆成
+   `parse_tile(...) -> PendingReplay`（只跑语法阶段、记录 `row_mt` 工单）与
+   `replay_tile(PendingReplay, ...)`（回放 + `exit_symbol` 的硬验收）。
+   现在 `BlockCtx<'a>` 借用了 `tile` / `CdfContext` / `MiGrid` / `BlockGrid` /
+   `CoeffContexts` / `store` / `frame`，返回它要重新设计生命周期或改成"自有状态 +
+   回放时再借"。
+2. `finish_frame` 拆成 `finish_parse`（tiles 语法 + ref 元数据/CDF 提交）与
+   `finish_replay_filters`（回放 + 滤镜 + store_pixels + 输出），用帧队列串起来。
+3. 单瓦片仍可用 row-mt 的回放并行；流水线只是把"语法 N+1"移到"滤镜 N"同一时段。
+4. 验收：逐字节不变（默认/`ME_ROW_MT`/并行），以及 `PHASE` 里 tiles/filters
+   不再相加而是部分重叠。
+
+**预期**：中位 50ms → **约 36~40ms**（语法 14ms 与滤镜/回放重叠）；离 33ms 仍可能
+差一点，但这是单瓦片下最可能接近实时的一步。**风险**：帧生命周期/参考槽/CDF 存档
+与线程同步，属多轮改造，不能半途合并。
