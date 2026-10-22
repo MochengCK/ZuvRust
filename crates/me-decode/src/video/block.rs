@@ -1668,6 +1668,7 @@ pub(crate) struct ReplayShared<'a> {
     pub grid: &'a BlockGrid,
     pub mi_grid: &'a MiGrid,
     pub store: &'a RefFrameStore,
+    pub ref_pixels: &'a [Option<std::sync::Arc<CurrFrame>>; 8],
     pub seq: &'a SequenceHeader,
     pub fh: &'a FrameHeader,
     pub blocks: &'a [BlockJob],
@@ -1973,7 +1974,7 @@ fn replay_one(shared: &ReplayShared<'_>, bj: &BlockJob, sc: &mut ReplayScratch) 
         // SAFETY: 见 `ReplayShared::frame` 的不变量（同一时刻单行独占）。
         let frame: &mut CurrFrame = unsafe { &mut *shared.frame };
         if info.is_inter {
-            let refs: &[Option<std::sync::Arc<CurrFrame>>; 8] = &shared.store.pixels;
+            let refs: &[Option<std::sync::Arc<CurrFrame>>; 8] = shared.ref_pixels;
             super::inter::compute_prediction(
                 frame, shared.grid, shared.mi_grid, shared.seq, shared.fh, refs, &info, r, c,
                 &bj.warp, &bj.intra_ctx, &mut sc.pred,
@@ -2064,6 +2065,9 @@ pub struct BlockCtx<'a> {
     pub seq: &'a SequenceHeader,
     pub fh: &'a FrameHeader,
     pub store: &'a RefFrameStore,
+    /// 构造时/回放前从参考槽取的 `Arc` 快照（语法阶段不读像素，回放 N+1 前
+    /// 必须用 `store.ref_pixels()` 刷新）。
+    pub ref_pixels: [Option<std::sync::Arc<CurrFrame>>; 8],
     pub field: Option<&'a mv::MotionField>,
     /// 帧级 CDF 上下文（跨瓦片共享，见 [`super::context`]）里的这两组。
     pub cdfs: &'a mut BlockCdfs,
@@ -2129,11 +2133,13 @@ impl<'a> BlockCtx<'a> {
         frame: Option<&'a mut CurrFrame>,
     ) -> Self {
         let base_q_idx = fh.params.quant.base_q_idx as u32;
+        let ref_pixels = store.ref_pixels();
         Self {
             grid,
             seq,
             fh,
             store,
+            ref_pixels,
             field,
             cdfs,
             coeff_cdfs,
@@ -2379,7 +2385,7 @@ impl<'a> BlockCtx<'a> {
             // 实测却到 58~61 ms，差出来的 ~40 ms 就是这遍白跑的 MC。
             // 调色板块（`inline_block`）**不受影响** —— 它 recording=false，照旧就地预测。
             if let Some(frame) = self.frame.as_deref_mut().filter(|_| !recording) {
-                let refs: &[Option<std::sync::Arc<CurrFrame>>; 8] = &*self.store.pixels;
+                let refs: &[Option<std::sync::Arc<CurrFrame>>; 8] = &self.ref_pixels;
                 super::inter::compute_prediction(
                     frame, self.grid, mi_grid, self.seq, self.fh, refs, &info, r, c, &warp,
                     &intra_ctx, &mut self.pred_scratch,
@@ -4681,6 +4687,7 @@ impl<'a> BlockCtx<'a> {
             grid: &*self.grid,
             mi_grid,
             store: self.store,
+            ref_pixels: &self.ref_pixels,
             seq: self.seq,
             fh: self.fh,
             blocks: &blocks,
@@ -4887,6 +4894,7 @@ impl<'a> BlockCtx<'a> {
             grid: &*self.grid,
             mi_grid,
             store: self.store,
+            ref_pixels: &self.ref_pixels,
             seq: self.seq,
             fh: self.fh,
             blocks: &blocks,

@@ -267,9 +267,7 @@ impl Av1Decoder {
     /// （CDF 上下文不用清：关键帧的 `primary_ref_frame` 必为 NONE，走默认表。）
     fn reset_reference_state(&mut self) {
         self.store.reset();
-        for slot in self.store.pixels.iter_mut() {
-            *slot = None;
-        }
+        self.store.clear_pixels();
     }
 
     /// `show_existing_frame`：不解码，直接把参考槽里的像素当这一帧的输出。
@@ -281,10 +279,7 @@ impl Av1Decoder {
         // `cloned()` 是 **`Arc` 的引用计数加一**，不是帧拷贝 —— 共享像素零成本。
         let mut frame = self
             .store
-            .pixels
-            .get(slot)
-            .and_then(|p| p.as_ref())
-            .cloned()
+            .pixel(slot)
             .ok_or_else(|| {
                 MediaError::Bitstream(format!(
                     "show_existing_frame 指向参考槽 {slot}，但那个槽还没有像素（流被截断，或 seek 到了没有随机访问点的位置）"

@@ -627,7 +627,7 @@ impl FrameHeader {
 /// `RefOrderHint`），没有它连位都读不对。另外"没写就沿用上一帧"的那几组参数
 /// （[`SavedFrameState`]）也挂在这里 —— 位读不依赖它们，但值对不上以后
 /// 滤波与运动补偿就会错。像素不在这里 —— 那是 M6（帧存储）的事。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct RefFrameStore {
     pub valid: [bool; NUM_REF_FRAMES],
     pub order_hint: [u8; NUM_REF_FRAMES],
@@ -647,7 +647,7 @@ pub struct RefFrameStore {
     /// 约 6.2 MB，而 `refresh_frame_flags` 经常一次刷两个槽（KEY + ARF）——
     /// 按值存就是每帧 6~12 MB 的 `memmove`，加每份新缓冲的缺页。
     /// 参考帧是**只读**的（预测/OBMC/warp 都只读），所以共享一份即可，零拷贝。
-    pub pixels: Box<[Option<std::sync::Arc<CurrFrame>>; NUM_REF_FRAMES]>,
+    pub pixels: Box<[std::sync::Mutex<Option<std::sync::Arc<CurrFrame>>>; NUM_REF_FRAMES]>,
     /// 每个槽的 CDF 上下文（规范 §7.20：`save_cdfs(i)` / `load_cdfs(ctx)`，
     /// 下标就是参考槽号）。
     pub cdfs: Box<[CdfContext; NUM_REF_FRAMES]>,
@@ -667,7 +667,7 @@ impl Default for RefFrameStore {
             render_width: [0; NUM_REF_FRAMES],
             render_height: [0; NUM_REF_FRAMES],
             saved: Box::new(std::array::from_fn(|_| SavedFrameState::past_independence())),
-            pixels: Box::new(std::array::from_fn(|_| None)),
+            pixels: Box::new(std::array::from_fn(|_| std::sync::Mutex::new(None))),
             // 默认上下文（base_q = 0 档）—— 真正的帧级初始化在驱动里按
             // `primary_ref_frame` 决定"用默认还是 load_cdfs"。
             cdfs: Box::new(std::array::from_fn(|_| CdfContext::defaults(0))),
@@ -737,12 +737,39 @@ impl RefFrameStore {
     /// 把这一帧的**像素**存进 `refresh_frame_flags` 指定的槽
     /// （§7.20 的 `FrameStore[i] = LrFrame`；像素要先经环路滤波与超分上采样）。
     /// **按引用共享**存进被刷新的每个槽（零拷贝，见 [`RefFrameStore::pixels`] 的说明）。
-    pub fn store_pixels(&mut self, refresh_flags: u8, frame: std::sync::Arc<CurrFrame>) {
+    pub fn store_pixels(&self, refresh_flags: u8, frame: std::sync::Arc<CurrFrame>) {
         for i in 0..NUM_REF_FRAMES {
             if (refresh_flags >> i) & 1 == 1 {
-                self.pixels[i] = Some(std::sync::Arc::clone(&frame));
+                *self.pixels[i].lock().unwrap_or_else(|e| e.into_inner()) =
+                    Some(std::sync::Arc::clone(&frame));
             }
         }
+    }
+
+    /// 取一份像素槽快照（8 个 `Arc` 引用计数加一）—— `BlockCtx` 在语法/回放
+    /// 期间用这份快照，避免长期借用 `RefFrameStore` 时挡住 `store_pixels`。
+    pub fn ref_pixels(&self) -> [Option<std::sync::Arc<CurrFrame>>; NUM_REF_FRAMES] {
+        std::array::from_fn(|i| {
+            self.pixels[i]
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .as_ref()
+                .cloned()
+        })
+    }
+
+    /// 清空像素槽（关键帧重置用）。
+    pub fn clear_pixels(&self) {
+        for slot in self.pixels.iter() {
+            *slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    /// 读一个槽的像素（`show_existing_frame` 用）。
+    pub fn pixel(&self, slot: usize) -> Option<std::sync::Arc<CurrFrame>> {
+        self.pixels
+            .get(slot)
+            .and_then(|p| p.lock().unwrap_or_else(|e| e.into_inner()).as_ref().cloned())
     }
 
     /// `save_cdfs(i)`（§7.20）：把当前帧的 CDF 上下文存进被刷新的每个槽。
