@@ -881,6 +881,8 @@ pub struct TxScratch {
     t: Vec<i32>,
     pred: Vec<u16>,
     residual: Vec<i64>,
+    /// 8bit/10bit 反变换的 i32 中间量（第四十五刀：8 路通道）；12bit 走 `residual`。
+    residual32: Vec<i32>,
     /// `coeffs` 收集量化系数用的缓冲（**只清前 `min(w*h, MAX_TXB_COEFFS)` 个**）。
     ///
     /// 早先是 `coeffs` 里的局部栈数组 `[i32; MAX_TXB_COEFFS]`（4KB）——
@@ -1205,7 +1207,7 @@ impl ResidualCtx<'_> {
                 )?
             };
             if reconstructing && eob > 0 {
-                let TxScratch { levels, t, pred, residual, .. } = scratch;
+                let TxScratch { levels, t, pred, residual, residual32, .. } = scratch;
                 self.add_residual(
                     plane,
                     start_x,
@@ -1215,6 +1217,7 @@ impl ResidualCtx<'_> {
                     t,
                     pred,
                     residual,
+                    residual32,
                 )?;
             }
             if dbg {
@@ -1268,8 +1271,8 @@ impl ResidualCtx<'_> {
             }
             if tj.has_residual {
                 let lv = &levels[tj.levels_at..tj.levels_at + tj.levels_len];
-                let TxScratch { t, pred, residual, .. } = scratch;
-                self.add_residual(tj.plane, tj.start_x, tj.start_y, tj.tx_sz, lv, t, pred, residual)?;
+                let TxScratch { t, pred, residual, residual32, .. } = scratch;
+                self.add_residual(tj.plane, tj.start_x, tj.start_y, tj.tx_sz, lv, t, pred, residual, residual32)?;
             }
             // 诊断（`ME_TRACE_RACE=1`）：**逐变换块**盖章，而且必须等**残差也加完**才算"写完" ——
             // 早先在 `reconstruct_block` 之后就盖，读者会看到"已写但缺残差"的像素，
@@ -1299,6 +1302,7 @@ impl ResidualCtx<'_> {
         t: &mut Vec<i32>,
         pred: &mut Vec<u16>,
         residual: &mut Vec<i64>,
+        residual32: &mut Vec<i32>,
     ) -> Result<()> {
         let w = TX_WIDTH[tx_sz as usize] as usize;
         let h = TX_HEIGHT[tx_sz as usize] as usize;
@@ -1347,6 +1351,7 @@ impl ResidualCtx<'_> {
             bit_depth,
             lossless,
             residual,
+            residual32,
         )
     }
 

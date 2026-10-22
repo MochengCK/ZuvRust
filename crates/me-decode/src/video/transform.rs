@@ -85,6 +85,30 @@
 //! 8/10/12 位深 × 随机/极端系数 + 无损 WHT，比**残差逐元素**；同进程"关 SIMD"靠
 //! `simd::FORCE_SCALAR`）+ 真素材三路（开/关/基线）逐字节。
 //!
+//! ## 第四十五刀（2026-10-22）：8bit/10bit 反变换走 **8 路 i32 通道**
+//!
+//! 重新采样后 `vt_forward_1d` 成了**整帧第一热点（14.5%）** —— 旧内核每条线只装
+//! **4 个 i64**，而 AVX2 寄存器里有 8 个 32 位槽。能不能换成 i32 完全取决于值域：
+//!
+//! ```text
+//!   反量化钳位：|t| ≤ 2^(7+BitDepth)
+//!   蝴蝶和    ：Σ两项 ≤ 2^(7+bd)·2^13 = 2^(20+bd)
+//!   8bit ⇒ 2^28    10bit ⇒ 2^30    12bit ⇒ 2^32  ✗
+//! ```
+//!
+//! 所以 **8/10bit 走 i32、12bit 仍走 i64**；4 宽/4 高的块凑不满 8 条线，也走 i64。
+//! 1D 内核**只有一份实现**（`simd.rs` 里用 `const I32: bool` 参数化 `vt_*` 辅助函数，
+//! 编译期常量折叠），行/列驱动各加一个 8 线版（8×8 i32 转置收集/写回）；i32 结果在
+//! 列趟之后才扩回 i64（只做位宽转换，不改数值）。
+//!
+//! **实测（同一二进制、`ME_NO_VT32=1` 关 i32 路；CPU 时间 / 100 帧 / 12 轮换序）**：
+//! i32 中位 **6.73s** vs i64 **7.49s**，**−10.1%（6/6 轮更快）**；
+//! `sample` 里 `vt_forward_1d` 从 **14.5%** 降到 **~5%**。
+//!
+//! **验收**：24/60 帧与改前**逐字节相同**、`ME_NO_SIMD` / row-mt 顺序 / row-mt 并行
+//! **逐字节相同**、真素材 60 帧三平面与 dav1d **逐像素一致**、`me-decode` 476 项
+//! 全过、四个非本机架构编译通过。诊断开关 `ME_NO_VT32=1` 只用来做同二进制 A/B。
+//!
 //! ## 这一层最容易写错的地方（写之前先记住）
 //!
 //! 1. **反量化不是"乘一个数"**：规范按系数位置分 `get_dc_quant` / `get_ac_quant`，
@@ -1030,6 +1054,7 @@ fn inverse_transform_2d_into(
     bit_depth: u8,
     lossless: bool,
     residual: &mut Vec<i64>,
+    residual32: &mut Vec<i32>,
 ) -> Result<()> {
     let idx = tx_sz as usize;
     let w = TX_WIDTH[idx] as usize;
@@ -1059,6 +1084,69 @@ fn inverse_transform_2d_into(
     let col_shift: u32 = if lossless { 0 } else { 4 };
     let row_clamp = bit_depth as u32 + 8;
     let col_clamp = (bit_depth as u32 + 6).max(16);
+
+    // **8bit/10bit 走 8 路 i32 通道**（第四十五刀）：中间量 ≤ 2^28 / 2^30，i32 装得下
+    // （见模块头的值域分析），而 AVX2 的 256 位寄存器能装 8 个 i32（i64 只装 4 个）。
+    // 12bit 的中间量到 2^32 ⇒ 必须走 i64；4 宽/4 高的块凑不满 8 条线 ⇒ 也走 i64。
+    let use_i32 = !lossless
+        && bit_depth <= 10
+        && w >= 8
+        && h >= 8
+        && !flags::no_vt32()
+        && super::simd::avx2_available();
+    if use_i32 {
+        if residual32.len() < w * h {
+            residual32.resize(w * h, 0);
+        }
+        let res32: &mut [i32] = &mut residual32[..w * h];
+        // SAFETY: 已判 AVX2；`t` 是 `w×h` 的系数格，`res32` 长度 = w·h。
+        let rows_done = unsafe {
+            super::simd::inv_txfm_rows_i32(
+                t,
+                res32,
+                w,
+                h,
+                kind_code(row_1d(tx_type)),
+                log2_w,
+                row_clamp,
+                row_shift,
+                log2_w.abs_diff(log2_h) == 1,
+                lossless,
+            )
+        };
+        if rows_done == h {
+            let lo = -(1i32 << (col_clamp - 1));
+            let hi = (1i32 << (col_clamp - 1)) - 1;
+            debug_assert!((col_clamp - 1) < 31, "i32 路径的列钳位必须在 31 位以内");
+            for v in res32.iter_mut() {
+                *v = (*v).clamp(lo, hi);
+            }
+            // SAFETY: 同上；`res32` 长度 = w·h。
+            let cols_done = unsafe {
+                super::simd::inv_txfm_cols_i32(
+                    res32,
+                    w,
+                    h,
+                    kind_code(col_1d(tx_type)),
+                    log2_h,
+                    col_clamp,
+                    col_shift,
+                    lossless,
+                )
+            };
+            if cols_done == w {
+                // 收窄回 i64 只是**位宽转换**（值域已由钳位/值域分析保证），不改变数值。
+                if residual.len() < w * h {
+                    residual.resize(w * h, 0);
+                }
+                for (d, s) in residual[..w * h].iter_mut().zip(res32.iter()) {
+                    *d = *s as i64;
+                }
+                return Ok(());
+            }
+        }
+        // 形状不满足（理论上不会发生）⇒ 不猜，落回 i64 路径重算。
+    }
 
     // 复用缓冲：**只增不减**（2026-10-05）。
     //
@@ -1171,11 +1259,25 @@ pub fn debug_inverse_only(
     lossless: bool,
 ) -> Vec<i64> {
     let mut residual = Vec::new();
-    inverse_transform_2d_into(t, tx_sz, tx_type, bit_depth, lossless, &mut residual)
-        .unwrap_or_default();
+    let mut residual32 = Vec::new();
+    inverse_transform_2d_into(
+        t,
+        tx_sz,
+        tx_type,
+        bit_depth,
+        lossless,
+        &mut residual,
+        &mut residual32,
+    )
+    .unwrap_or_default();
+    // i32 路径只填 `residual32`：诊断入口统一转成 i64 返回。
+    let n = residual_len(tx_sz);
+    if residual.len() < n {
+        residual = residual32.iter().take(n).map(|v| *v as i64).collect();
+    }
     // `inverse_transform_2d_into` 现在"只增不减"（见那里的说明）⇒ 返回前按形状截断，
     // 保持这个诊断入口"长度 = w·h"的老契约。
-    residual.truncate(residual_len(tx_sz));
+    residual.truncate(n);
     residual
 }
 
@@ -1200,6 +1302,7 @@ pub fn inverse_transform_add(
     bit_depth: u8,
     lossless: bool,
     residual: &mut Vec<i64>,
+    residual32: &mut Vec<i32>,
 ) -> Result<()> {
     let idx = tx_sz as usize;
     if idx >= TX_SIZES_ALL {
@@ -1249,7 +1352,15 @@ pub fn inverse_transform_add(
         return Ok(());
     }
     let residual = {
-        inverse_transform_2d_into(t, tx_sz, tx_type, bit_depth, lossless, residual)?;
+        inverse_transform_2d_into(
+            t,
+            tx_sz,
+            tx_type,
+            bit_depth,
+            lossless,
+            residual,
+            residual32,
+        )?;
         &residual[..w * h]
     };
 
@@ -1295,6 +1406,7 @@ mod tests {
         let pred = vec![0u16; w * h];
         let mut dst = vec![0u16; w * h];
         let mut residual = Vec::new();
+        let mut residual32 = Vec::new();
         inverse_transform_add(
             &t,
             tx_sz,
@@ -1305,6 +1417,7 @@ mod tests {
             8,
             false,
             &mut residual,
+            &mut residual32,
         )
         .unwrap();
         dst.iter().map(|v| *v as i64).collect()
@@ -1430,10 +1543,10 @@ mod tests {
                         }
                         crate::video::simd::FORCE_SCALAR.store(true, Ordering::Relaxed);
                         let mut a = Vec::new();
-                        inverse_transform_2d_into(&t, ts, tg, bd, false, &mut a).unwrap();
+                        inverse_transform_2d_into(&t, ts, tg, bd, false, &mut a, &mut Vec::new()).unwrap();
                         crate::video::simd::FORCE_SCALAR.store(false, Ordering::Relaxed);
                         let mut b = Vec::new();
-                        inverse_transform_2d_into(&t, ts, tg, bd, false, &mut b).unwrap();
+                        inverse_transform_2d_into(&t, ts, tg, bd, false, &mut b, &mut Vec::new()).unwrap();
                         assert_eq!(
                             a, b,
                             "SIMD 与标量不一致：tx_sz={ts} tx_type={tg} bd={bd} pattern={pattern}"
@@ -1453,10 +1566,10 @@ mod tests {
             }
             crate::video::simd::FORCE_SCALAR.store(true, Ordering::Relaxed);
             let mut a = Vec::new();
-            inverse_transform_2d_into(&t, TX_4X4, DCT_DCT, 8, true, &mut a).unwrap();
+            inverse_transform_2d_into(&t, TX_4X4, DCT_DCT, 8, true, &mut a, &mut Vec::new()).unwrap();
             crate::video::simd::FORCE_SCALAR.store(false, Ordering::Relaxed);
             let mut b = Vec::new();
-            inverse_transform_2d_into(&t, TX_4X4, DCT_DCT, 8, true, &mut b).unwrap();
+            inverse_transform_2d_into(&t, TX_4X4, DCT_DCT, 8, true, &mut b, &mut Vec::new()).unwrap();
             assert_eq!(a, b, "无损 WHT 的 SIMD 与标量不一致：pattern={pattern}");
             changed += 1;
         }

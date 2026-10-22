@@ -1826,7 +1826,9 @@ mod x86 {
     //
     // **值域分析（2026-10-02 插桩实测）**：乘法的输入 |t| ≤ 2^19.5（12bit 极端系数
     // 全组合扫一遍；8bit 真素材 ≤ 2^13.5）⇒ `_mm256_mul_epi32`（要求 |t| < 2^31）
-    // **精确**；但积与和要到 ~2^32 ⇒ 通道必须是 **i64**（不能退回 i32 通道）。
+    // **精确**；12bit 的积与和要到 ~2^32 ⇒ 通道必须是 **i64**。
+    // **8/10bit 的界只到 2^28 / 2^30 ⇒ 走 `const I32 = true` 的 8 路 i32 版**
+    // （第四十五刀；内核逻辑与 i64 版是同一份，只有元素宽度不同）。
     //
     // 两个驱动各自负责"4 条线"的收集/写回形态：
     // * [`inv_txfm_cols`]：线 = 相邻 4 **列** ⇒ 同一行的 4 个 i64 在内存里连续，
@@ -1834,50 +1836,80 @@ mod x86 {
     // * [`inv_txfm_rows`]：线 = 相邻 4 **行** ⇒ 跨 stride，靠 4×4 i32 转置收集、
     //   4×4 i64 转置写回（见 `vt_transpose4`）。
 
+    // `I32 = true`：8 个 i32 通道（8bit/10bit）；`false`：4 个 i64 通道（12bit 与
+    // 小尺寸块的兜底）。两条路的**算法逐条相同**，只有元素宽度不同 —— 值域见
+    // `transform.rs` 的「值域分析」：8bit 的中间量 ≤ 2^28、10bit ≤ 2^30 ⇒ i32 装得下，
+    // 12bit 到 2^32 ⇒ 必须 i64。
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_add(a: __m256i, b: __m256i) -> __m256i {
-        _mm256_add_epi64(a, b)
+    unsafe fn vt_add<const I32: bool>(a: __m256i, b: __m256i) -> __m256i {
+        if I32 {
+            _mm256_add_epi32(a, b)
+        } else {
+            _mm256_add_epi64(a, b)
+        }
     }
 
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_sub(a: __m256i, b: __m256i) -> __m256i {
-        _mm256_sub_epi64(a, b)
+    unsafe fn vt_sub<const I32: bool>(a: __m256i, b: __m256i) -> __m256i {
+        if I32 {
+            _mm256_sub_epi32(a, b)
+        } else {
+            _mm256_sub_epi64(a, b)
+        }
     }
 
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_neg(a: __m256i) -> __m256i {
-        _mm256_sub_epi64(_mm256_setzero_si256(), a)
+    unsafe fn vt_neg<const I32: bool>(a: __m256i) -> __m256i {
+        if I32 {
+            _mm256_sub_epi32(_mm256_setzero_si256(), a)
+        } else {
+            _mm256_sub_epi64(_mm256_setzero_si256(), a)
+        }
     }
 
-    /// `v * c`（`c` 广播成 i32 系数）。要求 |v| < 2^31 —— 见上面的值域分析。
+    /// `v * c`（`c` 广播）。i64 通道走 `mul_epi32`（要求 |v| < 2^31，见值域分析）；
+    /// i32 通道走 `mullo_epi32`（低 32 位；乘积在 i32 内不溢出，同样由值域分析保证）。
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_mul(v: __m256i, c: i32) -> __m256i {
-        _mm256_mul_epi32(v, _mm256_set1_epi64x(c as i64))
+    unsafe fn vt_mul<const I32: bool>(v: __m256i, c: i32) -> __m256i {
+        if I32 {
+            _mm256_mullo_epi32(v, _mm256_set1_epi32(c))
+        } else {
+            _mm256_mul_epi32(v, _mm256_set1_epi64x(c as i64))
+        }
     }
 
-    /// 4 个 i64 通道的**算术右移**（`n ∈ 1..=63`）：AVX2 没有 `srai_epi64`，手工拼 ——
+    /// **算术右移**：i32 通道直接 `srav`；i64 没有 `srai_epi64`，手工拼 ——
     /// 每个 64 位通道的符号位在高 32 位半字里，先复制到整个通道，再做逻辑右移 + 或。
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_srai(v: __m256i, n: u32) -> __m256i {
-        debug_assert!((1..=63).contains(&n));
-        let sign = _mm256_shuffle_epi32(_mm256_srai_epi32(v, 31), 0b11_11_01_01);
-        let hi = _mm256_sllv_epi64(sign, _mm256_set1_epi64x((64 - n) as i64));
-        _mm256_or_si256(_mm256_srlv_epi64(v, _mm256_set1_epi64x(n as i64)), hi)
+    unsafe fn vt_srai<const I32: bool>(v: __m256i, n: u32) -> __m256i {
+        debug_assert!(if I32 { (1..=31).contains(&n) } else { (1..=63).contains(&n) });
+        if I32 {
+            _mm256_srav_epi32(v, _mm256_set1_epi32(n as i32))
+        } else {
+            let sign = _mm256_shuffle_epi32(_mm256_srai_epi32(v, 31), 0b11_11_01_01);
+            let hi = _mm256_sllv_epi64(sign, _mm256_set1_epi64x((64 - n) as i64));
+            _mm256_or_si256(_mm256_srlv_epi64(v, _mm256_set1_epi64x(n as i64)), hi)
+        }
     }
 
     /// `Round2( v, n )`（§3）；`n = 0` 时等于 `v`。
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_round2(v: __m256i, n: u32) -> __m256i {
+    unsafe fn vt_round2<const I32: bool>(v: __m256i, n: u32) -> __m256i {
         if n == 0 {
             return v;
         }
-        vt_srai(vt_add(v, _mm256_set1_epi64x(1i64 << (n - 1))), n)
+        let half = if I32 {
+            _mm256_set1_epi32(1i32 << (n - 1))
+        } else {
+            _mm256_set1_epi64x(1i64 << (n - 1))
+        };
+        vt_srai::<I32>(vt_add::<I32>(v, half), n)
     }
 
     /// `v >> N`（**算术**右移，`N` 是编译期常量）—— **3 条**指令，比 [`vt_srai`] 少 2 条。
@@ -1903,19 +1935,28 @@ mod x86 {
     /// 在 const 泛型里做算术。
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_srai_c<const N: i32, const SHL: i32>(v: __m256i) -> __m256i {
+    unsafe fn vt_srai_c<const I32: bool, const N: i32, const SHL: i32>(v: __m256i) -> __m256i {
         debug_assert_eq!(N + SHL, 64, "vt_srai_c 的两个常量必须互补");
         debug_assert!((1..=31).contains(&N), "vt_srai_c 的移位量必须在 1..=31");
-        // 一个 i64 = 两个 i32：`srli_epi64` 给出**正确**的低 32 位，
-        // `srai_epi32` 给出**正确**的高 32 位（低 32 位无意义），按半字拼起来。
-        _mm256_blend_epi32::<0xAA>(_mm256_srli_epi64::<N>(v), _mm256_srai_epi32::<N>(v))
+        if I32 {
+            _mm256_srai_epi32::<N>(v)
+        } else {
+            // 一个 i64 = 两个 i32：`srli_epi64` 给出**正确**的低 32 位，
+            // `srai_epi32` 给出**正确**的高 32 位（低 32 位无意义），按半字拼起来。
+            _mm256_blend_epi32::<0xAA>(_mm256_srli_epi64::<N>(v), _mm256_srai_epi32::<N>(v))
+        }
     }
 
     /// [`vt_round2`] 的**常量移位**版：`(v + (1 << (N-1))) >> N`。语义逐位相同。
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_round2_c<const N: i32, const SHL: i32>(v: __m256i) -> __m256i {
-        vt_srai_c::<N, SHL>(vt_add(v, _mm256_set1_epi64x(1i64 << (N - 1))))
+    unsafe fn vt_round2_c<const I32: bool, const N: i32, const SHL: i32>(v: __m256i) -> __m256i {
+        let half = if I32 {
+            _mm256_set1_epi32(1i32 << (N - 1))
+        } else {
+            _mm256_set1_epi64x(1i64 << (N - 1))
+        };
+        vt_srai_c::<I32, N, SHL>(vt_add::<I32>(v, half))
     }
 
     /// 单测入口：把 [`vt_srai_c`] 的效果摊成 4 个 `i64`（`mod tests` 在 `x86` 外面，
@@ -1924,32 +1965,39 @@ mod x86 {
     pub(crate) unsafe fn vt_srai_c_probe<const N: i32, const SHL: i32>(v: [i64; 4]) -> [i64; 4] {
         let x = _mm256_loadu_si256(v.as_ptr() as *const __m256i);
         let mut o = [0i64; 4];
-        _mm256_storeu_si256(o.as_mut_ptr() as *mut __m256i, vt_srai_c::<N, SHL>(x));
+        _mm256_storeu_si256(o.as_mut_ptr() as *mut __m256i, vt_srai_c::<false, N, SHL>(x));
         o
     }
 
-    /// `Clip3( lo, hi, v )`（64 位有符号比较；`cmpgt_epi64` + `blendv`）。
+    /// `Clip3( lo, hi, v )`：i32 通道用 `max/min`；i64 用 `cmpgt_epi64` + `blendv`。
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_clamp(v: __m256i, lo: i64, hi: i64) -> __m256i {
-        let vl = _mm256_set1_epi64x(lo);
-        let vh = _mm256_set1_epi64x(hi);
-        let a = _mm256_blendv_epi8(v, vl, _mm256_cmpgt_epi64(vl, v));
-        _mm256_blendv_epi8(a, vh, _mm256_cmpgt_epi64(v, vh))
+    unsafe fn vt_clamp<const I32: bool>(v: __m256i, lo: i64, hi: i64) -> __m256i {
+        if I32 {
+            debug_assert!(lo >= i32::MIN as i64 && hi <= i32::MAX as i64);
+            let vl = _mm256_set1_epi32(lo as i32);
+            let vh = _mm256_set1_epi32(hi as i32);
+            _mm256_min_epi32(_mm256_max_epi32(v, vl), vh)
+        } else {
+            let vl = _mm256_set1_epi64x(lo);
+            let vh = _mm256_set1_epi64x(hi);
+            let a = _mm256_blendv_epi8(v, vl, _mm256_cmpgt_epi64(vl, v));
+            _mm256_blendv_epi8(a, vh, _mm256_cmpgt_epi64(v, vh))
+        }
     }
 
     /// `B( a, b, angle, flip, r )`（§7.13.1.2）的通道版。
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_butterfly(v: &mut [__m256i], a: usize, b: usize, angle: i32, flip: bool) {
+    unsafe fn vt_butterfly<const I32: bool>(v: &mut [__m256i], a: usize, b: usize, angle: i32, flip: bool) {
         let (c, s) = (
             super::super::transform::cos128(angle),
             super::super::transform::sin128(angle),
         );
-        let x = _mm256_sub_epi64(vt_mul(v[a], c), vt_mul(v[b], s));
-        let y = _mm256_add_epi64(vt_mul(v[a], s), vt_mul(v[b], c));
-        v[a] = vt_round2_c::<12, 52>(x);
-        v[b] = vt_round2_c::<12, 52>(y);
+        let x = vt_sub::<I32>(vt_mul::<I32>(v[a], c), vt_mul::<I32>(v[b], s));
+        let y = vt_add::<I32>(vt_mul::<I32>(v[a], s), vt_mul::<I32>(v[b], c));
+        v[a] = vt_round2_c::<I32, 12, 52>(x);
+        v[b] = vt_round2_c::<I32, 12, 52>(y);
         if flip {
             v.swap(a, b);
         }
@@ -1958,13 +2006,13 @@ mod x86 {
     /// `H( a, b, flip, r )`（§7.13.1.2）的通道版。
     #[inline]
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_hadamard(v: &mut [__m256i], a: usize, b: usize, flip: bool, r: u32) {
+    unsafe fn vt_hadamard<const I32: bool>(v: &mut [__m256i], a: usize, b: usize, flip: bool, r: u32) {
         let (a, b) = if flip { (b, a) } else { (a, b) };
         let (x, y) = (v[a], v[b]);
         let lo = -(1i64 << (r - 1));
         let hi = (1i64 << (r - 1)) - 1;
-        v[a] = vt_clamp(vt_add(x, y), lo, hi);
-        v[b] = vt_clamp(vt_sub(x, y), lo, hi);
+        v[a] = vt_clamp::<I32>(vt_add::<I32>(x, y), lo, hi);
+        v[b] = vt_clamp::<I32>(vt_sub::<I32>(x, y), lo, hi);
     }
 
     /// `Inverse DCT array permutation process`（§7.13.2.2）的通道版。
@@ -1984,35 +2032,35 @@ mod x86 {
 
     /// `Inverse ADST4 process`（§7.13.2.6）的通道版。
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_inverse_adst4(v: &mut [__m256i], r: u32) {
+    unsafe fn vt_inverse_adst4<const I32: bool>(v: &mut [__m256i], r: u32) {
         const SINPI_1_9: i32 = 1321;
         const SINPI_2_9: i32 = 2482;
         const SINPI_3_9: i32 = 3344;
         const SINPI_4_9: i32 = 3803;
         let mut s = [_mm256_setzero_si256(); 7];
-        s[0] = vt_mul(v[0], SINPI_1_9);
-        s[1] = vt_mul(v[0], SINPI_2_9);
-        s[2] = vt_mul(v[1], SINPI_3_9);
-        s[3] = vt_mul(v[2], SINPI_4_9);
-        s[4] = vt_mul(v[2], SINPI_1_9);
-        s[5] = vt_mul(v[3], SINPI_2_9);
-        s[6] = vt_mul(v[3], SINPI_4_9);
-        let a7 = vt_sub(v[0], v[2]);
-        let b7 = vt_add(a7, v[3]);
-        s[0] = vt_add(s[0], s[3]);
-        s[1] = vt_sub(s[1], s[4]);
+        s[0] = vt_mul::<I32>(v[0], SINPI_1_9);
+        s[1] = vt_mul::<I32>(v[0], SINPI_2_9);
+        s[2] = vt_mul::<I32>(v[1], SINPI_3_9);
+        s[3] = vt_mul::<I32>(v[2], SINPI_4_9);
+        s[4] = vt_mul::<I32>(v[2], SINPI_1_9);
+        s[5] = vt_mul::<I32>(v[3], SINPI_2_9);
+        s[6] = vt_mul::<I32>(v[3], SINPI_4_9);
+        let a7 = vt_sub::<I32>(v[0], v[2]);
+        let b7 = vt_add::<I32>(a7, v[3]);
+        s[0] = vt_add::<I32>(s[0], s[3]);
+        s[1] = vt_sub::<I32>(s[1], s[4]);
         s[3] = s[2];
-        s[2] = vt_mul(b7, SINPI_3_9);
-        s[0] = vt_add(s[0], s[5]);
-        s[1] = vt_sub(s[1], s[6]);
+        s[2] = vt_mul::<I32>(b7, SINPI_3_9);
+        s[0] = vt_add::<I32>(s[0], s[5]);
+        s[1] = vt_sub::<I32>(s[1], s[6]);
         let x = [
-            vt_add(s[0], s[3]),
-            vt_add(s[1], s[3]),
+            vt_add::<I32>(s[0], s[3]),
+            vt_add::<I32>(s[1], s[3]),
             s[2],
-            vt_sub(vt_add(s[0], s[1]), s[3]),
+            vt_sub::<I32>(vt_add::<I32>(s[0], s[1]), s[3]),
         ];
         for (k, slot) in v[..4].iter_mut().enumerate() {
-            *slot = vt_round2_c::<12, 52>(x[k]);
+            *slot = vt_round2_c::<I32, 12, 52>(x[k]);
         }
         let _ = r;
     }
@@ -2020,39 +2068,39 @@ mod x86 {
 
 // ===== 自动转录（从 transform.rs 的标量版逐条换名）=====
 #[target_feature(enable = "avx2")]
-unsafe fn vt_inverse_dct(v: &mut [__m256i], n: u32, r: u32) {
+unsafe fn vt_inverse_dct<const I32: bool>(v: &mut [__m256i], n: u32, r: u32) {
     let n0 = 1usize << n;
     vt_dct_permute(v, n);
 
     if n == 6 {
         for i in 0..16 {
-            vt_butterfly(v, 32 + i, 63 - i, 63 - 4 * brev(4, i) as i32, false);
+            vt_butterfly::<I32>(v, 32 + i, 63 - i, 63 - 4 * brev(4, i) as i32, false);
         }
     }
     if n >= 5 {
         for i in 0..8 {
-            vt_butterfly(v, 16 + i, 31 - i, 6 + ((brev(3, 7 - i) << 3) as i32), false);
+            vt_butterfly::<I32>(v, 16 + i, 31 - i, 6 + ((brev(3, 7 - i) << 3) as i32), false);
         }
     }
     if n == 6 {
         for i in 0..16 {
-            vt_hadamard(v, 32 + i * 2, 33 + i * 2, i & 1 == 1, r);
+            vt_hadamard::<I32>(v, 32 + i * 2, 33 + i * 2, i & 1 == 1, r);
         }
     }
     if n >= 4 {
         for i in 0..4 {
-            vt_butterfly(v, 8 + i, 15 - i, 12 + ((brev(2, 3 - i) << 4) as i32), false);
+            vt_butterfly::<I32>(v, 8 + i, 15 - i, 12 + ((brev(2, 3 - i) << 4) as i32), false);
         }
     }
     if n >= 5 {
         for i in 0..8 {
-            vt_hadamard(v, 16 + 2 * i, 17 + 2 * i, i & 1 == 1, r);
+            vt_hadamard::<I32>(v, 16 + 2 * i, 17 + 2 * i, i & 1 == 1, r);
         }
     }
     if n == 6 {
         for i in 0..4 {
             for j in 0..2 {
-                vt_butterfly(
+                vt_butterfly::<I32>(
                     v,
                     62 - i * 4 - j,
                     33 + i * 4 + j,
@@ -2064,18 +2112,18 @@ unsafe fn vt_inverse_dct(v: &mut [__m256i], n: u32, r: u32) {
     }
     if n >= 3 {
         for i in 0..2 {
-            vt_butterfly(v, 4 + i, 7 - i, 56 - 32 * i as i32, false);
+            vt_butterfly::<I32>(v, 4 + i, 7 - i, 56 - 32 * i as i32, false);
         }
     }
     if n >= 4 {
         for i in 0..4 {
-            vt_hadamard(v, 8 + 2 * i, 9 + 2 * i, i & 1 == 1, r);
+            vt_hadamard::<I32>(v, 8 + 2 * i, 9 + 2 * i, i & 1 == 1, r);
         }
     }
     if n >= 5 {
         for i in 0..2 {
             for j in 0..2 {
-                vt_butterfly(
+                vt_butterfly::<I32>(
                     v,
                     30 - 4 * i - j,
                     17 + 4 * i + j,
@@ -2088,34 +2136,34 @@ unsafe fn vt_inverse_dct(v: &mut [__m256i], n: u32, r: u32) {
     if n == 6 {
         for i in 0..8 {
             for j in 0..2 {
-                vt_hadamard(v, 32 + i * 4 + j, 35 + i * 4 - j, i & 1 == 1, r);
+                vt_hadamard::<I32>(v, 32 + i * 4 + j, 35 + i * 4 - j, i & 1 == 1, r);
             }
         }
     }
     for i in 0..2 {
-        vt_butterfly(v, 2 * i, 2 * i + 1, 32 + 16 * i as i32, i == 0);
+        vt_butterfly::<I32>(v, 2 * i, 2 * i + 1, 32 + 16 * i as i32, i == 0);
     }
     if n >= 3 {
         for i in 0..2 {
-            vt_hadamard(v, 4 + 2 * i, 5 + 2 * i, i == 1, r);
+            vt_hadamard::<I32>(v, 4 + 2 * i, 5 + 2 * i, i == 1, r);
         }
     }
     if n >= 4 {
         for i in 0..2 {
-            vt_butterfly(v, 14 - i, 9 + i, 48 + 64 * i as i32, true);
+            vt_butterfly::<I32>(v, 14 - i, 9 + i, 48 + 64 * i as i32, true);
         }
     }
     if n >= 5 {
         for i in 0..4 {
             for j in 0..2 {
-                vt_hadamard(v, 16 + 4 * i + j, 19 + 4 * i - j, i & 1 == 1, r);
+                vt_hadamard::<I32>(v, 16 + 4 * i + j, 19 + 4 * i - j, i & 1 == 1, r);
             }
         }
     }
     if n == 6 {
         for i in 0..2 {
             for j in 0..4 {
-                vt_butterfly(
+                vt_butterfly::<I32>(
                     v,
                     61 - i * 8 - j,
                     34 + i * 8 + j,
@@ -2126,81 +2174,81 @@ unsafe fn vt_inverse_dct(v: &mut [__m256i], n: u32, r: u32) {
         }
     }
     for i in 0..2 {
-        vt_hadamard(v, i, 3 - i, false, r);
+        vt_hadamard::<I32>(v, i, 3 - i, false, r);
     }
     if n >= 3 {
-        vt_butterfly(v, 6, 5, 32, true);
+        vt_butterfly::<I32>(v, 6, 5, 32, true);
     }
     if n >= 4 {
         for i in 0..2 {
             for j in 0..2 {
-                vt_hadamard(v, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, r);
+                vt_hadamard::<I32>(v, 8 + 4 * i + j, 11 + 4 * i - j, i == 1, r);
             }
         }
     }
     if n >= 5 {
         for i in 0..4 {
-            vt_butterfly(v, 29 - i, 18 + i, 48 + ((i >> 1) as i32) * 64, true);
+            vt_butterfly::<I32>(v, 29 - i, 18 + i, 48 + ((i >> 1) as i32) * 64, true);
         }
     }
     if n == 6 {
         for i in 0..4 {
             for j in 0..4 {
-                vt_hadamard(v, 32 + 8 * i + j, 39 + 8 * i - j, i & 1 == 1, r);
+                vt_hadamard::<I32>(v, 32 + 8 * i + j, 39 + 8 * i - j, i & 1 == 1, r);
             }
         }
     }
     if n >= 3 {
         for i in 0..4 {
-            vt_hadamard(v, i, 7 - i, false, r);
+            vt_hadamard::<I32>(v, i, 7 - i, false, r);
         }
     }
     if n >= 4 {
         for i in 0..2 {
-            vt_butterfly(v, 13 - i, 10 + i, 32, true);
+            vt_butterfly::<I32>(v, 13 - i, 10 + i, 32, true);
         }
     }
     if n >= 5 {
         for i in 0..2 {
             for j in 0..4 {
-                vt_hadamard(v, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, r);
+                vt_hadamard::<I32>(v, 16 + i * 8 + j, 23 + i * 8 - j, i == 1, r);
             }
         }
     }
     if n == 6 {
         for i in 0..8 {
-            vt_butterfly(v, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true);
+            vt_butterfly::<I32>(v, 59 - i, 36 + i, if i < 4 { 48 } else { 112 }, true);
         }
     }
     if n >= 4 {
         for i in 0..8 {
-            vt_hadamard(v, i, 15 - i, false, r);
+            vt_hadamard::<I32>(v, i, 15 - i, false, r);
         }
     }
     if n >= 5 {
         for i in 0..4 {
-            vt_butterfly(v, 27 - i, 20 + i, 32, true);
+            vt_butterfly::<I32>(v, 27 - i, 20 + i, 32, true);
         }
     }
     if n == 6 {
         for i in 0..8 {
-            vt_hadamard(v, 32 + i, 47 - i, false, r);
-            vt_hadamard(v, 48 + i, 63 - i, true, r);
+            vt_hadamard::<I32>(v, 32 + i, 47 - i, false, r);
+            vt_hadamard::<I32>(v, 48 + i, 63 - i, true, r);
         }
     }
     if n >= 5 {
         for i in 0..16 {
-            vt_hadamard(v, i, 31 - i, false, r);
+            vt_hadamard::<I32>(v, i, 31 - i, false, r);
         }
     }
     if n == 6 {
         for i in 0..8 {
-            vt_butterfly(v, 55 - i, 40 + i, 32, true);
+            vt_butterfly::<I32>(v, 55 - i, 40 + i, 32, true);
         }
     }
     if n == 6 {
         for i in 0..32 {
-            vt_hadamard(v, i, 63 - i, false, r);
+            vt_hadamard::<I32>(v, i, 63 - i, false, r);
         }
     }
     debug_assert_eq!(n0, 1usize << n);
@@ -2208,60 +2256,60 @@ unsafe fn vt_inverse_dct(v: &mut [__m256i], n: u32, r: u32) {
 
 
 #[target_feature(enable = "avx2")]
-unsafe fn vt_inverse_adst8(v: &mut [__m256i], r: u32) {
+unsafe fn vt_inverse_adst8<const I32: bool>(v: &mut [__m256i], r: u32) {
     vt_adst_input_permute(v, 3);
     for i in 0..4 {
-        vt_butterfly(v, 2 * i, 2 * i + 1, 60 - 16 * i as i32, true);
+        vt_butterfly::<I32>(v, 2 * i, 2 * i + 1, 60 - 16 * i as i32, true);
     }
     for i in 0..4 {
-        vt_hadamard(v, i, 4 + i, false, r);
+        vt_hadamard::<I32>(v, i, 4 + i, false, r);
     }
     for i in 0..2 {
-        vt_butterfly(v, 4 + 3 * i, 5 + i, 48 - 32 * i as i32, true);
+        vt_butterfly::<I32>(v, 4 + 3 * i, 5 + i, 48 - 32 * i as i32, true);
     }
     for j in 0..2 {
         for i in 0..2 {
-            vt_hadamard(v, 4 * j + i, 2 + 4 * j + i, false, r);
+            vt_hadamard::<I32>(v, 4 * j + i, 2 + 4 * j + i, false, r);
         }
     }
     for i in 0..2 {
-        vt_butterfly(v, 2 + 4 * i, 3 + 4 * i, 32, true);
+        vt_butterfly::<I32>(v, 2 + 4 * i, 3 + 4 * i, 32, true);
     }
-    vt_adst_output_permute(v, 3);
+    vt_adst_output_permute::<I32>(v, 3);
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn vt_inverse_adst16(v: &mut [__m256i], r: u32) {
+unsafe fn vt_inverse_adst16<const I32: bool>(v: &mut [__m256i], r: u32) {
     vt_adst_input_permute(v, 4);
     for i in 0..8 {
-        vt_butterfly(v, 2 * i, 2 * i + 1, 62 - 8 * i as i32, true);
+        vt_butterfly::<I32>(v, 2 * i, 2 * i + 1, 62 - 8 * i as i32, true);
     }
     for i in 0..8 {
-        vt_hadamard(v, i, 8 + i, false, r);
+        vt_hadamard::<I32>(v, i, 8 + i, false, r);
     }
     for i in 0..2 {
-        vt_butterfly(v, 8 + 2 * i, 9 + 2 * i, 56 - 32 * i as i32, true);
-        vt_butterfly(v, 13 + 2 * i, 12 + 2 * i, 8 + 32 * i as i32, true);
+        vt_butterfly::<I32>(v, 8 + 2 * i, 9 + 2 * i, 56 - 32 * i as i32, true);
+        vt_butterfly::<I32>(v, 13 + 2 * i, 12 + 2 * i, 8 + 32 * i as i32, true);
     }
     for j in 0..2 {
         for i in 0..4 {
-            vt_hadamard(v, 8 * j + i, 4 + 8 * j + i, false, r);
+            vt_hadamard::<I32>(v, 8 * j + i, 4 + 8 * j + i, false, r);
         }
     }
     for j in 0..2 {
         for i in 0..2 {
-            vt_butterfly(v, 4 + 8 * j + 3 * i, 5 + 8 * j + i, 48 - 32 * i as i32, true);
+            vt_butterfly::<I32>(v, 4 + 8 * j + 3 * i, 5 + 8 * j + i, 48 - 32 * i as i32, true);
         }
     }
     for j in 0..4 {
         for i in 0..2 {
-            vt_hadamard(v, 4 * j + i, 2 + 4 * j + i, false, r);
+            vt_hadamard::<I32>(v, 4 * j + i, 2 + 4 * j + i, false, r);
         }
     }
     for i in 0..4 {
-        vt_butterfly(v, 2 + 4 * i, 3 + 4 * i, 32, true);
+        vt_butterfly::<I32>(v, 2 + 4 * i, 3 + 4 * i, 32, true);
     }
-    vt_adst_output_permute(v, 4);
+    vt_adst_output_permute::<I32>(v, 4);
 }
 
 #[target_feature(enable = "avx2")]
@@ -2278,7 +2326,7 @@ unsafe fn vt_adst_input_permute(v: &mut [__m256i], n: u32) {
 }
 
 #[target_feature(enable = "avx2")]
-unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
+unsafe fn vt_adst_output_permute<const I32: bool>(v: &mut [__m256i], n: u32) {
     let n0 = 1usize << n;
     let mut copy: [MaybeUninit<__m256i>; 64] = [const { MaybeUninit::uninit() }; 64];
     for (i, slot) in copy[..n0].iter_mut().enumerate() {
@@ -2290,18 +2338,18 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
         let c = ((i >> 1) & 1) ^ ((i >> 2) & 1);
         let d = (i & 1) ^ ((i >> 1) & 1);
         let idx = ((d << 3) | (c << 2) | (b << 1) | a) >> (4 - n);
-        *slot = if i & 1 == 1 { vt_neg(copy[idx].assume_init()) } else { copy[idx].assume_init() };
+        *slot = if i & 1 == 1 { vt_neg::<I32>(copy[idx].assume_init()) } else { copy[idx].assume_init() };
     }
 }
 
 
     /// `Inverse ADST process`（§7.13.2.9）的通道版。
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_inverse_adst(v: &mut [__m256i], n: u32, r: u32) {
+    unsafe fn vt_inverse_adst<const I32: bool>(v: &mut [__m256i], n: u32, r: u32) {
         match n {
-            2 => vt_inverse_adst4(v, r),
-            3 => vt_inverse_adst8(v, r),
-            4 => vt_inverse_adst16(v, r),
+            2 => vt_inverse_adst4::<I32>(v, r),
+            3 => vt_inverse_adst8::<I32>(v, r),
+            4 => vt_inverse_adst16::<I32>(v, r),
             _ => unreachable!("ADST 只定义到 2^n = 16；调用前已按 tx_sz 校验"),
         }
     }
@@ -2309,27 +2357,27 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
     /// `Inverse Walsh-Hadamard transform process`（§7.13.2.10）的通道版。
     /// `shift ∈ {0, 2}`（行端 2、列端 0），都按**算术**右移。
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_inverse_wht(v: &mut [__m256i], shift: u32) {
+    unsafe fn vt_inverse_wht<const I32: bool>(v: &mut [__m256i], shift: u32) {
         #[inline]
         #[target_feature(enable = "avx2")]
-        unsafe fn shr(v: __m256i, shift: u32) -> __m256i {
+        unsafe fn shr<const I32: bool>(v: __m256i, shift: u32) -> __m256i {
             if shift == 0 {
                 v
             } else {
-                vt_srai(v, shift)
+                vt_srai::<I32>(v, shift)
             }
         }
-        let mut a = shr(v[0], shift);
-        let c = shr(v[1], shift);
-        let mut d = shr(v[2], shift);
-        let mut b = shr(v[3], shift);
-        a = vt_add(a, c);
-        d = vt_sub(d, b);
-        let e = shr(vt_sub(a, d), 1);
-        b = vt_sub(e, b);
-        let c = vt_sub(e, c);
-        a = vt_sub(a, b);
-        d = vt_add(d, c);
+        let mut a = shr::<I32>(v[0], shift);
+        let c = shr::<I32>(v[1], shift);
+        let mut d = shr::<I32>(v[2], shift);
+        let mut b = shr::<I32>(v[3], shift);
+        a = vt_add::<I32>(a, c);
+        d = vt_sub::<I32>(d, b);
+        let e = shr::<I32>(vt_sub::<I32>(a, d), 1);
+        b = vt_sub::<I32>(e, b);
+        let c = vt_sub::<I32>(e, c);
+        a = vt_sub::<I32>(a, b);
+        d = vt_add::<I32>(d, c);
         v[0] = a;
         v[1] = b;
         v[2] = c;
@@ -2338,26 +2386,26 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
 
     /// `Inverse identity transform process`（§7.13.2.11–14）的通道版。
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_inverse_identity(v: &mut [__m256i], n: u32) {
+    unsafe fn vt_inverse_identity<const I32: bool>(v: &mut [__m256i], n: u32) {
         match n {
             2 => {
                 for slot in v[..4].iter_mut() {
-                    *slot = vt_round2_c::<12, 52>(vt_mul(*slot, 5793));
+                    *slot = vt_round2_c::<I32, 12, 52>(vt_mul::<I32>(*slot, 5793));
                 }
             }
             3 => {
                 for slot in v[..8].iter_mut() {
-                    *slot = vt_add(*slot, *slot);
+                    *slot = vt_add::<I32>(*slot, *slot);
                 }
             }
             4 => {
                 for slot in v[..16].iter_mut() {
-                    *slot = vt_round2_c::<12, 52>(vt_mul(*slot, 11586));
+                    *slot = vt_round2_c::<I32, 12, 52>(vt_mul::<I32>(*slot, 11586));
                 }
             }
             5 => {
                 for slot in v[..32].iter_mut() {
-                    *slot = _mm256_slli_epi64::<2>(*slot);
+                    *slot = if I32 { _mm256_slli_epi32::<2>(*slot) } else { _mm256_slli_epi64::<2>(*slot) };
                 }
             }
             _ => unreachable!("IDTX 只定义到 2^n = 32；调用前已按 tx_sz 校验"),
@@ -2366,11 +2414,11 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
 
     /// 1D 变换的通道版入口（与标量的 `forward_1d` 同一张分派表）。
     #[target_feature(enable = "avx2")]
-    unsafe fn vt_forward_1d(kind: u32, v: &mut [__m256i], n: u32, r: u32) {
+    unsafe fn vt_forward_1d<const I32: bool>(kind: u32, v: &mut [__m256i], n: u32, r: u32) {
         match kind {
-            TXF_DCT => vt_inverse_dct(v, n, r),
-            TXF_ADST => vt_inverse_adst(v, n, r),
-            _ => vt_inverse_identity(v, n),
+            TXF_DCT => vt_inverse_dct::<I32>(v, n, r),
+            TXF_ADST => vt_inverse_adst::<I32>(v, n, r),
+            _ => vt_inverse_identity::<I32>(v, n),
         }
     }
 
@@ -2387,6 +2435,41 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
             _mm256_permute2x128_si256(t1, t3, 0x20),
             _mm256_permute2x128_si256(t0, t2, 0x31),
             _mm256_permute2x128_si256(t1, t3, 0x31),
+        ]
+    }
+
+    /// 8×8 i32 转置（转置是自逆的，收集与写回共用这一份）。
+    ///
+    /// 输入 `v[k]` = 第 k 行的 8 个 i32；输出 `o[j]` = 第 j 列（lane k = 第 k 行）。
+    /// 标准的三级 `unpack` + `permute2x128` 网络，共 24 条指令。
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn vt_transpose8(v: [__m256i; 8]) -> [__m256i; 8] {
+        let t0 = _mm256_unpacklo_epi32(v[0], v[1]);
+        let t1 = _mm256_unpackhi_epi32(v[0], v[1]);
+        let t2 = _mm256_unpacklo_epi32(v[2], v[3]);
+        let t3 = _mm256_unpackhi_epi32(v[2], v[3]);
+        let t4 = _mm256_unpacklo_epi32(v[4], v[5]);
+        let t5 = _mm256_unpackhi_epi32(v[4], v[5]);
+        let t6 = _mm256_unpacklo_epi32(v[6], v[7]);
+        let t7 = _mm256_unpackhi_epi32(v[6], v[7]);
+        let u0 = _mm256_unpacklo_epi64(t0, t2);
+        let u1 = _mm256_unpackhi_epi64(t0, t2);
+        let u2 = _mm256_unpacklo_epi64(t1, t3);
+        let u3 = _mm256_unpackhi_epi64(t1, t3);
+        let u4 = _mm256_unpacklo_epi64(t4, t6);
+        let u5 = _mm256_unpackhi_epi64(t4, t6);
+        let u6 = _mm256_unpacklo_epi64(t5, t7);
+        let u7 = _mm256_unpackhi_epi64(t5, t7);
+        [
+            _mm256_permute2x128_si256(u0, u4, 0x20),
+            _mm256_permute2x128_si256(u1, u5, 0x20),
+            _mm256_permute2x128_si256(u2, u6, 0x20),
+            _mm256_permute2x128_si256(u3, u7, 0x20),
+            _mm256_permute2x128_si256(u0, u4, 0x31),
+            _mm256_permute2x128_si256(u1, u5, 0x31),
+            _mm256_permute2x128_si256(u2, u6, 0x31),
+            _mm256_permute2x128_si256(u3, u7, 0x31),
         ]
     }
 
@@ -2655,13 +2738,13 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
             // 1:2 长方块的预缩放（§7.13.3：`Round2( *2896, 12 )`）
             if rect_prescale {
                 for slot in v[..w].iter_mut() {
-                    *slot = vt_round2_c::<12, 52>(vt_mul(*slot, 2896));
+                    *slot = vt_round2_c::<false, 12, 52>(vt_mul::<false>(*slot, 2896));
                 }
             }
             if lossless {
-                vt_inverse_wht(&mut v[..4], 2);
+                vt_inverse_wht::<false>(&mut v[..4], 2);
             } else {
-                vt_forward_1d(kind, &mut v[..w], log2_w, r);
+                vt_forward_1d::<false>(kind, &mut v[..w], log2_w, r);
             }
             // 写回：4 列一组做 4×4 i64 转置 → 每行的 4 个元素连续落盘
             let mut j = 0usize;
@@ -2671,9 +2754,9 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
                     // `row_shift ∈ {0, 1, 2}`（`TRANSFORM_ROW_SHIFT`）⇒ 全都能常量展开
                     let o = match row_shift {
                         0 => *row,
-                        1 => vt_round2_c::<1, 63>(*row),
-                        2 => vt_round2_c::<2, 62>(*row),
-                        other => vt_round2(*row, other),
+                        1 => vt_round2_c::<false, 1, 63>(*row),
+                        2 => vt_round2_c::<false, 2, 62>(*row),
+                        other => vt_round2::<false>(*row, other),
                     };
                     _mm256_storeu_si256(
                         data.as_mut_ptr().add((i + k) * w + j) as *mut __m256i,
@@ -2711,20 +2794,146 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
                 *slot = _mm256_loadu_si256(data.as_ptr().add(i * w + j) as *const __m256i);
             }
             if lossless {
-                vt_inverse_wht(&mut v[..4], 0);
+                vt_inverse_wht::<false>(&mut v[..4], 0);
             } else {
-                vt_forward_1d(kind, &mut v[..h], log2_h, r);
+                vt_forward_1d::<false>(kind, &mut v[..h], log2_h, r);
             }
             for (i, slot) in v[..h].iter().enumerate() {
                 // `col_shift ∈ {0, 4}`（`transform.rs`：无损 0、其余 4）⇒ 常量展开
                 let o = match col_shift {
                     0 => *slot,
-                    4 => vt_round2_c::<4, 60>(*slot),
-                    other => vt_round2(*slot, other),
+                    4 => vt_round2_c::<false, 4, 60>(*slot),
+                    other => vt_round2::<false>(*slot, other),
                 };
                 _mm256_storeu_si256(data.as_mut_ptr().add(i * w + j) as *mut __m256i, o);
             }
             j += 4;
+        }
+        j
+    }
+
+    /// 反变换的**行趟（8bit/10bit）**：8 行一组、8 个 i32 通道。
+    ///
+    /// 与 4 路 i64 版**逐位相同**（值域见 `transform.rs` 抬头：8bit ≤ 2^28、
+    /// 10bit ≤ 2^30）。只接 `w`、`h` 都是 8 的倍数的形状；4 宽/4 高的块仍走 i64 版。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn inv_txfm_rows_i32(
+        t: &[i32],
+        data: &mut [i32],
+        w: usize,
+        h: usize,
+        kind: u32,
+        log2_w: u32,
+        r: u32,
+        row_shift: u32,
+        rect_prescale: bool,
+        lossless: bool,
+    ) -> usize {
+        if !w.is_multiple_of(8) || !h.is_multiple_of(8) || w > 64 || h > 64 {
+            return 0;
+        }
+        let mut v = [_mm256_setzero_si256(); 64];
+        let mut i = 0usize;
+        while i + 8 <= h {
+            // 收集：8 行 × 8 列 → 转置成"通道 = 行"
+            let mut j = 0usize;
+            while j + 8 <= w {
+                if j >= 32 {
+                    v[j..j + 8].fill(_mm256_setzero_si256());
+                } else {
+                    let mut rows = [_mm256_setzero_si256(); 8];
+                    for (k, row) in rows.iter_mut().enumerate() {
+                        if i + k < 32 {
+                            *row = _mm256_loadu_si256(
+                                t.as_ptr().add((i + k) * w + j) as *const __m256i
+                            );
+                        }
+                    }
+                    let cols = vt_transpose8(rows);
+                    v[j..j + 8].copy_from_slice(&cols);
+                }
+                j += 8;
+            }
+            if rect_prescale {
+                for slot in v[..w].iter_mut() {
+                    *slot = vt_round2_c::<true, 12, 52>(vt_mul::<true>(*slot, 2896));
+                }
+            }
+            if lossless {
+                vt_inverse_wht::<true>(&mut v[..4], 2);
+            } else {
+                vt_forward_1d::<true>(kind, &mut v[..w], log2_w, r);
+            }
+            // 写回：转置回来 → 每行的 8 个元素连续落盘
+            let mut j = 0usize;
+            while j + 8 <= w {
+                let rows = vt_transpose8([
+                    v[j],
+                    v[j + 1],
+                    v[j + 2],
+                    v[j + 3],
+                    v[j + 4],
+                    v[j + 5],
+                    v[j + 6],
+                    v[j + 7],
+                ]);
+                for (k, row) in rows.iter().enumerate() {
+                    let o = match row_shift {
+                        0 => *row,
+                        1 => vt_round2_c::<true, 1, 63>(*row),
+                        2 => vt_round2_c::<true, 2, 62>(*row),
+                        other => vt_round2::<true>(*row, other),
+                    };
+                    _mm256_storeu_si256(
+                        data.as_mut_ptr().add((i + k) * w + j) as *mut __m256i,
+                        o,
+                    );
+                }
+                j += 8;
+            }
+            i += 8;
+        }
+        i
+    }
+
+    /// 反变换的**列趟（8bit/10bit）**：8 列一组（同一行的 8 个 i32 连续）。
+    /// 返回处理掉的**列数**（8 的倍数；0 = 全走标量）。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn inv_txfm_cols_i32(
+        data: &mut [i32],
+        w: usize,
+        h: usize,
+        kind: u32,
+        log2_h: u32,
+        r: u32,
+        col_shift: u32,
+        lossless: bool,
+    ) -> usize {
+        if !w.is_multiple_of(8) || !h.is_multiple_of(8) || w > 64 || h > 64 {
+            return 0;
+        }
+        let mut v = [_mm256_setzero_si256(); 64];
+        let mut j = 0usize;
+        while j + 8 <= w {
+            for (i, slot) in v[..h].iter_mut().enumerate() {
+                *slot = _mm256_loadu_si256(data.as_ptr().add(i * w + j) as *const __m256i);
+            }
+            if lossless {
+                vt_inverse_wht::<true>(&mut v[..4], 0);
+            } else {
+                vt_forward_1d::<true>(kind, &mut v[..h], log2_h, r);
+            }
+            for (i, slot) in v[..h].iter().enumerate() {
+                let o = match col_shift {
+                    0 => *slot,
+                    4 => vt_round2_c::<true, 4, 60>(*slot),
+                    other => vt_round2::<true>(*slot, other),
+                };
+                _mm256_storeu_si256(data.as_mut_ptr().add(i * w + j) as *mut __m256i, o);
+            }
+            j += 8;
         }
         j
     }
@@ -2831,7 +3040,8 @@ unsafe fn vt_adst_output_permute(v: &mut [__m256i], n: u32) {
 #[allow(unused_imports)]
 pub(crate) use x86::{
     diffwtd_mask8,
-    cdef_pair16, cdef_quad8, deblock_edge4, inv_txfm_cols, inv_txfm_rows,
+    cdef_pair16, cdef_quad8, deblock_edge4, inv_txfm_cols, inv_txfm_cols_i32, inv_txfm_rows,
+    inv_txfm_rows_i32,
     blend_avg8, blend_dist8, blend_masked8, blend_masked_u16in8, mc_delta8, mc_horiz8,
     mc_horiz16_8bpc, mc_horiz16_u8, mc_horiz_rows_8bpc, mc_shift8, mc_shift_row,
     mc_shift_rows, mc_vert8,
@@ -3072,6 +3282,40 @@ pub(crate) unsafe fn blend_dist8(
 #[allow(clippy::too_many_arguments)]
 pub(crate) unsafe fn inv_txfm_cols(
     _data: &mut [i64],
+    _w: usize,
+    _h: usize,
+    _kind: u32,
+    _log2_h: u32,
+    _r: u32,
+    _col_shift: u32,
+    _lossless: bool,
+) -> usize {
+    0
+}
+
+/// 非 x86_64：见 [`inv_txfm_rows_i32`]（`avx2_available()` 恒假 ⇒ 永不执行）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn inv_txfm_rows_i32(
+    _t: &[i32],
+    _data: &mut [i32],
+    _w: usize,
+    _h: usize,
+    _kind: u32,
+    _log2_w: u32,
+    _r: u32,
+    _row_shift: u32,
+    _rect_prescale: bool,
+    _lossless: bool,
+) -> usize {
+    0
+}
+
+/// 非 x86_64：见 [`inv_txfm_cols_i32`]（`avx2_available()` 恒假 ⇒ 永不执行）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn inv_txfm_cols_i32(
+    _data: &mut [i32],
     _w: usize,
     _h: usize,
     _kind: u32,
