@@ -242,20 +242,11 @@ pub struct Plane {
 
 impl Plane {
     pub fn new(w: usize, h: usize, bit_depth: u8) -> Self {
-        Self::new_impl(w, h, bit_depth, false)
-    }
-
-    /// 强制 u16 存储（`ME_PLANE_U8` 的桥接/诊断路径用）。
-    pub fn new_u16(w: usize, h: usize, bit_depth: u8) -> Self {
-        Self::new_impl(w, h, bit_depth, true)
-    }
-
-    fn new_impl(w: usize, h: usize, bit_depth: u8, force_u16: bool) -> Self {
         let mid = 1u16 << (bit_depth - 1);
         let stride = w + PLANE_PAD;
         let rows = h + PLANE_PAD;
         let n = stride * rows;
-        if bit_depth <= 8 && flags::plane_u8() && !force_u16 {
+        if bit_depth <= 8 && flags::plane_u8() {
             // 8bit：u8 缓冲（池按 (宽度, 长度) 复用，见 `pool`）。
             let mut data = match super::pool::take_u8(n) {
                 Some(v) => v,
@@ -1171,30 +1162,6 @@ impl CurrFrame {
         num_planes: usize,
         bit_depth: u8,
     ) -> Self {
-        Self::new_impl(width, height, sub_x, sub_y, num_planes, bit_depth, false)
-    }
-
-    /// 强制 u16 平面（`ME_PLANE_U8` 的 LR 桥接用）。
-    pub fn new_u16(
-        width: usize,
-        height: usize,
-        sub_x: bool,
-        sub_y: bool,
-        num_planes: usize,
-        bit_depth: u8,
-    ) -> Self {
-        Self::new_impl(width, height, sub_x, sub_y, num_planes, bit_depth, true)
-    }
-
-    fn new_impl(
-        width: usize,
-        height: usize,
-        sub_x: bool,
-        sub_y: bool,
-        num_planes: usize,
-        bit_depth: u8,
-        force_u16: bool,
-    ) -> Self {
         let mut planes = Vec::with_capacity(num_planes);
         let mut decoded = Vec::with_capacity(num_planes);
         let mut decoded_cols = Vec::with_capacity(num_planes);
@@ -1207,7 +1174,7 @@ impl CurrFrame {
                     (height + usize::from(sub_y)) >> u32::from(sub_y),
                 )
             };
-            planes.push(if force_u16 { Plane::new_u16(pw, ph, bit_depth) } else { Plane::new(pw, ph, bit_depth) });
+            planes.push(Plane::new(pw, ph, bit_depth));
             let cols = pw.div_ceil(4);
             decoded_cols.push(cols);
             decoded.push(vec![0u8; cols * ph.div_ceil(4)]);
@@ -1220,55 +1187,6 @@ impl CurrFrame {
             sub_y,
             num_planes,
         }
-    }
-
-    /// 整帧扩宽成 u16 的副本（`ME_PLANE_U8` 的桥接/参考帧存储用）。
-    /// 连 padding 一起复制，逐样本等价。
-    pub fn to_u16_copy(&self) -> CurrFrame {
-        let mut out = CurrFrame::new_u16(
-            self.planes[0].w,
-            self.planes[0].h,
-            self.sub_x,
-            self.sub_y,
-            self.num_planes,
-            self.planes[0].bit_depth,
-        );
-        for p in 0..self.num_planes {
-            let s = &self.planes[p];
-            let d = &mut out.planes[p];
-            if s.is_u8() {
-                for (dv, sv) in d.px16_mut().iter_mut().zip(s.px8().iter()) {
-                    *dv = u16::from(*sv);
-                }
-            } else {
-                d.px16_mut().copy_from_slice(s.px16());
-            }
-        }
-        out
-    }
-
-    /// 整帧收窄成 u8 的副本（仅在 `ME_PLANE_U8` 打开时得到 u8 平面）。
-    pub fn to_u8_copy(&self) -> CurrFrame {
-        let mut out = CurrFrame::new(
-            self.planes[0].w,
-            self.planes[0].h,
-            self.sub_x,
-            self.sub_y,
-            self.num_planes,
-            self.planes[0].bit_depth,
-        );
-        for p in 0..self.num_planes {
-            let s = &self.planes[p];
-            let d = &mut out.planes[p];
-            if d.is_u8() {
-                for (dv, sv) in d.px8_mut().iter_mut().zip(s.px16().iter()) {
-                    *dv = *sv as u8;
-                }
-            } else {
-                d.px16_mut().copy_from_slice(s.px16());
-            }
-        }
-        out
     }
 
     #[inline]

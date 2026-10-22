@@ -39,19 +39,12 @@ pub(crate) fn worker_count() -> usize {
     })
 }
 
-/// 输出平面的样本宽度（8bit 走 `ME_PLANE_U8` 时是 u8）。
-#[derive(Clone, Copy)]
-enum SinkPtr {
-    U8(*mut u8),
-    U16(*mut u16),
-}
-
 /// **只写自己那段行**的输出缓冲句柄。
 ///
 /// 由调用方保证：不同 worker 的 `[y0, y1)` 不重叠，且所有写入的 `y` 落在
 /// `[y0, y1)` 之内，写出的 `x` 落在 `[0, w)` 之内。
 pub(crate) struct RowsSink {
-    ptr: SinkPtr,
+    ptr: *mut u16,
     stride: usize,
     cap_rows: usize,
     y0: usize,
@@ -86,31 +79,7 @@ impl RowsSink {
         let cap_rows = len / stride.max(1);
         debug_assert!(y1 <= cap_rows && y0 <= y1, "RowsSink 的行区间不合法");
         Self {
-            ptr: SinkPtr::U16(base),
-            stride,
-            cap_rows,
-            y0,
-            y1,
-            bit_depth,
-        }
-    }
-
-    /// [`Self::from_base`] 的 u8 平面版（`ME_PLANE_U8`）。
-    ///
-    /// # Safety
-    /// 同 [`Self::from_base`]，只是缓冲元素是 u8。
-    pub(crate) unsafe fn from_base_u8(
-        base: *mut u8,
-        len: usize,
-        stride: usize,
-        y0: usize,
-        y1: usize,
-        bit_depth: u8,
-    ) -> Self {
-        let cap_rows = len / stride.max(1);
-        debug_assert!(y1 <= cap_rows && y0 <= y1, "RowsSink 的行区间不合法");
-        Self {
-            ptr: SinkPtr::U8(base),
+            ptr: base,
             stride,
             cap_rows,
             y0,
@@ -127,11 +96,7 @@ impl RowsSink {
         let max = (1i32 << self.bit_depth) - 1;
         // SAFETY: 见 `from_base` 的不变量。
         unsafe {
-            let i = y * self.stride + x;
-            match self.ptr {
-                SinkPtr::U8(p) => *p.add(i) = v.clamp(0, max) as u8,
-                SinkPtr::U16(p) => *p.add(i) = v.clamp(0, max) as u16,
-            }
+            *self.ptr.add(y * self.stride + x) = v.clamp(0, max) as u16;
         }
     }
 
@@ -146,20 +111,9 @@ impl RowsSink {
         let max = (1i32 << self.bit_depth) - 1;
         // SAFETY: 见 `from_base` 的不变量。
         unsafe {
-            let i0 = y * self.stride + x;
-            match self.ptr {
-                SinkPtr::U8(p) => {
-                    let base = p.add(i0);
-                    for (i, v) in vals.iter().enumerate() {
-                        *base.add(i) = (*v).clamp(0, max) as u8;
-                    }
-                }
-                SinkPtr::U16(p) => {
-                    let base = p.add(i0);
-                    for (i, v) in vals.iter().enumerate() {
-                        *base.add(i) = (*v).clamp(0, max) as u16;
-                    }
-                }
+            let base = self.ptr.add(y * self.stride + x);
+            for (i, v) in vals.iter().enumerate() {
+                *base.add(i) = (*v).clamp(0, max) as u16;
             }
         }
     }
@@ -174,41 +128,7 @@ impl RowsSink {
     /// （debug 构建下 `direct` 的使用点会断言）。
     #[inline]
     pub(crate) fn direct(&self) -> (*mut u16, isize, usize, usize) {
-        match self.ptr {
-            SinkPtr::U16(p) => (p, self.stride as isize, self.y0, self.y1),
-            SinkPtr::U8(_) => panic!("direct() 只能用于 u16 平面；u8 请用 direct_u8()"),
-        }
-    }
-
-    /// [`Self::direct`] 的 u8 平面版。
-    #[inline]
-    pub(crate) fn direct_u8(&self) -> (*mut u8, isize, usize, usize) {
-        match self.ptr {
-            SinkPtr::U8(p) => (p, self.stride as isize, self.y0, self.y1),
-            SinkPtr::U16(_) => panic!("direct_u8() 只能用于 u8 平面"),
-        }
-    }
-
-    /// 同 [`Self::set_row`]，但样本是 **u16**（CDEF 的 u8 快路径输出）。
-    #[inline]
-    pub(crate) fn set_row_u16(&self, x: usize, y: usize, vals: &[u16]) {
-        debug_assert!(y >= self.y0 && y < self.y1, "RowsSink 写到别人那段行了");
-        debug_assert!(y < self.cap_rows && x + vals.len() <= self.stride, "RowsSink 写出行容量外了");
-        let i0 = y * self.stride + x;
-        // SAFETY: 见 `from_base` 的不变量。
-        unsafe {
-            match self.ptr {
-                SinkPtr::U8(p) => {
-                    let base = p.add(i0);
-                    for (i, v) in vals.iter().enumerate() {
-                        *base.add(i) = *v as u8;
-                    }
-                }
-                SinkPtr::U16(p) => {
-                    std::ptr::copy_nonoverlapping(vals.as_ptr(), p.add(i0), vals.len());
-                }
-            }
-        }
+        (self.ptr, self.stride as isize, self.y0, self.y1)
     }
 
     /// 同 [`Self::set_row`]，但样本是 **i16**（[`super::simd::cdef_pair16`] 的 16 通道
@@ -228,19 +148,8 @@ impl RowsSink {
         // SAFETY: 见 `from_base` 的不变量；`i16` 与 `u16` 是同一块内存的两种读法
         //（值是 0..2^bd，最高位恒为 0）。
         unsafe {
-            let i0 = y * self.stride + x;
-            match self.ptr {
-                SinkPtr::U16(p) => {
-                    let base = p.add(i0) as *mut i16;
-                    std::ptr::copy_nonoverlapping(vals.as_ptr(), base, vals.len());
-                }
-                SinkPtr::U8(p) => {
-                    let base = p.add(i0);
-                    for (i, v) in vals.iter().enumerate() {
-                        *base.add(i) = *v as u8;
-                    }
-                }
-            }
+            let base = self.ptr.add(y * self.stride + x) as *mut i16;
+            std::ptr::copy_nonoverlapping(vals.as_ptr(), base, vals.len());
         }
     }
 }
@@ -261,29 +170,14 @@ pub(crate) fn split_frame_rows(
         let stride = plane.stride;
         let cap_rows = plane.sample_count() / stride; // 含底部的 border padding
         let bd = plane.bit_depth;
+        let base = plane.px16_mut().as_mut_ptr();
         let len = plane.sample_count();
         let mut cursor = 0usize;
         for (k, r) in ranges.iter().enumerate() {
             let end = r[p].min(cap_rows).max(cursor);
             // SAFETY: 各 worker 的行区间由 `cursor` 接力得到，两两不重叠；
             // `base`/`len` 是**整块**平面缓冲（`set` 用绝对行号，必须给基址）。
-            let sink = if plane.is_u8() {
-                unsafe {
-                    RowsSink::from_base_u8(
-                        plane.px8_mut().as_mut_ptr(),
-                        len,
-                        stride,
-                        cursor,
-                        end,
-                        bd,
-                    )
-                }
-            } else {
-                unsafe {
-                    RowsSink::from_base(plane.px16_mut().as_mut_ptr(), len, stride, cursor, end, bd)
-                }
-            };
-            out[k].push(sink);
+            out[k].push(unsafe { RowsSink::from_base(base, len, stride, cursor, end, bd) });
             cursor = end;
         }
     }

@@ -671,17 +671,6 @@ pub(crate) fn lr_dump(frame: &CurrFrame, dir: &str, tag: &str, n: u64) {
 /// 需要真的滤波时（`uses_lr == true`）仍然要开第三份 `out`：环路恢复的输出
 /// 既不回灌 `CdefFrame` 也不回灌 `CurrFrame`（规范 §7.17 就是这么定的），
 /// 两份源都必须**同时**可读。这时 `up_curr`/`up_cdef` 退化成只读借用。
-/// `ME_PLANE_U8` 的临时桥：LR 内核目前只认 u16 平面，先把 u8 帧整体扩宽，
-/// 跑完再收窄回 u8。逐字节等价；等 LR 内核迁移完再删掉这两段拷贝。
-fn to_u16_frame(src: &CurrFrame) -> CurrFrame {
-    src.to_u16_copy()
-}
-
-/// 见 [`to_u16_frame`]：把 LR 的 u16 输出收回 u8 帧。
-fn to_u8_frame(src: &CurrFrame) -> CurrFrame {
-    src.to_u8_copy()
-}
-
 pub fn apply(
     up_curr: CurrFrame,
     up_cdef: Option<CurrFrame>,
@@ -689,28 +678,6 @@ pub fn apply(
     seq: &SequenceHeader,
     lr: &LrState,
 ) -> Result<CurrFrame> {
-    // 不做 LR 时输出就是 CdefFrame 本身：**必须**在 u8 桥接之前返回，
-    // 否则会白做 u8→u16→u8 两趟整帧转换。
-    if !fh.params.lr.uses_lr || flags::no_lr() {
-        let out = up_cdef.unwrap_or(up_curr);
-        if !out.planes[0].is_u8() {
-            if let Some(d) = &flags::lr_dump_dir() {
-                let n = super::block::TRACE_FRAME_NO.load(std::sync::atomic::Ordering::Relaxed);
-                lr_dump(&out, d, "prelr", n);
-                lr_dump(&out, d, "postlr", n);
-            }
-        }
-        return Ok(out);
-    }
-
-    // `ME_PLANE_U8`：LR 内核还没迁 u8，先用 u16 桥跑完再收窄。
-    if up_curr.planes[0].is_u8() {
-        let curr16 = to_u16_frame(&up_curr);
-        let cdef16 = up_cdef.as_ref().map(to_u16_frame);
-        let out16 = apply(curr16, cdef16, fh, seq, lr)?;
-        return Ok(to_u8_frame(&out16));
-    }
-
     // 诊断（`AV1_TRACE_LR`）：一行回答"这一帧到底用了什么" —— 排查真实素材时最省时间的一条。
     if trace_lr() {
         eprintln!(
@@ -732,6 +699,16 @@ pub fn apply(
     if let Some(d) = &dump_dir {
         lr_dump(up_cdef.as_ref().unwrap_or(&up_curr), d, "prelr", dump_n);
     }
+    if !fh.params.lr.uses_lr || flags::no_lr() {
+        // 这一档的输出**就是** `CdefFrame` 本身 —— 直接移动，不再 `clone()`。
+        // 上一层没做 CDEF 时（`None`）它就是 `CurrFrame`，连"两个缓冲"都不用 ——
+        // `up_curr` 直接当输出，零拷贝、零分配。
+        let out = up_cdef.unwrap_or(up_curr);
+        if let Some(d) = &dump_dir {
+            lr_dump(&out, d, "postlr", dump_n);
+        }
+        return Ok(out);
+    }
     // 需要真滤波：两份源都得可读 ⇒ 从所有权降级成借用（`out` 是第三份）。
     // 没做 CDEF 时 `CdefFrame ≡ CurrFrame`，直接借用同一份（规范语义允许）。
     let up_curr = &up_curr;
@@ -743,7 +720,7 @@ pub fn apply(
     // 缺页 + 内核清零便宜得多。
     // ⚠️ 前提是"覆盖满"：x/y 两个循环按 `MI_SIZE` 走满整帧，`w`/`h` 已按平面
     //    边界裁剪，三档（wiener / sgr / none）都写。改这段循环时务必保持这条。
-    let mut out = CurrFrame::new_u16(
+    let mut out = CurrFrame::new(
         up_cdef.planes[0].w,
         up_cdef.planes[0].h,
         up_cdef.sub_x,

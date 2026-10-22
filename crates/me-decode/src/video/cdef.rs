@@ -503,10 +503,7 @@ fn cdef_filter(
     let sec_taps = &CDEF_SEC_TAPS[tap_sel];
 
     let plane_ref = &curr.planes[plane as usize];
-    // u8 平面（`ME_PLANE_U8`）暂时走标量：CDEF 的 SIMD 内核只吃 u16 源/目标。
-    // 迁移内核之前先把正确性跑通；`data` 在 u8 路径上不会被访问。
-    let is_u8 = plane_ref.is_u8();
-    let data: &[u16] = if is_u8 { &[] } else { plane_ref.px16() };
+    let data = plane_ref.px16();
     let stride = plane_ref.stride;
     let sink = &sinks[plane as usize];
 
@@ -525,9 +522,8 @@ fn cdef_filter(
     // 有 72 样本的 padding，越界候选的读取是**可寻址**的；它们只会污染最右/最下
     // 1~2 行/列的**输出**，这些像素随后用标量重算（越界候选不参与）。
     // 左/上边界仍走标量：平面没有负向 padding。
-    let cap_rows = (plane_ref.sample_count() / stride.max(1)) as i32;
-    let simd = !is_u8
-        && super::simd::avx2_available()
+    let cap_rows = (data.len() / stride) as i32;
+    let simd = super::simd::avx2_available()
         && (interior || !super::flags::no_cdef_edge())
         && x0 >= 2
         && y0 >= 2
@@ -546,11 +542,7 @@ fn cdef_filter(
             let y = y0 as usize + i;
             for j in xl..xh {
                 let x = x0 as usize + j;
-                let cur = if is_u8 {
-                    i32::from(plane_ref.get(x, y))
-                } else {
-                    i32::from(data[y * stride + x])
-                };
+                let cur = i32::from(data[y * stride + x]);
                 let mut max = cur;
                 let mut min = cur;
                 let mut sum = 0i32;
@@ -600,108 +592,6 @@ fn cdef_filter(
             }
         }
     };
-
-    // u8 内点块：把 (w+2)×(h+2) 的窗口扩宽到 u16 临时缓冲，跑现有 SIMD 内核，
-    // 再把输出收窄写回 u8 平面。边缘块仍走标量（越界候选要排除，见 `interior`）。
-    // 这一步把 u8 的 CDEF 从"每像素 20 个候选的标量"换成整块向量化。
-    if is_u8 && interior && super::simd::avx2_available() && w == 8 {
-        // 亮度 8×8：原生 u8 内核直接读平面、直接写 CdefFrame（无 scratch）。
-        let mut offs = [0isize; super::simd::CDEF_CANDS];
-        let mut taps = [0i32; super::simd::CDEF_CANDS];
-        let mut n = 0usize;
-        for k in 0..2usize {
-            for sign in [-1i32, 1] {
-                let [dy, dx] = CDEF_DIRECTIONS[dir][k];
-                offs[n] = (sign * dy) as isize * stride as isize + (sign * dx) as isize;
-                taps[n] = pri_taps[k];
-                n += 1;
-            }
-        }
-        for k in 0..2usize {
-            for dir_off in [-2i32, 2] {
-                let d = ((dir as i32 + dir_off) & 7) as usize;
-                let [dy, dx] = CDEF_DIRECTIONS[d][k];
-                for sign in [-1i32, 1] {
-                    offs[n] = (sign * dy) as isize * stride as isize + (sign * dx) as isize;
-                    taps[n] = sec_taps[k];
-                    n += 1;
-                }
-            }
-        }
-        let (dptr, dstride, dy0, dy1) = sink.direct_u8();
-        debug_assert!(
-            y0 as usize >= dy0 && (y0 as usize + h) <= dy1,
-            "CDEF 的 u8 SIMD 路径要写出自己那段行了"
-        );
-        // SAFETY: interior 保证窗口在平面内；dptr/dstride 来自本 worker 的 sink。
-        unsafe {
-            super::simd::cdef_pair16_u8(
-                plane_ref.px8(),
-                stride as isize,
-                x0 as isize,
-                y0 as isize,
-                h,
-                w,
-                &offs,
-                &taps,
-                pri_str,
-                pri_adj as u32,
-                sec_str,
-                sec_adj as u32,
-                dptr,
-                dstride,
-            );
-        }
-        return;
-    }
-    if is_u8 && interior && super::simd::avx2_available() && w == 4 && h == 4 {
-        // 色度 4×4：原生 u8 quad8，直接读平面、直接写 CdefFrame。
-        let mut offs = [0isize; super::simd::CDEF_CANDS];
-        let mut taps = [0i32; super::simd::CDEF_CANDS];
-        let mut n = 0usize;
-        for k in 0..2usize {
-            for sign in [-1i32, 1] {
-                let [dy, dx] = CDEF_DIRECTIONS[dir][k];
-                offs[n] = (sign * dy) as isize * stride as isize + (sign * dx) as isize;
-                taps[n] = pri_taps[k];
-                n += 1;
-            }
-        }
-        for k in 0..2usize {
-            for dir_off in [-2i32, 2] {
-                let d = ((dir as i32 + dir_off) & 7) as usize;
-                let [dy, dx] = CDEF_DIRECTIONS[d][k];
-                for sign in [-1i32, 1] {
-                    offs[n] = (sign * dy) as isize * stride as isize + (sign * dx) as isize;
-                    taps[n] = sec_taps[k];
-                    n += 1;
-                }
-            }
-        }
-        let (dptr, dstride, dy0, dy1) = sink.direct_u8();
-        debug_assert!(
-            y0 as usize >= dy0 && (y0 as usize + h) <= dy1,
-            "CDEF 的 u8 SIMD 路径要写出自己那段行了"
-        );
-        // SAFETY: interior 保证窗口在平面内；dptr/dstride 来自本 worker 的 sink。
-        unsafe {
-            super::simd::cdef_quad8_u8(
-                plane_ref.px8(),
-                stride as isize,
-                x0 as isize,
-                y0 as isize,
-                &offs,
-                &taps,
-                pri_str,
-                pri_adj as u32,
-                sec_str,
-                sec_adj as u32,
-                dptr,
-                dstride,
-            );
-        }
-        return;
-    }
 
     if simd {
         // 12 个候选的偏移（相对块左上角）与抽头：**只跟方向/强度有关**，
@@ -789,7 +679,7 @@ fn cdef_filter(
         return;
     }
 
-    filter_pixels(0, w, 0, h, interior && !is_u8);
+    filter_pixels(0, w, 0, h, interior);
 }
 
 /// 累加一个候选样本（已把 `constrain` 的两个参数算好）。

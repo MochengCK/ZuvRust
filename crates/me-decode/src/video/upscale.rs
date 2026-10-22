@@ -141,12 +141,6 @@ const UPSCALE_FILTER: [[i16; FILTER_TAPS]; 64] = [
 ///
 /// `use_superres = 0` 时规范就是"原样返回"——这时直接克隆一份，调用方不用分叉。
 pub fn apply(frame: &CurrFrame, fh: &FrameHeader, seq: &SequenceHeader) -> Result<CurrFrame> {
-    // `ME_PLANE_U8`：上采样内核只认 u16，先扩宽跑完再收窄。
-    if frame.planes[0].is_u8() {
-        let f16 = frame.to_u16_copy();
-        let out16 = apply(&f16, fh, seq)?;
-        return Ok(out16.to_u8_copy());
-    }
     if !fh.use_superres {
         return Ok(frame.clone());
     }
@@ -154,7 +148,7 @@ pub fn apply(frame: &CurrFrame, fh: &FrameHeader, seq: &SequenceHeader) -> Resul
     let sub_y = seq.color.subsampling_y;
     // 输出帧按**拉宽后**的宽度开（`CurrFrame::new` 对色度用 `(w+1)>>1`，
     // 正是规范的 `Round2(UpscaledWidth, subX)`）。
-    let mut out = CurrFrame::new_u16(
+    let mut out = CurrFrame::new(
         fh.upscaled_width as usize,
         fh.frame_height as usize,
         sub_x,

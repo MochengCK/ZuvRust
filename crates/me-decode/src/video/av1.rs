@@ -393,9 +393,7 @@ impl Av1Decoder {
             pf.tiles.len(),
             pf.tiles.iter().map(|t| t.data.len()).sum::<usize>(),
         ));
-        // `ME_PLANE_U8` 的混合架构：重建阶段固定 u16（预测/变换/MC 全是 u16 内核），
-        // 到滤镜阶段再转 u8。见 `filters::decode_frame_wrapup`。
-        let mut frame = CurrFrame::new_u16(
+        let mut frame = CurrFrame::new(
             pf.fh.frame_width as usize,
             pf.fh.frame_height as usize,
             seq.color.subsampling_x,

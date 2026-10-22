@@ -663,13 +663,6 @@ pub fn apply_film_grain(frame: &mut CurrFrame, params: &FilmGrainParams, is_iden
     if !params.apply_grain {
         return;
     }
-    // `ME_PLANE_U8`：颗粒合成内核只认 u16，先扩宽再收窄。
-    if frame.planes[0].is_u8() {
-        let mut tmp = frame.to_u16_copy();
-        apply_film_grain(&mut tmp, params, is_identity);
-        *frame = tmp.to_u8_copy();
-        return;
-    }
     let num_uv = [usize::from(params.num_uv_points[0]), usize::from(params.num_uv_points[1])];
     let has_chroma = num_uv[0] > 0 || num_uv[1] > 0 || params.chroma_scaling_from_luma;
     let bit_depth = frame.planes[0].bit_depth;
