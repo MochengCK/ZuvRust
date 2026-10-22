@@ -2807,15 +2807,22 @@ LR 桥”的成本；审计早已指出 MC 的 u8 源+加宽可能更慢，混�
 验收：默认 / `ME_ROW_MT` / `ME_ROW_MT+PAR` / `ME_NO_SIMD` 四路 24 帧逐字节相同；
 `me-decode` 476 passed；默认路径 A/B 与 cut51 持平（甚至略快，噪声内）。
 
-### 第二轮要解决的（还没做）
+### 第二轮进度
 
-1. **`RefFrameStore` 的像素可变性**：`PendingTile` 里的 `BlockCtx` 长期持有
-   `&RefFrameStore`，而滤镜 N 结束后要 `store_pixels(N)`（`&mut`）——两者冲突。
-   需要把 `pixels` 放到内部可变容器（`RwLock` / `ArcSwap`），或拆成
-   “元数据视图（语法用，只读）+ 像素槽（内部可变）”。这是第二轮的核心改动。
-2. **两个 pending 帧**：`Av1Decoder` 现在只有一个 `pending: Option<PendingFrame>`；
-   需要“正在 parse 的 N+1”和“正在滤镜/回放的 N”两个状态 + 帧队列。
-3. **提交顺序**：`store.refresh()`（元数据）可提前到滤镜前；`store_pixels` /
-   `save_cdfs` 必须等滤镜完成；`replay N+1` 必须等 `store_pixels(N)`。
-4. **输出顺序**与 `show_existing_frame` / `show_frame=0` 的显示事件不能乱序。
+1. ✅ **`RefFrameStore` 像素槽内部可变**（2026-10-23，`d4a8e5b`）：
+   `pixels` 改为 `[Mutex<Option<Arc<CurrFrame>>>; 8]`，`store_pixels(&self)`；
+   `BlockCtx` 增加 `ref_pixels` Arc 快照，`ReplayShared` 也用它。这样
+   `PendingTile` 可以长期借 `&RefFrameStore`，滤镜后再写像素。
+   验收：默认/`ME_ROW_MT`/`PAR` 24 帧逐字节一致，476 测试，默认无回归。
+   ⚠️ 跨帧回放前必须调用 `ctx.ref_pixels = store.ref_pixels()` 刷新快照
+   （parse 时 N 的像素还没落槽）。
+2. **还没做：两个 pending 帧 + 帧调度器**。`Av1Decoder` 仍只有一个
+   `pending: Option<PendingFrame>`，`decode()` 里帧完成即同步 `finish_frame`。
+   需要新增 `FilterJob`（后台滤镜线程 + join）和“先 parse N+1、再 join N、
+   刷新 refs、回放 N+1、启动滤镜 N+1”的状态机；`flush()` 负责 join 最后一帧。
+   先只支持 **单瓦片 + `ME_ROW_MT=1`**（多瓦片 `PendingTile` 会同时借同一份
+   `&mut` CDF/网格，当前接口容纳不下），其余路径回退同步。
+3. 提交顺序：`store.refresh()`/`motion_field_storage`/`save_cdfs` 提前到滤镜前，
+   `store_pixels` 等滤镜完成；`show_existing_frame` 与关键帧重置前先 join。
+4. 输出顺序与 `show_frame=0` 不能乱序；`flush()` 收尾。
 5. 验收仍是逐字节一致 + `PHASE` 里 tiles/filters 部分重叠；目标中位 50→36~40ms。
