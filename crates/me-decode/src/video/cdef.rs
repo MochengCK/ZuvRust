@@ -654,25 +654,15 @@ fn cdef_filter(
         }
         return;
     }
-    if is_u8 && interior && super::simd::avx2_available() {
-        let sw = w + 4;
-        let sh = h + 4;
-        let mut src = [0u16; 12 * 12];
-        let mut out = [0u16; 12 * 12];
-        for yy in 0..sh {
-            let sy = y0 - 2 + yy as i32;
-            for xx in 0..sw {
-                let sx = x0 - 2 + xx as i32;
-                src[yy * sw + xx] = plane_ref.get(sx as usize, sy as usize);
-            }
-        }
+    if is_u8 && interior && super::simd::avx2_available() && w == 4 && h == 4 {
+        // 色度 4×4：原生 u8 quad8，直接读平面、直接写 CdefFrame。
         let mut offs = [0isize; super::simd::CDEF_CANDS];
         let mut taps = [0i32; super::simd::CDEF_CANDS];
         let mut n = 0usize;
         for k in 0..2usize {
             for sign in [-1i32, 1] {
                 let [dy, dx] = CDEF_DIRECTIONS[dir][k];
-                offs[n] = (sign * dy) as isize * sw as isize + (sign * dx) as isize;
+                offs[n] = (sign * dy) as isize * stride as isize + (sign * dx) as isize;
                 taps[n] = pri_taps[k];
                 n += 1;
             }
@@ -682,52 +672,33 @@ fn cdef_filter(
                 let d = ((dir as i32 + dir_off) & 7) as usize;
                 let [dy, dx] = CDEF_DIRECTIONS[d][k];
                 for sign in [-1i32, 1] {
-                    offs[n] = (sign * dy) as isize * sw as isize + (sign * dx) as isize;
+                    offs[n] = (sign * dy) as isize * stride as isize + (sign * dx) as isize;
                     taps[n] = sec_taps[k];
                     n += 1;
                 }
             }
         }
-        // SAFETY: AVX2 已判；`src` 覆盖内核会读的 2 像素外扩，`out` 是
-        // 同 stride 的输出缓冲；`interior` 保证窗口样本都在平面内。
+        let (dptr, dstride, dy0, dy1) = sink.direct_u8();
+        debug_assert!(
+            y0 as usize >= dy0 && (y0 as usize + h) <= dy1,
+            "CDEF 的 u8 SIMD 路径要写出自己那段行了"
+        );
+        // SAFETY: interior 保证窗口在平面内；dptr/dstride 来自本 worker 的 sink。
         unsafe {
-            if w == 4 && h == 4 {
-                super::simd::cdef_quad8(
-                    &src[..sw * sh],
-                    sw as isize,
-                    2,
-                    2,
-                    &offs,
-                    &taps,
-                    pri_str,
-                    pri_adj as u32,
-                    sec_str,
-                    sec_adj as u32,
-                    out.as_mut_ptr(),
-                    sw as isize,
-                );
-            } else {
-                super::simd::cdef_pair16(
-                    &src[..sw * sh],
-                    sw as isize,
-                    2,
-                    2,
-                    h,
-                    w,
-                    &offs,
-                    &taps,
-                    pri_str,
-                    pri_adj as u32,
-                    sec_str,
-                    sec_adj as u32,
-                    out.as_mut_ptr(),
-                    sw as isize,
-                );
-            }
-        }
-        for r in 0..h {
-            let base = (2 + r) * sw + 2;
-            sink.set_row_u16(x0 as usize, y0 as usize + r, &out[base..base + w]);
+            super::simd::cdef_quad8_u8(
+                plane_ref.px8(),
+                stride as isize,
+                x0 as isize,
+                y0 as isize,
+                &offs,
+                &taps,
+                pri_str,
+                pri_adj as u32,
+                sec_str,
+                sec_adj as u32,
+                dptr,
+                dstride,
+            );
         }
         return;
     }
