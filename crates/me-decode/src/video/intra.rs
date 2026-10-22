@@ -242,11 +242,20 @@ pub struct Plane {
 
 impl Plane {
     pub fn new(w: usize, h: usize, bit_depth: u8) -> Self {
+        Self::new_impl(w, h, bit_depth, false)
+    }
+
+    /// 强制 u16 存储（`ME_PLANE_U8` 的桥接/诊断路径用）。
+    pub fn new_u16(w: usize, h: usize, bit_depth: u8) -> Self {
+        Self::new_impl(w, h, bit_depth, true)
+    }
+
+    fn new_impl(w: usize, h: usize, bit_depth: u8, force_u16: bool) -> Self {
         let mid = 1u16 << (bit_depth - 1);
         let stride = w + PLANE_PAD;
         let rows = h + PLANE_PAD;
         let n = stride * rows;
-        if bit_depth <= 8 && flags::plane_u8() {
+        if bit_depth <= 8 && flags::plane_u8() && !force_u16 {
             // 8bit：u8 缓冲（池按 (宽度, 长度) 复用，见 `pool`）。
             let mut data = match super::pool::take_u8(n) {
                 Some(v) => v,
@@ -1162,6 +1171,30 @@ impl CurrFrame {
         num_planes: usize,
         bit_depth: u8,
     ) -> Self {
+        Self::new_impl(width, height, sub_x, sub_y, num_planes, bit_depth, false)
+    }
+
+    /// 强制 u16 平面（`ME_PLANE_U8` 的 LR 桥接用）。
+    pub fn new_u16(
+        width: usize,
+        height: usize,
+        sub_x: bool,
+        sub_y: bool,
+        num_planes: usize,
+        bit_depth: u8,
+    ) -> Self {
+        Self::new_impl(width, height, sub_x, sub_y, num_planes, bit_depth, true)
+    }
+
+    fn new_impl(
+        width: usize,
+        height: usize,
+        sub_x: bool,
+        sub_y: bool,
+        num_planes: usize,
+        bit_depth: u8,
+        force_u16: bool,
+    ) -> Self {
         let mut planes = Vec::with_capacity(num_planes);
         let mut decoded = Vec::with_capacity(num_planes);
         let mut decoded_cols = Vec::with_capacity(num_planes);
@@ -1174,7 +1207,7 @@ impl CurrFrame {
                     (height + usize::from(sub_y)) >> u32::from(sub_y),
                 )
             };
-            planes.push(Plane::new(pw, ph, bit_depth));
+            planes.push(if force_u16 { Plane::new_u16(pw, ph, bit_depth) } else { Plane::new(pw, ph, bit_depth) });
             let cols = pw.div_ceil(4);
             decoded_cols.push(cols);
             decoded.push(vec![0u8; cols * ph.div_ceil(4)]);

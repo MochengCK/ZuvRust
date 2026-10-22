@@ -671,6 +671,55 @@ pub(crate) fn lr_dump(frame: &CurrFrame, dir: &str, tag: &str, n: u64) {
 /// 需要真的滤波时（`uses_lr == true`）仍然要开第三份 `out`：环路恢复的输出
 /// 既不回灌 `CdefFrame` 也不回灌 `CurrFrame`（规范 §7.17 就是这么定的），
 /// 两份源都必须**同时**可读。这时 `up_curr`/`up_cdef` 退化成只读借用。
+/// `ME_PLANE_U8` 的临时桥：LR 内核目前只认 u16 平面，先把 u8 帧整体扩宽，
+/// 跑完再收窄回 u8。逐字节等价；等 LR 内核迁移完再删掉这两段拷贝。
+fn to_u16_frame(src: &CurrFrame) -> CurrFrame {
+    let mut out = CurrFrame::new_u16(
+        src.planes[0].w,
+        src.planes[0].h,
+        src.sub_x,
+        src.sub_y,
+        src.num_planes,
+        src.planes[0].bit_depth,
+    );
+    for p in 0..src.num_planes {
+        let s = &src.planes[p];
+        let d = &mut out.planes[p];
+        if s.is_u8() {
+            for (dv, sv) in d.px16_mut().iter_mut().zip(s.px8().iter()) {
+                *dv = u16::from(*sv);
+            }
+        } else {
+            d.px16_mut().copy_from_slice(s.px16());
+        }
+    }
+    out
+}
+
+/// 见 [`to_u16_frame`]：把 LR 的 u16 输出收回 u8 帧。
+fn to_u8_frame(src: &CurrFrame) -> CurrFrame {
+    let mut out = CurrFrame::new(
+        src.planes[0].w,
+        src.planes[0].h,
+        src.sub_x,
+        src.sub_y,
+        src.num_planes,
+        src.planes[0].bit_depth,
+    );
+    for p in 0..src.num_planes {
+        let s = &src.planes[p];
+        let d = &mut out.planes[p];
+        if d.is_u8() {
+            for (dv, sv) in d.px8_mut().iter_mut().zip(s.px16().iter()) {
+                *dv = *sv as u8;
+            }
+        } else {
+            d.px16_mut().copy_from_slice(s.px16());
+        }
+    }
+    out
+}
+
 pub fn apply(
     up_curr: CurrFrame,
     up_cdef: Option<CurrFrame>,
@@ -678,6 +727,14 @@ pub fn apply(
     seq: &SequenceHeader,
     lr: &LrState,
 ) -> Result<CurrFrame> {
+    // `ME_PLANE_U8`：LR 内核还没迁 u8，先用 u16 桥跑完再收窄。
+    if up_curr.planes[0].is_u8() {
+        let curr16 = to_u16_frame(&up_curr);
+        let cdef16 = up_cdef.as_ref().map(to_u16_frame);
+        let out16 = apply(curr16, cdef16, fh, seq, lr)?;
+        return Ok(to_u8_frame(&out16));
+    }
+
     // 诊断（`AV1_TRACE_LR`）：一行回答"这一帧到底用了什么" —— 排查真实素材时最省时间的一条。
     if trace_lr() {
         eprintln!(
@@ -720,7 +777,7 @@ pub fn apply(
     // 缺页 + 内核清零便宜得多。
     // ⚠️ 前提是"覆盖满"：x/y 两个循环按 `MI_SIZE` 走满整帧，`w`/`h` 已按平面
     //    边界裁剪，三档（wiener / sgr / none）都写。改这段循环时务必保持这条。
-    let mut out = CurrFrame::new(
+    let mut out = CurrFrame::new_u16(
         up_cdef.planes[0].w,
         up_cdef.planes[0].h,
         up_cdef.sub_x,
