@@ -503,7 +503,10 @@ fn cdef_filter(
     let sec_taps = &CDEF_SEC_TAPS[tap_sel];
 
     let plane_ref = &curr.planes[plane as usize];
-    let data = plane_ref.px16();
+    // u8 平面（`ME_PLANE_U8`）暂时走标量：CDEF 的 SIMD 内核只吃 u16 源/目标。
+    // 迁移内核之前先把正确性跑通；`data` 在 u8 路径上不会被访问。
+    let is_u8 = plane_ref.is_u8();
+    let data: &[u16] = if is_u8 { &[] } else { plane_ref.px16() };
     let stride = plane_ref.stride;
     let sink = &sinks[plane as usize];
 
@@ -522,8 +525,9 @@ fn cdef_filter(
     // 有 72 样本的 padding，越界候选的读取是**可寻址**的；它们只会污染最右/最下
     // 1~2 行/列的**输出**，这些像素随后用标量重算（越界候选不参与）。
     // 左/上边界仍走标量：平面没有负向 padding。
-    let cap_rows = (data.len() / stride) as i32;
-    let simd = super::simd::avx2_available()
+    let cap_rows = (plane_ref.sample_count() / stride.max(1)) as i32;
+    let simd = !is_u8
+        && super::simd::avx2_available()
         && (interior || !super::flags::no_cdef_edge())
         && x0 >= 2
         && y0 >= 2
@@ -542,7 +546,11 @@ fn cdef_filter(
             let y = y0 as usize + i;
             for j in xl..xh {
                 let x = x0 as usize + j;
-                let cur = i32::from(data[y * stride + x]);
+                let cur = if is_u8 {
+                    i32::from(plane_ref.get(x, y))
+                } else {
+                    i32::from(data[y * stride + x])
+                };
                 let mut max = cur;
                 let mut min = cur;
                 let mut sum = 0i32;
@@ -679,7 +687,7 @@ fn cdef_filter(
         return;
     }
 
-    filter_pixels(0, w, 0, h, interior);
+    filter_pixels(0, w, 0, h, interior && !is_u8);
 }
 
 /// 累加一个候选样本（已把 `constrain` 的两个参数算好）。

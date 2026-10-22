@@ -1355,19 +1355,36 @@ impl ResidualCtx<'_> {
         // 写回的是**这个变换块**的位置：`dst` 要从 (start_x, start_y) 起算
         // （曾经整个平面从头传进去 → 残差全叠到左上角，画面上只剩"预测的平滑图"）。
         let base = start_y as usize * stride + start_x as usize;
-        let dst = &mut frame.planes[plane as usize].px16_mut()[base..];
-        super::transform::inverse_transform_add(
-            &t,
-            tx_sz,
-            tx_type,
-            pred,
-            dst,
-            stride,
-            bit_depth,
-            lossless,
-            residual,
-            residual32,
-        )
+        let plane_ref = &mut frame.planes[plane as usize];
+        if plane_ref.is_u8() {
+            let dst = &mut plane_ref.px8_mut()[base..];
+            super::transform::inverse_transform_add8(
+                &t,
+                tx_sz,
+                tx_type,
+                pred,
+                dst,
+                stride,
+                bit_depth,
+                lossless,
+                residual,
+                residual32,
+            )
+        } else {
+            let dst = &mut plane_ref.px16_mut()[base..];
+            super::transform::inverse_transform_add(
+                &t,
+                tx_sz,
+                tx_type,
+                pred,
+                dst,
+                stride,
+                bit_depth,
+                lossless,
+                residual,
+                residual32,
+            )
+        }
     }
 
     /// 一个变换块的**像素重建**：帧内预测 + 标记 `BlockDecoded`。
