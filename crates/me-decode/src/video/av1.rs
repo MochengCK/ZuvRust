@@ -152,6 +152,74 @@ struct PendingFrame {
     want_tiles: u32,
 }
 
+/// 后台滤镜线程的产物。
+struct Filtered {
+    lr: CurrFrame,
+    block_grid: BlockGrid,
+    mi_grid: MiGrid,
+    fh: FrameHeader,
+    seq: SequenceHeader,
+    pts_us: i64,
+    show_frame: bool,
+    refresh_flags: u8,
+}
+
+/// 一帧的**后台滤镜任务**（去块 → CDEF → 超分 → LR）。语法 N+1 可与它重叠，
+/// join 之后才提交参考像素并产出显示帧。
+struct FilterJob {
+    handle: std::thread::JoinHandle<Result<Filtered>>,
+}
+
+impl FilterJob {
+    #[allow(clippy::too_many_arguments)]
+    fn start(
+        frame: CurrFrame,
+        fh: FrameHeader,
+        seq: SequenceHeader,
+        block_grid: BlockGrid,
+        mi_grid: MiGrid,
+        lr: LrState,
+        pts_us: i64,
+        show_frame: bool,
+        refresh_flags: u8,
+    ) -> Result<Self> {
+        let fh2 = fh.clone();
+        let seq2 = seq.clone();
+        let _ = (&fh2, &seq2);
+        let handle = std::thread::Builder::new()
+            .name("av1-filter".into())
+            .spawn(move || {
+                let lr_out = super::filters::decode_frame_wrapup(
+                    frame,
+                    &fh2,
+                    &seq2,
+                    &block_grid,
+                    &mi_grid,
+                    &lr,
+                )?;
+                Ok(Filtered {
+                    lr: lr_out,
+                    block_grid,
+                    mi_grid,
+                    fh: fh2,
+                    seq: seq2,
+                    pts_us,
+                    show_frame,
+                    refresh_flags,
+                })
+            })
+            .map_err(|e| MediaError::Io(format!("启动 AV1 滤镜线程失败：{e}")))?;
+        Ok(Self { handle })
+    }
+
+    fn join(self) -> Result<Filtered> {
+        match self.handle.join() {
+            Ok(r) => r,
+            Err(_) => Err(MediaError::Bitstream("AV1 滤镜线程 panic".into())),
+        }
+    }
+}
+
 /// 自研 AV1 软解（进度见 [`crate::video`] 的分层表）。
 pub struct Av1Decoder {
     /// 容器给的 `av1C`（ISO/IEC 14496-15 的 AV1CodecConfigurationRecord）
@@ -164,6 +232,8 @@ pub struct Av1Decoder {
     mf_store: MotionFieldStore,
     /// 正在解、等瓦片组的那一帧
     pending: Option<PendingFrame>,
+    /// 后台滤镜中的上一帧（`ME_FRAME_PIPE=1`）
+    pending_filter: Option<FilterJob>,
     /// **跨帧复用的网格池**（`BlockGrid` + `MiGrid`）。
     ///
     /// 1080p 这两个网格加起来约 11 MB，每帧 `new` 一次的话光分配（大块走 `mmap`、
@@ -224,6 +294,7 @@ impl Av1Decoder {
             store: RefFrameStore::new(),
             mf_store: MotionFieldStore::new(),
             pending: None,
+            pending_filter: None,
             grid_pool: None,
             last_setup_ms: 0.0,
             last_setup_parts: (0.0, 0.0, 0.0),
@@ -575,6 +646,208 @@ fn add_tile_group(pf: &mut PendingFrame, body: &[u8]) -> Result<()> {
     Ok(())
 }
 
+impl Av1Decoder {
+    /// 两帧流水线的帧完成处理：当前帧语法 parse 先跑（与上一帧的后台滤镜重叠），
+    /// 然后 join 上一帧、提交像素/输出，再回放当前帧并启动它的滤镜。
+    fn finish_frame_pipeline(
+        &mut self,
+        mut pf: PendingFrame,
+        out: &mut Vec<VideoFrame>,
+    ) -> Result<()> {
+        let pipeline = flags::frame_pipe()
+            && flags::row_mt()
+            && !flags::syntax_only()
+            && pf.want_tiles == 1
+            && pf.tiles.len() == 1;
+        if !pipeline {
+            self.drain_pending_filter(out)?;
+            if let Some(vf) = self.finish_frame(pf)? {
+                out.push(vf);
+            }
+            return Ok(());
+        }
+        let seq = self.seq.clone().ok_or_else(|| {
+            MediaError::Bitstream("解码帧时没有序列头（av1C 与码流都没给）".into())
+        })?;
+        let num_planes = if seq.color.mono_chrome { 1usize } else { 3 };
+        let pts_us = self.sample_pts_us;
+        let mut frame = CurrFrame::new(
+            pf.fh.frame_width as usize,
+            pf.fh.frame_height as usize,
+            seq.color.subsampling_x,
+            seq.color.subsampling_y,
+            num_planes,
+            seq.color.bit_depth,
+        );
+        pf.tiles.sort_by_key(|t| t.index);
+        self.last_tiles = Some((1, pf.tiles[0].data.len()));
+        super::block::TRACE_FRAME_NO
+            .store(self.frames_parsed, std::sync::atomic::Ordering::Relaxed);
+        super::block::TRACE_TILE_FRAME_NO
+            .store(self.tile_frames, std::sync::atomic::Ordering::Relaxed);
+
+        // ① 先只跑语法（与上一帧的后台滤镜重叠）。
+        let tile = pf.tiles[0].as_tile();
+        let parsed = super::block::parse_tile(
+            &tile,
+            &seq,
+            &pf.fh,
+            &self.store,
+            pf.motion_field.as_ref(),
+            &mut pf.cdf,
+            &mut pf.mi_grid,
+            &mut pf.block_grid,
+            &mut pf.coeff_ctxs,
+            &mut pf.lr,
+            Some(&mut frame),
+        )?;
+        drop(tile);
+        let mut pending = Some(parsed);
+        let mut blocks = 0u64;
+
+        if self.pending_filter.is_none() {
+            // 第一帧：没有可重叠的滤镜，直接回放并启动。
+            let p = pending.take().expect("刚放进去");
+            let r = super::block::replay_tile(p, &mut pf.mi_grid)?;
+            blocks += r.blocks.blocks;
+            self.start_filter_job(pf, frame, seq, pts_us, blocks)?;
+            return Ok(());
+        }
+
+        // ② 语法已就绪；join 上一帧的滤镜并提交参考像素/输出。
+        let job = self.pending_filter.take().expect("刚判过 Some");
+        let filtered = job.join()?;
+        let Filtered {
+            lr: filtered_lr,
+            block_grid,
+            mi_grid,
+            fh: filtered_fh,
+            seq: filtered_seq,
+            pts_us: filtered_pts,
+            show_frame,
+            refresh_flags,
+        } = filtered;
+        let lr = std::sync::Arc::new(filtered_lr);
+        self.store
+            .store_pixels(refresh_flags, std::sync::Arc::clone(&lr));
+        self.grid_pool = Some((block_grid, mi_grid));
+        if show_frame {
+            let mut lr = lr;
+            let fg = &filtered_fh.params.film_grain;
+            if fg.apply_grain {
+                let is_identity = filtered_seq.color.matrix_coefficients == 0;
+                super::grain::apply_film_grain(
+                    std::sync::Arc::make_mut(&mut lr),
+                    fg,
+                    is_identity,
+                );
+            }
+            out.push(nv12_frame(&lr, filtered_pts)?);
+        }
+
+        // ③ 上一帧像素已落槽 ⇒ 刷新快照，回放当前帧，启动它的滤镜。
+        pending
+            .as_mut()
+            .expect("pending 还在")
+            .refresh_refs(&self.store);
+        let r = super::block::replay_tile(pending.take().expect("刚判过"), &mut pf.mi_grid)?;
+        blocks += r.blocks.blocks;
+        self.start_filter_job(pf, frame, seq, pts_us, blocks)?;
+        Ok(())
+    }
+
+    /// 提交一帧的参考元数据/CDF，并把滤镜丢到后台线程。
+    fn start_filter_job(
+        &mut self,
+        mut pf: PendingFrame,
+        frame: CurrFrame,
+        seq: SequenceHeader,
+        pts_us: i64,
+        blocks: u64,
+    ) -> Result<()> {
+        let refresh_flags = pf.fh.refresh_frame_flags;
+        let show_frame = pf.fh.show_frame;
+        self.last_blocks = blocks;
+        self.tile_frames += 1;
+        self.frames_parsed += 1;
+        if refresh_flags != 0 {
+            if let Some((saved_rf, saved_mvs)) =
+                Some(motion_field_storage(&pf.block_grid, &pf.fh, &seq, &self.store))
+            {
+                for slot in 0..8usize {
+                    if (refresh_flags >> slot) & 1 == 1 {
+                        self.mf_store.save(
+                            slot,
+                            pf.fh.mi_rows as usize,
+                            pf.fh.mi_cols as usize,
+                            pf.fh.is_intra,
+                            saved_rf.clone(),
+                            saved_mvs.clone(),
+                            pf.fh.order_hints,
+                        );
+                    }
+                }
+            }
+            if !pf.fh.disable_frame_end_update_cdf {
+                self.store.save_cdfs(refresh_flags, &pf.cdf);
+            }
+            self.store.refresh(&pf.fh);
+        }
+        let job = FilterJob::start(
+            frame,
+            pf.fh.clone(),
+            seq,
+            pf.block_grid,
+            pf.mi_grid,
+            pf.lr,
+            pts_us,
+            show_frame,
+            refresh_flags,
+        )?;
+        self.pending_filter = Some(job);
+        if pf.motion_field.is_some() {
+            self.mf_buf = pf.motion_field.take();
+        }
+        Ok(())
+    }
+
+    /// join 后台滤镜、提交像素并产出显示帧（顺序路径/收尾用）。
+    fn drain_pending_filter(&mut self, out: &mut Vec<VideoFrame>) -> Result<()> {
+        let Some(job) = self.pending_filter.take() else {
+            return Ok(());
+        };
+        let filtered = job.join()?;
+        let Filtered {
+            lr: filtered_lr,
+            block_grid,
+            mi_grid,
+            fh: filtered_fh,
+            seq: filtered_seq,
+            pts_us: filtered_pts,
+            show_frame,
+            refresh_flags,
+        } = filtered;
+        let lr = std::sync::Arc::new(filtered_lr);
+        self.store
+            .store_pixels(refresh_flags, std::sync::Arc::clone(&lr));
+        self.grid_pool = Some((block_grid, mi_grid));
+        if show_frame {
+            let mut lr = lr;
+            let fg = &filtered_fh.params.film_grain;
+            if fg.apply_grain {
+                let is_identity = filtered_seq.color.matrix_coefficients == 0;
+                super::grain::apply_film_grain(
+                    std::sync::Arc::make_mut(&mut lr),
+                    fg,
+                    is_identity,
+                );
+            }
+            out.push(nv12_frame(&lr, filtered_pts)?);
+        }
+        Ok(())
+    }
+}
+
 impl VideoDecoder for Av1Decoder {
     fn decode(&mut self, sample: &[u8], pts_us: i64) -> Result<Vec<VideoFrame>> {
         if sample.is_empty() {
@@ -596,6 +869,7 @@ impl VideoDecoder for Av1Decoder {
                             || old.max_frame_width != sh.max_frame_width
                             || old.max_frame_height != sh.max_frame_height
                         {
+                            self.drain_pending_filter(&mut out)?;
                             self.reset_reference_state();
                         }
                     }
@@ -627,9 +901,11 @@ impl VideoDecoder for Av1Decoder {
                     // 关键帧 + 显示 ⇒ 参考帧状态整体重置（§5.9.2）。放在解析之后：
                     // 解析期间还要用旧参考帧读尺寸/顺序。
                     if fh.frame_type == FrameType::Key && fh.show_frame {
+                        self.drain_pending_filter(&mut out)?;
                         self.reset_reference_state();
                     }
                     if fh.show_existing_frame {
+                        self.drain_pending_filter(&mut out)?;
                         self.frames_parsed += 1;
                         if let Some(vf) = self.show_existing(&fh)? {
                             out.push(vf);
@@ -652,9 +928,7 @@ impl VideoDecoder for Av1Decoder {
                     self.pending = Some(pf);
                     if self.pending_complete() {
                         let pf = self.pending.take().expect("刚放进去");
-                        if let Some(vf) = self.finish_frame(pf)? {
-                            out.push(vf);
-                        }
+                        self.finish_frame_pipeline(pf, &mut out)?;
                     }
                 }
                 ObuType::TileGroup => {
@@ -669,9 +943,7 @@ impl VideoDecoder for Av1Decoder {
                     }
                     if self.pending_complete() {
                         let pf = self.pending.take().expect("刚判过 complete");
-                        if let Some(vf) = self.finish_frame(pf)? {
-                            out.push(vf);
-                        }
+                        self.finish_frame_pipeline(pf, &mut out)?;
                     }
                 }
                 other => {
@@ -682,16 +954,18 @@ impl VideoDecoder for Av1Decoder {
                 }
             }
         }
-        if out.is_empty() && self.pending.is_none() {
+        if out.is_empty() && self.pending.is_none() && self.pending_filter.is_none() {
             self.header_only_samples += 1;
         }
         Ok(out)
     }
 
     fn flush(&mut self) -> Result<Vec<VideoFrame>> {
-        // 没有重排序队列：显示事件即输出，所以冲刷时没有滞留帧。
+        // 两帧流水线会把最后一帧的输出推迟到下一次 decode/flush；这里收尾。
         // 半截的帧（瓦片没收齐）是数据问题，不在这里假装补全。
-        Ok(Vec::new())
+        let mut out = Vec::new();
+        self.drain_pending_filter(&mut out)?;
+        Ok(out)
     }
 
     fn backend(&self) -> &'static str {

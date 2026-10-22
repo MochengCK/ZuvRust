@@ -5400,6 +5400,14 @@ pub fn parse_tile<'a, 't, 'm, 'l>(
     })
 }
 
+impl PendingTile<'_> {
+    /// 跨帧回放前刷新参考像素快照：parse 时上一帧的像素可能还没落槽
+    /// （两帧流水线里滤镜 N 在语法 N+1 之后才完成）。
+    pub fn refresh_refs(&mut self, store: &RefFrameStore) {
+        self.ctx.ref_pixels = store.ref_pixels();
+    }
+}
+
 pub fn replay_tile(
     pending: PendingTile<'_>,
     mi_grid: &mut MiGrid,
