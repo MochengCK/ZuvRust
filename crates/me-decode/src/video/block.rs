@@ -5203,19 +5203,35 @@ pub fn needs_interp_filter_here(
 /// `frame` 为 `Some` 时顺带走 §7.11.2 的帧内预测把像素写出来（M5）；为 `None`
 /// 时只读语法 —— 真素材的语法验收（`real_av1_tests`）走的是后者。
 #[allow(clippy::too_many_arguments)]
-pub fn decode_tile(
-    tile: &Tile<'_>,
-    seq: &SequenceHeader,
-    fh: &FrameHeader,
-    store: &RefFrameStore,
-    field: Option<&mv::MotionField>,
-    cdf_ctx: &mut CdfContext,
-    mi_grid: &mut MiGrid,
-    block_grid: &mut BlockGrid,
-    coeff_ctxs: &mut CoeffContexts,
-    lr: &mut LrState,
-    frame: Option<&mut CurrFrame>,
-) -> Result<TileDecodeResult> {
+/// `decode_tile` 的语法阶段产物：保留 `BlockCtx`（含 row-mt 工单）以便稍后回放。
+pub struct PendingTile<'a> {
+    ctx: BlockCtx<'a>,
+    row_mt: bool,
+    exit_ok: bool,
+    bits_left: i64,
+    uncovered: usize,
+    overlaps: usize,
+    partition: partition::PartitionStats,
+    sb_bits: Vec<u32>,
+    sb_leaves: Vec<u32>,
+    total_consumed: i64,
+    syn_ms: f64,
+}
+
+pub fn parse_tile<'a, 't, 'm, 'l>(
+    tile: &'t Tile<'_>,
+    seq: &'a SequenceHeader,
+    fh: &'a FrameHeader,
+    store: &'a RefFrameStore,
+    field: Option<&'a mv::MotionField>,
+    cdf_ctx: &'a mut CdfContext,
+    mi_grid: &'m mut MiGrid,
+    block_grid: &'a mut BlockGrid,
+    coeff_ctxs: &'a mut CoeffContexts,
+    lr: &'l mut LrState,
+    frame: Option<&'a mut CurrFrame>,
+) -> Result<PendingTile<'a>> {
+
     let ti = &fh.params.tile_info;
     let mi_rows = *ti.mi_row_starts.last().unwrap_or(&0) as i32;
     let mi_cols = *ti.mi_col_starts.last().unwrap_or(&0) as i32;
@@ -5360,6 +5376,39 @@ pub fn decode_tile(
             ctx.row_mt.blocks.len()
         );
     }
+    let total_consumed = dec.consumed_bits();
+    Ok(PendingTile {
+        ctx,
+        row_mt,
+        exit_ok,
+        bits_left,
+        uncovered,
+        overlaps,
+        partition,
+        sb_bits,
+        sb_leaves,
+        total_consumed,
+        syn_ms,
+    })
+}
+
+pub fn replay_tile(
+    pending: PendingTile<'_>,
+    mi_grid: &mut MiGrid,
+) -> Result<TileDecodeResult> {
+    let PendingTile {
+        mut ctx,
+        row_mt,
+        exit_ok,
+        bits_left,
+        uncovered,
+        overlaps,
+        partition,
+        sb_bits,
+        sb_leaves,
+        total_consumed,
+        syn_ms,
+    } = pending;
     // ── row-mt 重建阶段（阶段 1：整个瓦片语法跑完后顺序回放）─────────────
     if row_mt {
         let (n_blocks, n_txbs, n_levels) =
@@ -5386,7 +5435,6 @@ pub fn decode_tile(
         }
     }
     let blocks = std::mem::take(&mut ctx.stats);
-    let total_consumed = dec.consumed_bits();
     let partition_bits = total_consumed - blocks.bits as i64;
     Ok(TileDecodeResult {
         partition,
@@ -5399,6 +5447,27 @@ pub fn decode_tile(
         sb_leaves,
         partition_bits,
     })
+}
+
+/// 行为不变的顺序包装：先语法 parse，再回放 replay。
+#[allow(clippy::too_many_arguments)]
+pub fn decode_tile<'a, 't>(
+    tile: &'t Tile<'_>,
+    seq: &'a SequenceHeader,
+    fh: &'a FrameHeader,
+    store: &'a RefFrameStore,
+    field: Option<&'a mv::MotionField>,
+    cdf_ctx: &'a mut CdfContext,
+    mi_grid: &'a mut MiGrid,
+    block_grid: &'a mut BlockGrid,
+    coeff_ctxs: &'a mut CoeffContexts,
+    lr: &'a mut LrState,
+    frame: Option<&'a mut CurrFrame>,
+) -> Result<TileDecodeResult> {
+    let pending = parse_tile(
+        tile, seq, fh, store, field, cdf_ctx, mi_grid, block_grid, coeff_ctxs, lr, frame,
+    )?;
+    replay_tile(pending, mi_grid)
 }
 
 /// 叶子回调的类型别名（`partition.rs` 的 `PartitionCtx::leaf_hook` 用它）。
