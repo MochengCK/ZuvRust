@@ -2816,7 +2816,8 @@ LR 桥”的成本；审计早已指出 MC 的 u8 源+加宽可能更慢，混�
    验收：默认/`ME_ROW_MT`/`PAR` 24 帧逐字节一致，476 测试，默认无回归。
    ⚠️ 跨帧回放前必须调用 `ctx.ref_pixels = store.ref_pixels()` 刷新快照
    （parse 时 N 的像素还没落槽）。
-2. **还没做：两个 pending 帧 + 帧调度器**。`Av1Decoder` 仍只有一个
+2. **帧调度器**：✅ 已实现原型 `ME_FRAME_PIPE`（`3b8c4a3`），但实测更慢
+   （见第三十六节），默认关；下面保留原设计说明。`Av1Decoder` 仍只有一个
    `pending: Option<PendingFrame>`，`decode()` 里帧完成即同步 `finish_frame`。
    需要新增 `FilterJob`（后台滤镜线程 + join）和“先 parse N+1、再 join N、
    刷新 refs、回放 N+1、启动滤镜 N+1”的状态机；`flush()` 负责 join 最后一帧。
@@ -2826,3 +2827,31 @@ LR 桥”的成本；审计早已指出 MC 的 u8 源+加宽可能更慢，混�
    `store_pixels` 等滤镜完成；`show_existing_frame` 与关键帧重置前先 join。
 4. 输出顺序与 `show_frame=0` 不能乱序；`flush()` 收尾。
 5. 验收仍是逐字节一致 + `PHASE` 里 tiles/filters 部分重叠；目标中位 50→36~40ms。
+
+## 三十六、两帧流水线原型（`ME_FRAME_PIPE`）：正确但**更慢**，默认关（2026-10-23）
+
+**实现**：帧 N 回放后把滤镜丢到后台线程；主线程先 `parse_tile` 帧 N+1 的语法，
+再 join 滤镜 N → `store_pixels(N)` → 刷新 `ref_pixels` → `replay_tile(N+1)` →
+启动滤镜 N+1。`flush()` 收尾最后一帧。仅支持单瓦片 + `ME_ROW_MT=1`；
+多瓦片 / 非 row-mt 自动回退同步路径。提交 `3b8c4a3`。
+
+**正确性**：
+- 24/60 帧与 cut51 基线**逐字节相同**；
+- `ME_FRAME_PIPE=1` 但不开 row-mt 的回退路径也逐字节相同；
+- 默认路径（flag 关）与 cut51 持平（5.97s vs 5.95s / 100 帧，噪声内）。
+
+**性能（100 帧真实素材，交替 A/B）**：
+
+| 配置 | 无流水线 | 有流水线 |
+|---|---|---|
+| 1 线程 row-mt | 7.0s | 7.3s |
+| 4 线程 row-mt+par | **5.15s** | 5.9s |
+| 8 线程 row-mt+par | **5.38s** | 7 线程 + 流水线 6.0s |
+
+⇒ **所有配置都更慢**。原因：滤镜阶段已经用满可用核心（CDEF/去块/LR 内部
+就带 worker 池），主线程再跑语法 N+1 只是抢核；单瓦片下没有额外空闲并行度。
+**默认不启用**，`ME_FRAME_PIPE` 仅作为实验开关保留。
+
+**保留的地基**（行为不变的独立提交）：`parse_tile`/`replay_tile` 拆分
+（`7ae6b39`）、`RefFrameStore.pixels` 内部可变 + `BlockCtx.ref_pixels`
+快照（`d4a8e5b`）。以后若在多瓦片/多帧独立流上重启帧级调度，可直接复用。
