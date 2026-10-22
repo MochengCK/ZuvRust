@@ -1275,6 +1275,14 @@ cargo test --workspace > /tmp/me.log 2>&1; echo "exit=$?"; grep -E "test result|
       **验收**：24/60 帧、`ME_NO_SIMD`、row-mt 并行逐字节相同；
       workspace **1026 passed / 0 failed**。
 
+      ㊼ **CDEF 候选偏移/抽头按帧预计算 —— 约 +1.2%，已回退**（2026-10-22，第四十七刀，否定实验）：
+      `cdef_filter` 自身占 9.6%，SIMD 分支每块重算 12 个候选的 `offs`/`taps`
+      （1080p 一帧约 9.7 万块）。加 `CdefTables`（`offs[plane][dir][12]` +
+      `taps[tap_sel][12]`，约 4.6 KB）在 `apply` 里一次填好，输出逐字节相同；
+      但实测 **6.405s → 6.480s（约 +1.2%，2/6 轮更快）**，已完整回退。
+      猜测：12 项循环全是常量、已被编译器展开得很好，换表查址反而多一层
+      load/cache 压力。**「少算」不等于「更快」**（与第三十九/四十一刀同源）。
+
     - **已知问题：帧右边界超块伸出区（`coded 宽不是 8 的倍数`时）**：当
       `FrameWidth % 8 != 0`，`MiCols*4 > FrameWidth`，最后一列超块会伸到帧右边界以外。
       参考实现里那块像素是**重建出来的**（帧缓冲的 border 承接），2026-10-03 起我们
