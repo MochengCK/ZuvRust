@@ -967,6 +967,21 @@ mod x86 {
             _mm256_storeu_si256(o.add(c) as *mut __m256i, v);
             c += 8;
         }
+        // 4 宽尾段（色度/窄块）：4 个 u16 → 4 个 i32，一条 128 位载入 + 零扩展 + 存储。
+        if c + 4 <= n {
+            let s16 = _mm_loadl_epi64(p.offset(base + c as isize) as *const __m128i);
+            let s32 = _mm_cvtepu16_epi32(s16);
+            let v = match post_round {
+                0 => s32,
+                1 => _mm_slli_epi32::<1>(s32),
+                2 => _mm_slli_epi32::<2>(s32),
+                3 => _mm_slli_epi32::<3>(s32),
+                4 => _mm_slli_epi32::<4>(s32),
+                _ => s32,
+            };
+            _mm_storeu_si128(o.add(c) as *mut __m128i, v);
+            c += 4;
+        }
         c
     }
 
@@ -1025,6 +1040,21 @@ mod x86 {
                 };
                 _mm256_storeu_si256(o.add(k) as *mut __m256i, v);
                 k += 8;
+            }
+            // 4 宽尾段（色度/窄块）：与上面的 8 宽同一套移位，只是 128 位。
+            if k + 4 <= n {
+                let s16 = _mm_loadl_epi64(row.offset(base + k as isize) as *const __m128i);
+                let s32 = _mm_cvtepu16_epi32(s16);
+                let v = match post_round {
+                    0 => s32,
+                    1 => _mm_slli_epi32::<1>(s32),
+                    2 => _mm_slli_epi32::<2>(s32),
+                    3 => _mm_slli_epi32::<3>(s32),
+                    4 => _mm_slli_epi32::<4>(s32),
+                    _ => s32,
+                };
+                _mm_storeu_si128(o.add(k) as *mut __m128i, v);
+                k += 4;
             }
             c = k;
         }
