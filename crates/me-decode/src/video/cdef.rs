@@ -517,17 +517,82 @@ fn cdef_filter(
         y0 >= 2 && x0 >= 2 && y_lo_mi >= 0 && x_lo_mi >= 0 && y_hi_mi < mi_rows && x_hi_mi < mi_cols;
 
     // **SIMD**：两行 × 8 列一次算完，i16 通道（见 `simd::cdef_pair16`）。
-    // 除了 `interior`（保证 12 个候选在**帧的 4×4 网格内** ⇒ 值是正确的），
-    // 还要额外保证**取址**留在平面缓冲内：8 通道读最远到 `x0 + 9`（`dx ≤ 2` 再加 7 列），
-    // 行最远到 `y0 + h + 1`。色度（`w = 4`）只用前 4 个通道，另外 4 个读到的是右边的样本、
-    // 直接丢弃 —— 所以这里只判"读得到"，不判"用得上"。
+    //
+    // 2026-10-22：**右/下边界块也走 SIMD**。内核读的是平面缓冲，而平面在右侧/底部
+    // 有 72 样本的 padding，越界候选的读取是**可寻址**的；它们只会污染最右/最下
+    // 1~2 行/列的**输出**，这些像素随后用标量重算（越界候选不参与）。
+    // 左/上边界仍走标量：平面没有负向 padding。
     let cap_rows = (data.len() / stride) as i32;
-    let simd = interior
-        && super::simd::avx2_available()
+    let simd = super::simd::avx2_available()
+        && (interior || !super::flags::no_cdef_edge())
         && x0 >= 2
         && y0 >= 2
         && x0 + 9 < stride as i32
         && y0 + h as i32 + 1 < cap_rows;
+
+    // 候选最大外扩 2 个样本 ⇒ 从这一列/行起输出可能受越界候选影响。
+    let coded_w = (mi_cols << MI_SIZE_LOG2) >> sub_x;
+    let coded_h = (mi_rows << MI_SIZE_LOG2) >> sub_y;
+    let x_border = (coded_w - 2 - x0).clamp(0, w as i32) as usize;
+    let y_border = (coded_h - 2 - y0).clamp(0, h as i32) as usize;
+
+    // 标量逐像素：`fast` 只在"候选全在帧内"时走无检查路径（整块标量回退用）。
+    let filter_pixels = |xl: usize, xh: usize, yl: usize, yh: usize, fast: bool| {
+        for i in yl..yh {
+            let y = y0 as usize + i;
+            for j in xl..xh {
+                let x = x0 as usize + j;
+                let cur = i32::from(data[y * stride + x]);
+                let mut max = cur;
+                let mut min = cur;
+                let mut sum = 0i32;
+                for k in 0..2 {
+                    for sign in [-1i32, 1] {
+                        if fast {
+                            let [dy, dx] = CDEF_DIRECTIONS[dir][k];
+                            let py = (y as i32 + sign * dy) as usize;
+                            let px = (x as i32 + sign * dx) as usize;
+                            // SAFETY(逻辑)：fast 已保证 20 个候选都在平面缓冲内
+                            cdef_acc(
+                                i32::from(data[py * stride + px]),
+                                cur, pri_str, pri_adj, pri_taps[k], &mut sum, &mut max, &mut min,
+                            );
+                            for dir_off in [-2i32, 2] {
+                                let d = ((dir as i32 + dir_off) & 7) as usize;
+                                let [dy, dx] = CDEF_DIRECTIONS[d][k];
+                                let py = (y as i32 + sign * dy) as usize;
+                                let px = (x as i32 + sign * dx) as usize;
+                                cdef_acc(
+                                    i32::from(data[py * stride + px]),
+                                    cur, sec_str, sec_adj, sec_taps[k], &mut sum, &mut max, &mut min,
+                                );
+                            }
+                        } else {
+                            if let Some(p) = cdef_get_at(
+                                curr, plane, x0, y0, i as i32, j as i32, dir, k, sign, sub_x,
+                                sub_y, mi_rows, mi_cols,
+                            ) {
+                                cdef_acc(p, cur, pri_str, pri_adj, pri_taps[k], &mut sum, &mut max, &mut min);
+                            }
+                            for dir_off in [-2i32, 2] {
+                                let d = ((dir as i32 + dir_off) & 7) as usize;
+                                if let Some(s2) = cdef_get_at(
+                                    curr, plane, x0, y0, i as i32, j as i32, d, k, sign, sub_x,
+                                    sub_y, mi_rows, mi_cols,
+                                ) {
+                                    cdef_acc(s2, cur, sec_str, sec_adj, sec_taps[k], &mut sum, &mut max, &mut min);
+                                }
+                            }
+                        }
+                    }
+                }
+                let adjust = if sum < 0 { 1 } else { 0 };
+                let v = clip3(min, max, cur + ((8 + sum - adjust) >> 4));
+                sink.set(x, y, v);
+            }
+        }
+    };
+
     if simd {
         // 12 个候选的偏移（相对块左上角）与抽头：**只跟方向/强度有关**，
         // 与行无关 ⇒ 每块算一次。约定前 4 个是主抽头、后 8 个是次抽头。
@@ -568,9 +633,9 @@ fn cdef_filter(
         // 算 2 行 × **8** 列，而 4:2:0 的色度块只有 **4** 列 ⇒ 一半的通道白算。
         // `cdef_quad8` 一次算 **4 行 × 4 列**（4 个 qword），16 个通道全部用满，
         // 迭代次数从 `h/2` 降到 `h/4`。取址要求**更弱**（每行只读 4 个 u16）。
-        if w == 4 && h == 4 {
-            // SAFETY: 同上；`w == h == 4` 正是本分支的前提。
-            unsafe {
+        unsafe {
+            if w == 4 && h == 4 {
+                // SAFETY: 同上；`w == h == 4` 正是本分支的前提。
                 super::simd::cdef_quad8(
                     data,
                     stride as isize,
@@ -585,83 +650,36 @@ fn cdef_filter(
                     dptr,
                     dstride,
                 );
+            } else {
+                super::simd::cdef_pair16(
+                    data,
+                    stride as isize,
+                    x0 as isize,
+                    y0 as isize,
+                    h,
+                    w,
+                    &offs,
+                    &taps,
+                    pri_str,
+                    pri_adj as u32,
+                    sec_str,
+                    sec_adj as u32,
+                    dptr,
+                    dstride,
+                );
             }
-            return;
         }
-        unsafe {
-            super::simd::cdef_pair16(
-                data,
-                stride as isize,
-                x0 as isize,
-                y0 as isize,
-                h,
-                w,
-                &offs,
-                &taps,
-                pri_str,
-                pri_adj as u32,
-                sec_str,
-                sec_adj as u32,
-                dptr,
-                dstride,
-            );
+        // 边界条带用标量补算（右条带 + 下条带，二者不重叠）。
+        if x_border < w {
+            filter_pixels(x_border, w, 0, h, false);
+        }
+        if y_border < h {
+            filter_pixels(0, x_border, y_border, h, false);
         }
         return;
     }
 
-    for i in 0..h {
-        let y = y0 as usize + i;
-        for j in 0..w {
-            let x = x0 as usize + j;
-            let cur = i32::from(data[y * stride + x]);
-            let mut max = cur;
-            let mut min = cur;
-            let mut sum = 0i32;
-            for k in 0..2 {
-                for sign in [-1i32, 1] {
-                    if interior {
-                        let [dy, dx] = CDEF_DIRECTIONS[dir][k];
-                        let py = (y as i32 + sign * dy) as usize;
-                        let px = (x as i32 + sign * dx) as usize;
-                        // SAFETY(逻辑)：interior 已保证 20 个候选都在平面缓冲内
-                        cdef_acc(
-                            i32::from(data[py * stride + px]),
-                            cur, pri_str, pri_adj, pri_taps[k], &mut sum, &mut max, &mut min,
-                        );
-                        for dir_off in [-2i32, 2] {
-                            let d = ((dir as i32 + dir_off) & 7) as usize;
-                            let [dy, dx] = CDEF_DIRECTIONS[d][k];
-                            let py = (y as i32 + sign * dy) as usize;
-                            let px = (x as i32 + sign * dx) as usize;
-                            cdef_acc(
-                                i32::from(data[py * stride + px]),
-                                cur, sec_str, sec_adj, sec_taps[k], &mut sum, &mut max, &mut min,
-                            );
-                        }
-                    } else {
-                        if let Some(p) = cdef_get_at(
-                            curr, plane, x0, y0, i as i32, j as i32, dir, k, sign, sub_x, sub_y,
-                            mi_rows, mi_cols,
-                        ) {
-                            cdef_acc(p, cur, pri_str, pri_adj, pri_taps[k], &mut sum, &mut max, &mut min);
-                        }
-                        for dir_off in [-2i32, 2] {
-                            let d = ((dir as i32 + dir_off) & 7) as usize;
-                            if let Some(s2) = cdef_get_at(
-                                curr, plane, x0, y0, i as i32, j as i32, d, k, sign, sub_x,
-                                sub_y, mi_rows, mi_cols,
-                            ) {
-                                cdef_acc(s2, cur, sec_str, sec_adj, sec_taps[k], &mut sum, &mut max, &mut min);
-                            }
-                        }
-                    }
-                }
-            }
-            let adjust = if sum < 0 { 1 } else { 0 };
-            let v = clip3(min, max, cur + ((8 + sum - adjust) >> 4));
-            sink.set(x, y, v);
-        }
-    }
+    filter_pixels(0, w, 0, h, interior);
 }
 
 /// 累加一个候选样本（已把 `constrain` 的两个参数算好）。
