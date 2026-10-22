@@ -1055,7 +1055,7 @@ fn inverse_transform_2d_into(
     lossless: bool,
     residual: &mut Vec<i64>,
     residual32: &mut Vec<i32>,
-) -> Result<()> {
+) -> Result<bool> {
     let idx = tx_sz as usize;
     let w = TX_WIDTH[idx] as usize;
     let h = TX_HEIGHT[idx] as usize;
@@ -1135,14 +1135,9 @@ fn inverse_transform_2d_into(
                 )
             };
             if cols_done == w {
-                // 收窄回 i64 只是**位宽转换**（值域已由钳位/值域分析保证），不改变数值。
-                if residual.len() < w * h {
-                    residual.resize(w * h, 0);
-                }
-                for (d, s) in residual[..w * h].iter_mut().zip(res32.iter()) {
-                    *d = *s as i64;
-                }
-                return Ok(());
+                // 不再收窄成 i64：调用方（`inverse_transform_add` / `debug_inverse_only`）
+                // 直接读 `residual32`。值是规范值域内的 i32，扩宽只是位宽转换。
+                return Ok(true);
             }
         }
         // 形状不满足（理论上不会发生）⇒ 不猜，落回 i64 路径重算。
@@ -1247,7 +1242,7 @@ fn inverse_transform_2d_into(
             res[i * w + j] = round2(line[i], col_shift);
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// 诊断入口：只算反变换的残差（不写像素），给 coeff.rs 的 trace 用。
@@ -1260,7 +1255,7 @@ pub fn debug_inverse_only(
 ) -> Vec<i64> {
     let mut residual = Vec::new();
     let mut residual32 = Vec::new();
-    inverse_transform_2d_into(
+    let used32 = inverse_transform_2d_into(
         t,
         tx_sz,
         tx_type,
@@ -1269,10 +1264,10 @@ pub fn debug_inverse_only(
         &mut residual,
         &mut residual32,
     )
-    .unwrap_or_default();
+    .unwrap_or(false);
     // i32 路径只填 `residual32`：诊断入口统一转成 i64 返回。
     let n = residual_len(tx_sz);
-    if residual.len() < n {
+    if used32 {
         residual = residual32.iter().take(n).map(|v| *v as i64).collect();
     }
     // `inverse_transform_2d_into` 现在"只增不减"（见那里的说明）⇒ 返回前按形状截断，
@@ -1351,18 +1346,41 @@ pub fn inverse_transform_add(
         }
         return Ok(());
     }
-    let residual = {
-        inverse_transform_2d_into(
-            t,
-            tx_sz,
-            tx_type,
-            bit_depth,
-            lossless,
-            residual,
-            residual32,
-        )?;
-        &residual[..w * h]
-    };
+    let used32 = inverse_transform_2d_into(
+        t,
+        tx_sz,
+        tx_type,
+        bit_depth,
+        lossless,
+        residual,
+        residual32,
+    )?;
+    if used32 {
+        let res = &residual32[..w * h];
+        let (flip_ud, flip_lr) = flips(tx_type);
+        if !flip_ud && !flip_lr {
+            // 绝大多数是 DCT_DCT：按行取连续切片，编译器可把内层向量化。
+            for i in 0..h {
+                let p = &pred[i * w..i * w + w];
+                let r = &res[i * w..i * w + w];
+                let d = &mut dst[i * stride..i * stride + w];
+                for j in 0..w {
+                    d[j] = clip1(p[j] as i32 + r[j], bit_depth);
+                }
+            }
+        } else {
+            for i in 0..h {
+                let yy = if flip_ud { h - 1 - i } else { i };
+                for j in 0..w {
+                    let xx = if flip_lr { w - 1 - j } else { j };
+                    dst[yy * stride + xx] =
+                        clip1(pred[yy * w + xx] as i32 + res[i * w + j], bit_depth);
+                }
+            }
+        }
+        return Ok(());
+    }
+    let residual = &residual[..w * h];
 
     // 无损模式：规范要求 Residual 能用 1 + BitDepth 位有符号整数表示
     // （§7.12.4 的 conformance note）。超出说明码流/调用方有问题，如实报错。
@@ -1542,11 +1560,9 @@ mod tests {
                             }
                         }
                         crate::video::simd::FORCE_SCALAR.store(true, Ordering::Relaxed);
-                        let mut a = Vec::new();
-                        inverse_transform_2d_into(&t, ts, tg, bd, false, &mut a, &mut Vec::new()).unwrap();
+                        let a = super::debug_inverse_only(&t, ts, tg, bd, false);
                         crate::video::simd::FORCE_SCALAR.store(false, Ordering::Relaxed);
-                        let mut b = Vec::new();
-                        inverse_transform_2d_into(&t, ts, tg, bd, false, &mut b, &mut Vec::new()).unwrap();
+                        let b = super::debug_inverse_only(&t, ts, tg, bd, false);
                         assert_eq!(
                             a, b,
                             "SIMD 与标量不一致：tx_sz={ts} tx_type={tg} bd={bd} pattern={pattern}"
@@ -1565,11 +1581,9 @@ mod tests {
                 *v = ((k as u32 * 7 + pattern) % 9) as i32 - 4;
             }
             crate::video::simd::FORCE_SCALAR.store(true, Ordering::Relaxed);
-            let mut a = Vec::new();
-            inverse_transform_2d_into(&t, TX_4X4, DCT_DCT, 8, true, &mut a, &mut Vec::new()).unwrap();
+            let a = super::debug_inverse_only(&t, TX_4X4, DCT_DCT, 8, true);
             crate::video::simd::FORCE_SCALAR.store(false, Ordering::Relaxed);
-            let mut b = Vec::new();
-            inverse_transform_2d_into(&t, TX_4X4, DCT_DCT, 8, true, &mut b, &mut Vec::new()).unwrap();
+            let b = super::debug_inverse_only(&t, TX_4X4, DCT_DCT, 8, true);
             assert_eq!(a, b, "无损 WHT 的 SIMD 与标量不一致：pattern={pattern}");
             changed += 1;
         }

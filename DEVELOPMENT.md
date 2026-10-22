@@ -1317,6 +1317,16 @@ cargo test --workspace > /tmp/me.log 2>&1; echo "exit=$?"; grep -E "test result|
       **实测**（同一二进制、8 轮换序，CPU/100 帧）：中位 **6.81s vs 6.855s，
       约 −0.7%（5/8 轮更快）**。
 
+      51. **i32 残差不再扩宽，直接加回预测 —— −2.7%**（2026-10-23，第五十一刀）：
+      第四十五刀之后 i32 反变换算完又会把 `w·h` 个 i32 逐个扩宽成 i64 写进
+      `residual`，最终加法再读回来转 i32——一写一读全是白费。现在
+      `inverse_transform_2d_into` 返回 `bool`（true = 结果在 `residual32`），
+      `inverse_transform_add` 直接读 i32；非翻转块按行取连续切片，内层
+      `clip1(p + r)` 可被 LLVM 向量化，翻转类型走同一份带 flip 映射的标量循环。
+      `debug_inverse_only` 在自己的诊断副本上转回 i64，对外契约不变。
+      **实测**（同一二进制、8 轮换序，CPU/100 帧）：中位 **6.07s vs 6.24s，
+      −2.7%（7/8 轮更快）**。
+
     - **已知问题：帧右边界超块伸出区（`coded 宽不是 8 的倍数`时）**：当
       `FrameWidth % 8 != 0`，`MiCols*4 > FrameWidth`，最后一列超块会伸到帧右边界以外。
       参考实现里那块像素是**重建出来的**（帧缓冲的 border 承接），2026-10-03 起我们
