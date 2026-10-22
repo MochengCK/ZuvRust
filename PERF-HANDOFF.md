@@ -2797,3 +2797,25 @@ LR 桥”的成本；审计早已指出 MC 的 u8 源+加宽可能更慢，混�
 **预期**：中位 50ms → **约 36~40ms**（语法 14ms 与滤镜/回放重叠）；离 33ms 仍可能
 差一点，但这是单瓦片下最可能接近实时的一步。**风险**：帧生命周期/参考槽/CDF 存档
 与线程同步，属多轮改造，不能半途合并。
+
+### 第一步已完成（2026-10-23，`7ae6b39`）
+
+`decode_tile` 已拆成 `parse_tile`（返回 `PendingTile`：`BlockCtx` + row-mt 工单 +
+统计/exit 信息）与 `replay_tile`；`decode_tile` 保留为顺序包装，现有调用方不变。
+`mi_grid`/`lr` 不进入 `PendingTile`，用独立生命周期释放借用。
+
+验收：默认 / `ME_ROW_MT` / `ME_ROW_MT+PAR` / `ME_NO_SIMD` 四路 24 帧逐字节相同；
+`me-decode` 476 passed；默认路径 A/B 与 cut51 持平（甚至略快，噪声内）。
+
+### 第二轮要解决的（还没做）
+
+1. **`RefFrameStore` 的像素可变性**：`PendingTile` 里的 `BlockCtx` 长期持有
+   `&RefFrameStore`，而滤镜 N 结束后要 `store_pixels(N)`（`&mut`）——两者冲突。
+   需要把 `pixels` 放到内部可变容器（`RwLock` / `ArcSwap`），或拆成
+   “元数据视图（语法用，只读）+ 像素槽（内部可变）”。这是第二轮的核心改动。
+2. **两个 pending 帧**：`Av1Decoder` 现在只有一个 `pending: Option<PendingFrame>`；
+   需要“正在 parse 的 N+1”和“正在滤镜/回放的 N”两个状态 + 帧队列。
+3. **提交顺序**：`store.refresh()`（元数据）可提前到滤镜前；`store_pixels` /
+   `save_cdfs` 必须等滤镜完成；`replay N+1` 必须等 `store_pixels(N)`。
+4. **输出顺序**与 `show_existing_frame` / `show_frame=0` 的显示事件不能乱序。
+5. 验收仍是逐字节一致 + `PHASE` 里 tiles/filters 部分重叠；目标中位 50→36~40ms。
