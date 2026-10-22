@@ -604,6 +604,56 @@ fn cdef_filter(
     // u8 内点块：把 (w+2)×(h+2) 的窗口扩宽到 u16 临时缓冲，跑现有 SIMD 内核，
     // 再把输出收窄写回 u8 平面。边缘块仍走标量（越界候选要排除，见 `interior`）。
     // 这一步把 u8 的 CDEF 从"每像素 20 个候选的标量"换成整块向量化。
+    if is_u8 && interior && super::simd::avx2_available() && w == 8 {
+        // 亮度 8×8：原生 u8 内核直接读平面、直接写 CdefFrame（无 scratch）。
+        let mut offs = [0isize; super::simd::CDEF_CANDS];
+        let mut taps = [0i32; super::simd::CDEF_CANDS];
+        let mut n = 0usize;
+        for k in 0..2usize {
+            for sign in [-1i32, 1] {
+                let [dy, dx] = CDEF_DIRECTIONS[dir][k];
+                offs[n] = (sign * dy) as isize * stride as isize + (sign * dx) as isize;
+                taps[n] = pri_taps[k];
+                n += 1;
+            }
+        }
+        for k in 0..2usize {
+            for dir_off in [-2i32, 2] {
+                let d = ((dir as i32 + dir_off) & 7) as usize;
+                let [dy, dx] = CDEF_DIRECTIONS[d][k];
+                for sign in [-1i32, 1] {
+                    offs[n] = (sign * dy) as isize * stride as isize + (sign * dx) as isize;
+                    taps[n] = sec_taps[k];
+                    n += 1;
+                }
+            }
+        }
+        let (dptr, dstride, dy0, dy1) = sink.direct_u8();
+        debug_assert!(
+            y0 as usize >= dy0 && (y0 as usize + h) <= dy1,
+            "CDEF 的 u8 SIMD 路径要写出自己那段行了"
+        );
+        // SAFETY: interior 保证窗口在平面内；dptr/dstride 来自本 worker 的 sink。
+        unsafe {
+            super::simd::cdef_pair16_u8(
+                plane_ref.px8(),
+                stride as isize,
+                x0 as isize,
+                y0 as isize,
+                h,
+                w,
+                &offs,
+                &taps,
+                pri_str,
+                pri_adj as u32,
+                sec_str,
+                sec_adj as u32,
+                dptr,
+                dstride,
+            );
+        }
+        return;
+    }
     if is_u8 && interior && super::simd::avx2_available() {
         let sw = w + 4;
         let sh = h + 4;

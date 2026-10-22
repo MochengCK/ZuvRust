@@ -1192,6 +1192,100 @@ mod x86 {
         }
     }
 
+    /// [`cdef_pair16`] 的 **u8 源/目标版**（亮度 8×8，`ME_PLANE_U8`）。
+    ///
+    /// 算术与 u16 版逐条相同；候选加载是 `loadl_epi64 + cvtepu8_epi16`，
+    /// 写回是 `packus` 后的 8 字节。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn cdef_pair16_u8(
+        data: &[u8],
+        stride: isize,
+        x0: isize,
+        y0: isize,
+        h: usize,
+        wu: usize,
+        offs: &[isize; super::CDEF_CANDS],
+        taps: &[i32; super::CDEF_CANDS],
+        pri_thr: i32,
+        pri_adj: u32,
+        sec_thr: i32,
+        sec_adj: u32,
+        dst: *mut u8,
+        dst_stride: isize,
+    ) {
+        debug_assert_eq!(wu, 8, "u8 亮度内核只处理 8 宽");
+        let base = data.as_ptr();
+        let zero = _mm256_setzero_si256();
+        let one = _mm256_set1_epi16(1);
+        let eight = _mm256_set1_epi16(8);
+        let pri_t = _mm256_set1_epi16(pri_thr as i16);
+        let sec_t = _mm256_set1_epi16(sec_thr as i16);
+        let pri_s = _mm_cvtsi32_si128(pri_adj as i32);
+        let sec_s = _mm_cvtsi32_si128(sec_adj as i32);
+        let tap_v: [__m256i; super::CDEF_CANDS] =
+            std::array::from_fn(|c| _mm256_set1_epi16(taps[c] as i16));
+        let mut r = 0usize;
+        while r < h {
+            // `h` 为奇数时最后一行只算一次（高半读同一行）、只写一次。
+            let r1 = if r + 1 < h { r + 1 } else { r };
+            let off0 = (y0 + r as isize) * stride + x0;
+            let off1 = (y0 + r1 as isize) * stride + x0;
+            // SAFETY: 见函数文档的不变量（调用方保证整块 8 通道的取址都在缓冲内）
+            let cur = _mm256_set_m128i(
+                _mm_cvtepu8_epi16(_mm_loadl_epi64(base.offset(off1) as *const __m128i)),
+                _mm_cvtepu8_epi16(_mm_loadl_epi64(base.offset(off0) as *const __m128i)),
+            );
+            let mut acc = zero;
+            let mut mx = cur;
+            let mut mn = cur;
+            for c in 0..super::CDEF_CANDS {
+                let (thr, sh) = if c < 4 { (pri_t, pri_s) } else { (sec_t, sec_s) };
+                let cand = _mm256_set_m128i(
+                    _mm_cvtepu8_epi16(_mm_loadl_epi64(base.offset(off1 + offs[c]) as *const __m128i)),
+                    _mm_cvtepu8_epi16(_mm_loadl_epi64(base.offset(off0 + offs[c]) as *const __m128i)),
+                );
+                // `constrain( cand - cur, thr, adj )`（§7.15.3）：
+                //   sign(diff) · Clip3(0, |diff|, thr - (|diff| >> adj))
+                // `sign_epi16(t, diff)` 正好给"取符号、`diff == 0` 归零"，
+                // 与标量里 `sign = if diff < 0 { -1 } else { 1 }` 逐位一致
+                // （`diff == 0` 时 `mag == 0` ⇒ `t == 0`，谁乘都是 0）。
+                let diff = _mm256_sub_epi16(cand, cur);
+                let mag = _mm256_abs_epi16(diff);
+                let t = _mm256_sub_epi16(thr, _mm256_sra_epi16(mag, sh));
+                let t = _mm256_max_epi16(_mm256_min_epi16(t, mag), zero);
+                let val = _mm256_sign_epi16(t, diff);
+                acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(val, tap_v[c]));
+                mx = _mm256_max_epi16(mx, cand);
+                mn = _mm256_min_epi16(mn, cand);
+            }
+            // `adjust = sum < 0 ? 1 : 0`；`v = cur + ((8 + sum - adjust) >> 4)`
+            let adjust = _mm256_and_si256(_mm256_cmpgt_epi16(zero, acc), one);
+            let v = _mm256_add_epi16(
+                cur,
+                _mm256_srai_epi16::<4>(_mm256_add_epi16(_mm256_sub_epi16(eight, adjust), acc)),
+            );
+            // `Clip3(min, max, v)`：min/max 都来自合法样本 ⇒ 结果自然在 [0, 2^bd) 内
+            let v = _mm256_min_epi16(_mm256_max_epi16(v, mn), mx);
+            let lo = _mm256_castsi256_si128(v);
+            let lo8 = _mm_packus_epi16(lo, lo);
+            _mm_storel_epi64(
+                dst.offset((y0 + r as isize) * dst_stride + x0) as *mut __m128i,
+                lo8,
+            );
+            if r + 1 < h {
+                let hi = _mm256_extracti128_si256::<1>(v);
+                let hi8 = _mm_packus_epi16(hi, hi);
+                _mm_storel_epi64(
+                    dst.offset((y0 + r1 as isize) * dst_stride + x0) as *mut __m128i,
+                    hi8,
+                );
+            }
+            r += 2;
+        }
+    }
+
+
     /// **CDEF**（§7.15.3）一次滤完**四行 × 四列**（16 个 i16 通道，**全部用满**）。
     ///
     /// ## 为什么色度要单独一条（2026-10-05 第三十五轮）
@@ -3070,7 +3164,7 @@ unsafe fn vt_adst_output_permute<const I32: bool>(v: &mut [__m256i], n: u32) {
 #[allow(unused_imports)]
 pub(crate) use x86::{
     diffwtd_mask8,
-    cdef_pair16, cdef_quad8, deblock_edge4, inv_txfm_cols, inv_txfm_cols_i32, inv_txfm_rows,
+    cdef_pair16, cdef_pair16_u8, cdef_quad8, deblock_edge4, inv_txfm_cols, inv_txfm_cols_i32, inv_txfm_rows,
     inv_txfm_rows_i32,
     blend_avg8, blend_dist8, blend_masked8, blend_masked_u16in8, mc_delta8, mc_horiz8,
     mc_horiz16_8bpc, mc_horiz16_u8, mc_horiz_rows_8bpc, mc_shift8, mc_shift_row,
@@ -3367,6 +3461,27 @@ pub(crate) unsafe fn inv_txfm_cols_i32(
 //
 // ⚠️ 新增桩时必须逐个确认调用点确实带那道门：桩是**空实现**，一旦被真的调用，
 // 结果是"画面悄悄错一点点"，比编译不过危险得多。
+
+/// 非 x86_64：见 [`cdef_pair16_u8`]（`avx2_available()` 恒假 ⇒ 永不执行）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cdef_pair16_u8(
+    _data: &[u8],
+    _stride: isize,
+    _x0: isize,
+    _y0: isize,
+    _h: usize,
+    _wu: usize,
+    _offs: &[isize; CDEF_CANDS],
+    _taps: &[i32; CDEF_CANDS],
+    _pri_thr: i32,
+    _pri_adj: u32,
+    _sec_thr: i32,
+    _sec_adj: u32,
+    _dst: *mut u8,
+    _dst_stride: isize,
+) {
+}
 
 /// 非 x86_64 的去块桩（`avx2_available()` 恒假 ⇒ `deblock` 走标量 `filter_edge`）。
 #[cfg(not(target_arch = "x86_64"))]
