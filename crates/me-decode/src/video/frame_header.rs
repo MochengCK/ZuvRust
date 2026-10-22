@@ -738,6 +738,14 @@ impl RefFrameStore {
     /// （§7.20 的 `FrameStore[i] = LrFrame`；像素要先经环路滤波与超分上采样）。
     /// **按引用共享**存进被刷新的每个槽（零拷贝，见 [`RefFrameStore::pixels`] 的说明）。
     pub fn store_pixels(&mut self, refresh_flags: u8, frame: std::sync::Arc<CurrFrame>) {
+        // `ME_PLANE_U8` 的混合架构：当前帧用 u8，但参考帧统一存 u16 —— MC 内核
+        // 还没迁 u8，而且审计结论是"u8 源 + 加宽"会拖慢 MC。参考帧是只读的，
+        // 在这里做一次整帧扩宽，之后所有预测都走原来的 u16 内核。
+        let frame = if frame.planes[0].is_u8() {
+            std::sync::Arc::new(frame.to_u16_copy())
+        } else {
+            frame
+        };
         for i in 0..NUM_REF_FRAMES {
             if (refresh_flags >> i) & 1 == 1 {
                 self.pixels[i] = Some(std::sync::Arc::clone(&frame));
