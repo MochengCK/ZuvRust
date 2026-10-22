@@ -162,7 +162,17 @@ fn run_pass(
     }
 
     let p = &mut frame.planes[plane as usize];
-    let (ptr, stride, pw, ph, bd) = (p.px16_mut().as_mut_ptr(), p.stride, p.w as i32, p.h as i32, p.bit_depth);
+    let (ptr, stride, pw, ph, bd) = (
+        if p.is_u8() {
+            PlanePtr::U8(p.px8_mut().as_mut_ptr())
+        } else {
+            PlanePtr::U16(p.px16_mut().as_mut_ptr())
+        },
+        p.stride,
+        p.w as i32,
+        p.h as i32,
+        p.bit_depth,
+    );
     let mk = |band: Band| PlaneView {
         ptr,
         stride,
@@ -290,8 +300,14 @@ fn run_line(
 ///
 /// `get` 仍然照旧做帧内边界检查（越界是**真的错了**，要报错）；`set` 在 release 下
 /// 不做检查（规范保证落点都在帧内），两条都额外用 `debug_assert` 钉住"不越带"。
+#[derive(Clone, Copy)]
+enum PlanePtr {
+    U8(*mut u8),
+    U16(*mut u16),
+}
+
 struct PlaneView {
-    ptr: *mut u16,
+    ptr: PlanePtr,
     stride: usize,
     plane: u8,
     w: i32,
@@ -325,6 +341,19 @@ impl PlaneView {
         }
     }
 
+    #[inline(always)]
+    fn is_u8(&self) -> bool {
+        matches!(self.ptr, PlanePtr::U8(_))
+    }
+
+    #[inline(always)]
+    fn as_u16_ptr(&self) -> *mut u16 {
+        match self.ptr {
+            PlanePtr::U16(p) => p,
+            PlanePtr::U8(_) => unreachable!("u8 平面不能走 deblock 的 u16 SIMD 内核"),
+        }
+    }
+
     /// 读一个样本；越界返回错误（规范保证不会越界，越界说明前面读错了）。
     #[inline(always)]
     fn get(&self, x: i32, y: i32) -> Result<i32> {
@@ -346,7 +375,13 @@ impl PlaneView {
         );
         debug_assert!(self.in_band(x, y), "去块读到别人的带里了：({x},{y})");
         // SAFETY: 见 `get`；此处由调用方保证。
-        unsafe { *self.ptr.add(y as usize * self.stride + x as usize) as i32 }
+        let i = y as usize * self.stride + x as usize;
+        unsafe {
+            match self.ptr {
+                PlanePtr::U8(p) => i32::from(*p.add(i)),
+                PlanePtr::U16(p) => i32::from(*p.add(i)),
+            }
+        }
     }
 
     #[inline(always)]
@@ -358,8 +393,12 @@ impl PlaneView {
         debug_assert!(self.in_band(x, y), "去块写到别人的带里了：({x},{y})");
         let max = (1i32 << self.bit_depth) - 1;
         // SAFETY: 同 `get`；规范保证去块的落点都在帧内。
+        let i = y as usize * self.stride + x as usize;
         unsafe {
-            *self.ptr.add(y as usize * self.stride + x as usize) = v.clamp(0, max) as u16;
+            match self.ptr {
+                PlanePtr::U8(p) => *p.add(i) = v.clamp(0, max) as u8,
+                PlanePtr::U16(p) => *p.add(i) = v.clamp(0, max) as u16,
+            }
         }
     }
 }
@@ -557,12 +596,12 @@ fn loop_filter_edge(
     } else {
         xp >= 0 && xp + MI_SIZE < view.w && yp - need >= 0 && yp + need - 1 < view.h
     };
-    if simd_in_bounds && super::simd::avx2_available() && !flags::trace_dbl2() {
+    if simd_in_bounds && super::simd::avx2_available() && !view.is_u8() && !flags::trace_dbl2() {
         // SAFETY: 已判 AVX2；上面的 `simd_in_bounds` 就是 `deblock_edge4` 的安全前提
         // （读写全部在帧内、不越出所在行；转置加载多读的列也在这个界内）。
         unsafe {
             super::simd::deblock_edge4(
-                view.ptr,
+                view.as_u16_ptr(),
                 view.stride as isize,
                 view.bit_depth,
                 xp,
@@ -1078,7 +1117,7 @@ mod tests {
             let mut a = frame.planes.clone();
             let mut b = frame.planes.clone();
             let va = PlaneView {
-                ptr: a[0].px16_mut().as_mut_ptr(),
+                ptr: PlanePtr::U16(a[0].px16_mut().as_mut_ptr()),
                 stride: a[0].stride,
                 plane,
                 w: 32,
@@ -1087,7 +1126,7 @@ mod tests {
                 band: Band::Whole,
             };
             let vb = PlaneView {
-                ptr: b[0].px16_mut().as_mut_ptr(),
+                ptr: PlanePtr::U16(b[0].px16_mut().as_mut_ptr()),
                 stride: b[0].stride,
                 plane,
                 w: 32,
@@ -1114,7 +1153,7 @@ mod tests {
         let mut frame = CurrFrame::new(16, 16, false, false, 1, 8);
         frame.planes[0] = Plane::new(16, 16, 8);
         let view = PlaneView {
-            ptr: frame.planes[0].px16_mut().as_mut_ptr(),
+            ptr: PlanePtr::U16(frame.planes[0].px16_mut().as_mut_ptr()),
             stride: frame.planes[0].stride,
             plane: 0,
             w: 16,
@@ -1181,7 +1220,7 @@ mod tests {
         let mut frame = CurrFrame::new(16, 16, false, false, 1, 8);
         frame.planes[0] = plane;
         let view = PlaneView {
-            ptr: frame.planes[0].px16_mut().as_mut_ptr(),
+            ptr: PlanePtr::U16(frame.planes[0].px16_mut().as_mut_ptr()),
             stride: frame.planes[0].stride,
             plane: 0,
             w: 16,
@@ -1266,7 +1305,7 @@ mod tests {
         let orig = a.px16().to_vec();
 
         let va = PlaneView {
-            ptr: a.px16_mut().as_mut_ptr(),
+            ptr: PlanePtr::U16(a.px16_mut().as_mut_ptr()),
             stride: a.stride,
             plane,
             w: 64,

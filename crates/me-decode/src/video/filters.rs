@@ -42,6 +42,13 @@ pub fn decode_frame_wrapup(
     if let Some(d) = &dump_dir {
         super::lr::lr_dump(&frame, d, "predb", dump_n);
     }
+    // `ME_PLANE_U8`：重建是 u16，进入滤镜链之前转成 u8。后面的去块/CDEF/LR
+    // 都按 u8 平面处理（LR/超分暂时用桥接），参考帧存回 u16（store_pixels）。
+    let mut frame = if flags::plane_u8() && !frame.planes[0].is_u8() {
+        frame.to_u8_copy()
+    } else {
+        frame
+    };
     // §7.14 去块（原地修改 CurrFrame）
     let lf = &fh.params.loop_filter;
     if (lf.level[0] != 0 || lf.level[1] != 0) && !flags::no_deblock() {
