@@ -1319,10 +1319,25 @@ impl ResidualCtx<'_> {
         let frame = self.frame.as_mut().expect("调用前已判过 Some");
         let pred = scratch_len(pred, w * h);
         {
+            // 逐像素 `Plane::get` 每次都要在 u8/u16 两种存储之间分支 + 做边界断言；
+            // 这里按平面**分派一次**，然后整行切片拷贝。8bit 仍然要逐样本加宽到 u16。
             let p = frame.plane(plane);
-            for i in 0..h {
-                for j in 0..w {
-                    pred[i * w + j] = p.get(start_x as usize + j, start_y as usize + i);
+            let stride = p.stride;
+            let x0 = start_x as usize;
+            let y0 = start_y as usize;
+            if p.is_u8() {
+                let data = p.px8();
+                for i in 0..h {
+                    let row = &data[(y0 + i) * stride + x0..][..w];
+                    for (d, s) in pred[i * w..(i + 1) * w].iter_mut().zip(row) {
+                        *d = u16::from(*s);
+                    }
+                }
+            } else {
+                let data = p.px16();
+                for i in 0..h {
+                    pred[i * w..(i + 1) * w]
+                        .copy_from_slice(&data[(y0 + i) * stride + x0..][..w]);
                 }
             }
         }

@@ -1265,6 +1265,16 @@ cargo test --workspace > /tmp/me.log 2>&1; echo "exit=$?"; grep -E "test result|
       **下一刀候选**：CDEF 合计约 **25%**（`cdef_filter` 自身 9.6% + `cdef_pair16`
       5.8% + `cdef_quad8` 3.7% + `dir_accum` 3.0% + `apply` 3.2%）。
 
+      ㊻ **残差回写前的预测块拷贝按行切片 —— −4.7%**（2026-10-22，第四十六刀）：
+      `add_residual` 每块先把预测从平面拷进连续的 `pred` 缓冲，原来是逐像素
+      `Plane::get(x, y)` —— 每次都要在 u8/u16 两种存储之间分支 + 做边界断言。
+      改成**按平面分派一次** + 整行切片：u16 直接 `copy_from_slice`，u8 逐样本
+      加宽到 u16（LLVM 可向量化）。输出逐字节相同。
+      **实测**（cut45 PGO vs cut46 PGO，CPU 时间 / 100 帧 / 8 轮换序）：
+      中位 **7.03s vs 6.705s，−4.7%（8/8 轮更快）**；按同口径折算约 64 ms/帧。
+      **验收**：24/60 帧、`ME_NO_SIMD`、row-mt 并行逐字节相同；
+      workspace **1026 passed / 0 failed**。
+
     - **已知问题：帧右边界超块伸出区（`coded 宽不是 8 的倍数`时）**：当
       `FrameWidth % 8 != 0`，`MiCols*4 > FrameWidth`，最后一列超块会伸到帧右边界以外。
       参考实现里那块像素是**重建出来的**（帧缓冲的 border 承接），2026-10-03 起我们
