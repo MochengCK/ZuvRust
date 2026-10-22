@@ -596,6 +596,12 @@ fn loop_filter_edge(
     } else {
         xp >= 0 && xp + MI_SIZE < view.w && yp - need >= 0 && yp + need - 1 < view.h
     };
+    if simd_in_bounds && super::simd::avx2_available() && view.is_u8() && !flags::trace_dbl2() {
+        deblock_edge4_u8_scratch(
+            view, xp, yp, dx, dy, plane, filter_size, need, limit, blimit, thresh,
+        )?;
+        return Ok(());
+    }
     if simd_in_bounds && super::simd::avx2_available() && !view.is_u8() && !flags::trace_dbl2() {
         // SAFETY: 已判 AVX2；上面的 `simd_in_bounds` 就是 `deblock_edge4` 的安全前提
         // （读写全部在帧内、不越出所在行；转置加载多读的列也在这个界内）。
@@ -622,6 +628,80 @@ fn loop_filter_edge(
         // ⚠️ 这一行就是 `run_pass` 里"按行带/列带切"的**唯一依据**：
         // `sample_filter` 的读窗口只沿 `(dx, dy)` 铺开，所以 pass 0 只碰行、pass 1 只碰列。
         sample_filter(view, xp + dy * i, yp + dx * i, limit, blimit, thresh, dx, dy, filter_size)?;
+    }
+    Ok(())
+}
+
+/// u8 平面的去块边：把窗口扩宽到 u16 临时缓冲，跑现有 `deblock_edge4`，
+/// 再把结果收窄写回。只给 `simd_in_bounds` 的边用（窗口全在帧内）。
+#[allow(clippy::too_many_arguments)]
+fn deblock_edge4_u8_scratch(
+    view: &PlaneView,
+    xp: i32,
+    yp: i32,
+    dx: i32,
+    dy: i32,
+    plane: u8,
+    filter_size: i32,
+    need: i32,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+) -> Result<()> {
+    let load_pad = if need >= 7 {
+        8
+    } else if need >= 3 {
+        4
+    } else {
+        2
+    };
+    // 竖边：窗口是 4 行 × [xp-load_pad, xp-load_pad+w)；横边：2·need 行 × 4 列。
+    let (w, h, x0, y0) = if dy == 1 {
+        (4usize, (2 * need) as usize, 0i32, need)
+    } else {
+        let w = if need >= 7 { 16 } else if need >= 3 { 8 } else { 4 };
+        (w, 4usize, load_pad, 0i32)
+    };
+    let mut buf = [0u16; 16 * 16];
+    let src_x0 = if dy == 1 { xp } else { xp - load_pad };
+    let src_y0 = if dy == 1 { yp - need } else { yp };
+    for r in 0..h {
+        for c in 0..w {
+            let sx = src_x0 + c as i32;
+            let sy = src_y0 + r as i32;
+            buf[r * w + c] = if sx >= 0 && sy >= 0 && sx < view.w && sy < view.h {
+                view.get(sx, sy)? as u16
+            } else {
+                0
+            };
+        }
+    }
+    // SAFETY: 已判 AVX2；窗口按 `simd_in_bounds` 全在帧内，临时缓冲尺寸覆盖内核读写。
+    unsafe {
+        super::simd::deblock_edge4(
+            buf.as_mut_ptr(),
+            w as isize,
+            view.bit_depth,
+            x0,
+            y0,
+            dx,
+            dy,
+            plane,
+            filter_size,
+            need,
+            limit,
+            blimit,
+            thresh,
+        );
+    }
+    for r in 0..h {
+        for c in 0..w {
+            let sx = src_x0 + c as i32;
+            let sy = src_y0 + r as i32;
+            if sx >= 0 && sy >= 0 && sx < view.w && sy < view.h {
+                view.set(sx, sy, buf[r * w + c] as i32);
+            }
+        }
     }
     Ok(())
 }
