@@ -38,7 +38,7 @@ use std::sync::Arc;
 
 use me_container::Demuxer;
 use me_core::{CodecId, MediaError, MediaInfo, MediaKind, Packet, ReadAt, Result, Timebase, Track};
-use me_mux::{Interleaver, MkvMuxer, Mp4Muxer, TsMuxer};
+use me_mux::{AdtsMuxer, FlacMuxer, Interleaver, MkvMuxer, Mp4Muxer, TsMuxer};
 
 use crate::progress::Progress;
 
@@ -48,6 +48,12 @@ pub enum OutputContainer {
     MpegTs,
     Fmp4,
     Matroska,
+    /// `.webm`：Matroska 的受限子集（VP8/VP9/AV1 + Opus）。
+    WebM,
+    /// `.flac`：裸 FLAC，只能装声音。
+    Flac,
+    /// `.aac`：裸 ADTS，只能装 AAC 声音。
+    Adts,
 }
 
 impl OutputContainer {
@@ -60,8 +66,12 @@ impl OutputContainer {
             "mp4" | "m4s" | "m4v" | "mov" | "m4a" => Ok(OutputContainer::Fmp4),
             // `.mka` = 只有声音的 Matroska，容器规则完全一样
             "mkv" | "mka" => Ok(OutputContainer::Matroska),
+            "webm" => Ok(OutputContainer::WebM),
+            "flac" => Ok(OutputContainer::Flac),
+            "aac" | "adts" => Ok(OutputContainer::Adts),
             other => Err(MediaError::Unsupported(format!(
-                "不认识的输出容器 `.{other}`（支持 .ts / .mp4 / .m4s / .mov / .mkv / .mka）"
+                "不认识的输出容器 `.{other}`（支持 .ts / .mp4 / .m4s / .mov / .mkv / .mka / \
+                 .webm / .flac / .aac）"
             ))),
         }
     }
@@ -71,7 +81,18 @@ impl OutputContainer {
             OutputContainer::MpegTs => "mpeg-ts",
             OutputContainer::Fmp4 => "fmp4",
             OutputContainer::Matroska => "matroska",
+            OutputContainer::WebM => "webm",
+            OutputContainer::Flac => "flac",
+            OutputContainer::Adts => "adts",
         }
+    }
+
+    /// 这个容器本身**只能装声音**（`.flac` / `.aac`）。
+    ///
+    /// 裸音频流没有"轨"的概念，画面根本无处安放 ⇒ 遇到这类产物自动丢掉画面，
+    /// 而不是要求调用方先传 `--audio-only`（宿主并没有暴露那个开关）。
+    fn audio_only(self) -> bool {
+        matches!(self, OutputContainer::Flac | OutputContainer::Adts)
     }
 }
 
@@ -193,13 +214,22 @@ fn run(
     }
     // 「只留声音 / 只留画面」：把不要的那一路整个摘掉 —— 下游（输出轨、分段、
     // 采样映射）都是按这两个列表推的，摘掉即生效；未被映射的采样会被自然跳过。
-    match opts.tracks {
+    //
+    // `.flac` / `.aac` 这类**裸音频流**容器本身装不下画面，这里直接按"只留声音"处理：
+    // 不这么做，用户选个 .aac 就会被 check_codec_support 以"装不下 video"拒掉，
+    // 而"提取音轨"恰恰是他想要的。
+    let tracks = if container.audio_only() {
+        TrackChoice::AudioOnly
+    } else {
+        opts.tracks
+    };
+    match tracks {
         TrackChoice::Both => {}
         TrackChoice::AudioOnly => video_inputs.clear(),
         TrackChoice::VideoOnly => audio_inputs.clear(),
     }
     if video_inputs.is_empty() && audio_inputs.is_empty() {
-        return Err(MediaError::Container(match opts.tracks {
+        return Err(MediaError::Container(match tracks {
             TrackChoice::Both => "输入里既没有视频轨也没有音频轨，没有可合并的内容".into(),
             TrackChoice::AudioOnly => "输入里没有音频轨，没得可提取".into(),
             TrackChoice::VideoOnly => "输入里没有视频轨，没得可提取".into(),
@@ -523,8 +553,8 @@ fn check_codec_support(container: OutputContainer, tracks: &[Track]) -> Result<(
                 ),
                 _ => false,
             },
-            // Matroska：视频四种都认；音频除 FLAC 都认
-            //（FLAC 在 MKV 里要 `fLaC` 头形态的 CodecPrivate，转换还没做，见 me-mux/src/mkv.rs）
+            // Matroska：视频四种都认；音频除 Vorbis 都认
+            //（FLAC 的 `fLaC` 头由封装器从 `dfLa` 载荷转出来，见 me_container::flac_config）
             OutputContainer::Matroska => match t.kind {
                 MediaKind::Video => {
                     matches!(t.codec, CodecId::H264 | CodecId::H265 | CodecId::Av1 | CodecId::Vp9)
@@ -532,27 +562,59 @@ fn check_codec_support(container: OutputContainer, tracks: &[Track]) -> Result<(
                 MediaKind::Audio => matches!(
                     t.codec,
                     CodecId::Aac | CodecId::Mp3 | CodecId::Opus | CodecId::Ac3 | CodecId::Eac3
+                        | CodecId::Flac
                 ),
                 _ => false,
             },
+            // WebM 是 Matroska 的受限子集：VP8/VP9/AV1 + Opus（引擎没有 Vorbis）
+            OutputContainer::WebM => match t.kind {
+                MediaKind::Video => {
+                    matches!(t.codec, CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1)
+                }
+                MediaKind::Audio => matches!(t.codec, CodecId::Opus),
+                _ => false,
+            },
+            // 裸流：只能装一条，且编码必须完全对得上
+            OutputContainer::Flac => t.kind == MediaKind::Audio && t.codec == CodecId::Flac,
+            OutputContainer::Adts => t.kind == MediaKind::Audio && t.codec == CodecId::Aac,
         };
         if !ok {
             return Err(MediaError::Unsupported(format!(
-                "{} 装不下这条轨道：{} / {:?}",
+                "{} 装不下这条轨道：{} / {:?}{}",
                 container.name(),
                 t.codec.name(),
-                t.kind
+                t.kind,
+                match container {
+                    OutputContainer::WebM =>
+                        "（WebM 只允许 VP8 / VP9 / AV1 画面与 Opus 声音，换 .mkv 或 .mp4）",
+                    OutputContainer::Flac => "（裸 FLAC 只装 FLAC 声音，换 .mkv / .mp4 / .mka）",
+                    OutputContainer::Adts => "（裸 ADTS 只装 AAC 声音，换 .m4a / .mkv）",
+                    _ => "",
+                }
             )));
         }
+    }
+    // 裸流装不下第二条轨（产物里没有"轨"的概念，第二条只会是坏文件）
+    if matches!(container, OutputContainer::Flac | OutputContainer::Adts) && tracks.len() > 1 {
+        return Err(MediaError::Unsupported(format!(
+            "{} 只能装一条声音轨，这里有 {} 条",
+            container.name(),
+            tracks.len()
+        )));
     }
     Ok(())
 }
 
-/// 封装器的两种实现（对外只暴露"写一条采样"和"收尾"）。
+/// 封装器的几种实现（对外只暴露"写一条采样"和"收尾"）。
+///
+/// `.mkv` 与 `.webm` 共用一个变体：它们是同一个封装器，只差 `DocType`
+/// （在 [`Muxer::with_writer`] 里按容器设置）。
 enum Muxer {
     Ts(TsMuxer),
     Mp4(Mp4Muxer),
     Mkv(MkvMuxer),
+    Flac(FlacMuxer),
+    Adts(AdtsMuxer),
 }
 
 impl Muxer {
@@ -573,20 +635,34 @@ impl Muxer {
                 m.set_tracks(tracks)?;
                 Ok(Muxer::Mp4(m))
             }
-            OutputContainer::Matroska => {
-                let mut m = MkvMuxer::with_writer(writer);
+            OutputContainer::Matroska | OutputContainer::WebM => {
+                let mut m = if container == OutputContainer::WebM {
+                    MkvMuxer::with_writer_webm(writer)
+                } else {
+                    MkvMuxer::with_writer(writer)
+                };
                 // ⚠️ 必须在 `set_tracks`（它会把 `Info` 写进产物）**之前**设好
                 m.set_duration_hint_us(duration_hint_us);
                 m.set_tracks(tracks)?;
                 Ok(Muxer::Mkv(m))
             }
+            OutputContainer::Flac => {
+                let mut m = FlacMuxer::with_writer(writer);
+                m.set_tracks(tracks)?;
+                Ok(Muxer::Flac(m))
+            }
+            OutputContainer::Adts => {
+                let mut m = AdtsMuxer::with_writer(writer);
+                m.set_tracks(tracks)?;
+                Ok(Muxer::Adts(m))
+            }
         }
     }
 
-    /// 分片/簇的目标时长（微秒）。TS 没有分片概念，忽略。
+    /// 分片/簇的目标时长（微秒）。TS 与裸音频流没有分片概念，忽略。
     fn set_fragment_us(&mut self, us: i64) {
         match self {
-            Muxer::Ts(_) => {}
+            Muxer::Ts(_) | Muxer::Flac(_) | Muxer::Adts(_) => {}
             Muxer::Mp4(m) => m.set_fragment_duration_us(us),
             Muxer::Mkv(m) => m.set_cluster_duration_us(us),
         }
@@ -597,6 +673,8 @@ impl Muxer {
             Muxer::Ts(m) => m.write_packet(p),
             Muxer::Mp4(m) => m.write_packet(p),
             Muxer::Mkv(m) => m.write_packet(p),
+            Muxer::Flac(m) => m.write_packet(p),
+            Muxer::Adts(m) => m.write_packet(p),
         }
     }
 
@@ -606,6 +684,8 @@ impl Muxer {
             Muxer::Ts(m) => m.bytes_written(),
             Muxer::Mp4(m) => m.bytes_written(),
             Muxer::Mkv(m) => m.bytes_written(),
+            Muxer::Flac(m) => m.bytes_written(),
+            Muxer::Adts(m) => m.bytes_written(),
         }
     }
 
@@ -621,6 +701,14 @@ impl Muxer {
                 Ok(m.bytes_written())
             }
             Muxer::Mkv(mut m) => {
+                m.finish()?;
+                Ok(m.bytes_written())
+            }
+            Muxer::Flac(mut m) => {
+                m.finish()?;
+                Ok(m.bytes_written())
+            }
+            Muxer::Adts(mut m) => {
                 m.finish()?;
                 Ok(m.bytes_written())
             }

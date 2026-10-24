@@ -269,6 +269,122 @@ fn av1_with_flac_hires_merges_through_the_cli() {
 }
 
 #[test]
+fn flac_survives_the_matroska_path() {
+    // B 站 AV1 + Hi-Res(FLAC) 的另一种落点：用户把合并格式选成 MKV。
+    // 以前这里会以 "Matroska 里的 FLAC 需要 fLaC 头形态的 CodecPrivate" 失败。
+    let dir = tmp_dir("mkv-flac");
+    let v = dir.join("v.mp4");
+    let a = dir.join("a.flac.m4a");
+    write_av1_only(&v, 2);
+    write_flac_only(&a, 2, 192_000);
+    let out = dir.join("out.mkv");
+
+    let (ok, _stdout, stderr) = run(&[
+        "mux",
+        out.to_str().unwrap(),
+        v.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(ok, "AV1 + FLAC 合到 MKV 应当成功，stderr={stderr}");
+
+    let (ok2, probe, stderr2) = run(&["probe", out.to_str().unwrap(), "--json"]);
+    assert!(ok2, "probe 产物应当成功，stderr={stderr2}");
+    assert!(probe.contains("\"codec\":\"av1\""), "画面应当是 AV1：{probe}");
+    assert!(probe.contains("\"codec\":\"flac\""), "声音应当是 FLAC：{probe}");
+    assert!(probe.contains("\"sampleRate\":192000"), "Hi-Res 采样率要保住：{probe}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bare_flac_output_drops_the_video_automatically() {
+    // `.flac` 是裸音频流，装不下画面 ⇒ 引擎应当自动只留声音，
+    // 而不是要求调用方先传 `--audio-only`（宿主并没有暴露那个开关）
+    let dir = tmp_dir("flac-out");
+    let v = dir.join("v.mp4");
+    let a = dir.join("a.m4a");
+    write_av1_only(&v, 1);
+    write_flac_only(&a, 1, 96_000);
+    let out = dir.join("out.flac");
+
+    let (ok, stdout, stderr) = run(&[
+        "mux",
+        out.to_str().unwrap(),
+        v.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(ok, "导出 .flac 应当成功，stderr={stderr}");
+    assert!(stdout.contains("\"container\":\"flac\""), "{stdout}");
+
+    // 产物必须真的是裸 FLAC：魔数 + 能被 probe 认出来
+    let bytes = std::fs::read(&out).expect("产物应当存在");
+    assert_eq!(&bytes[..4], b"fLaC", "裸 FLAC 必须以 fLaC 开头");
+    let (ok2, probe, stderr2) = run(&["probe", out.to_str().unwrap(), "--json"]);
+    assert!(ok2, "probe 裸 FLAC 应当成功，stderr={stderr2}");
+    assert!(!probe.contains("kindName\":\"video\""), "裸 FLAC 里不该有画面：{probe}");
+    assert!(probe.contains("\"codec\":\"flac\""), "{probe}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bare_aac_output_wraps_each_frame_with_adts() {
+    let dir = tmp_dir("aac-out");
+    let a = dir.join("a.m4s");
+    let v = dir.join("v.m4s");
+    write_audio_only(&a, 1);
+    write_video_only(&v, 1);
+    let out = dir.join("out.aac");
+
+    let (ok, _, stderr) = run(&[
+        "mux",
+        out.to_str().unwrap(),
+        v.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(ok, "导出 .aac 应当成功，stderr={stderr}");
+
+    // 每一帧都要带 ADTS 同步字，且能被引擎自己的 ADTS 解封装器读出来
+    let bytes = std::fs::read(&out).expect("产物应当存在");
+    assert_eq!(bytes[0], 0xFF, "第一帧要有 ADTS 同步字");
+    assert_eq!(bytes[1] & 0xF0, 0xF0);
+    let (ok2, probe, stderr2) = run(&["probe", out.to_str().unwrap(), "--json"]);
+    assert!(ok2, "probe 裸 ADTS 应当成功，stderr={stderr2}");
+    assert!(probe.contains("\"codec\":\"aac\""), "{probe}");
+    assert!(!probe.contains("kindName\":\"video\""), "裸 ADTS 里不该有画面：{probe}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn webm_refuses_h264_before_writing_anything() {
+    // WebM 只认 VP8/VP9/AV1 + Opus。H.264 进去必须**在开工前**报错，
+    // 而不是产出一个"扩展名是 webm、浏览器却打不开"的文件。
+    let dir = tmp_dir("webm-h264");
+    let v = dir.join("v.mp4");
+    let a = dir.join("a.mp4");
+    write_video_only(&v, 1);
+    write_audio_only(&a, 1);
+    let out = dir.join("out.webm");
+
+    let (ok, _stdout, stderr) = run(&[
+        "mux",
+        out.to_str().unwrap(),
+        v.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(!ok, "H.264 → WebM 必须失败");
+    assert!(stderr.contains("WebM"), "错误里要说清是 WebM 装不下：{stderr}");
+    assert!(!out.exists(), "失败时不许留下半截产物");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
 fn a_single_input_is_a_valid_remux() {
     let dir = tmp_dir("remux");
     let v = dir.join("v.mp4");

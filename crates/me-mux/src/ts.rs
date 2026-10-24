@@ -20,6 +20,7 @@
 
 use me_core::{ByteWriter, CodecId, MediaError, MediaKind, Packet, Result, Timebase, Track};
 
+use crate::adts::{adts_header, is_adts};
 use crate::convert;
 use crate::sink::Sink;
 
@@ -443,38 +444,6 @@ fn emit_payload(out: &mut Sink, pid: u16, cc: &mut u8, payload: &[u8]) -> Result
         }
     }
     Ok(())
-}
-
-/// 这段数据是不是已经是 ADTS 帧（带同步字）。
-fn is_adts(data: &[u8]) -> bool {
-    data.len() >= 2 && data[0] == 0xFF && (data[1] & 0xF0) == 0xF0
-}
-
-/// 由 AudioSpecificConfig 合成 ADTS 头（7 字节，无 CRC）。
-fn adts_header(asc: &[u8], payload_len: usize) -> Option<Vec<u8>> {
-    if asc.len() < 2 {
-        return None;
-    }
-    let aot = (asc[0] >> 3) & 0x1F;
-    let sf_index = ((asc[0] & 0x07) << 1) | (asc[1] >> 7);
-    let channels = (asc[1] >> 3) & 0x0F;
-    if aot == 0 || sf_index >= 13 {
-        return None;
-    }
-    let frame_len = 7 + payload_len;
-    if frame_len > 0x1FFF {
-        return None; // ADTS 的长度字段只有 13 位
-    }
-    let profile = (aot - 1) & 0x03;
-    Some(vec![
-        0xFF,
-        0xF1, // MPEG-4, layer 0, protection_absent
-        (profile << 6) | (sf_index << 2) | ((channels >> 2) & 0x01),
-        ((channels & 0x03) << 6) | ((frame_len >> 11) as u8 & 0x03),
-        ((frame_len >> 3) & 0xFF) as u8,
-        (((frame_len & 0x07) as u8) << 5) | 0x1F,
-        0xFC,
-    ])
 }
 
 /// 90kHz 刻度 → 微秒（给上层算进度用）。

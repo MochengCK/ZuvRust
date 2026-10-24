@@ -192,3 +192,54 @@ cd /tmp && python3 -m http.server 8912 --bind 127.0.0.1 &
 最终改名用同一个扩展名）。⚠️ 「下载最大分辨率/码率」这一项**没做**：
 引擎支持 `--max-height`/`--max-bandwidth`，但宿主的下载走下载引擎（XferRust），
 媒体引擎这条链上没有调用点 —— 要做先把"下载要不要经媒体引擎取流"这件事定下来。
+
+---
+
+## 七、合并输出再扩三种 + MKV 晚到轨崩溃（2026-10-25）
+
+**状态**：输出容器从 `fMP4 / TS / MKV` 扩到 **`.mp4 .m4s .mov .m4a / .ts .m2ts / .mkv .mka /
+.webm / .flac / .aac`**；**FLAC in MKV 从"明确拒绝"变成支持**。全量 1054 项通过，
+真素材（109 MB，AV1 1080p + AAC）合到 `.mkv` 后逐轨载荷哈希与源一致。
+
+### 1. FLAC：`dfLa` ↔ `fLaC` 的唯一转换处
+
+新增 `me-container/src/flac_config.rs`（与 `opus_config.rs` 同一条纪律：**引擎内部只认 `dfLa`
+载荷**，容器层读入时规范化、写出时转回去）：
+
+- `dfla_to_flac_header()` —— 写 MKV `CodecPrivate` / 裸 `.flac` 头；
+- `flac_header_to_dfla()` —— MKV 读侧把 `fLaC` 还原成 `dfLa`；
+- 两条必须记住：`dfLa` 是 **FullBox**（前 4 字节是 version+flags，不能多写一层）；输出的
+  **"最后一块"标志要重算**（输入常不给，不补就会把音频帧当元数据块头继续解析）。
+- 也**兜住"只有 34 字节裸 STREAMINFO"**的输入；缺魔数 / 缺 STREAMINFO 都给带原因的报错。
+- MKV 读侧 `codec_of()` 补 `A_FLAC`，`me-mux` 的 `codec_id_of()` 补 `(Audio, Flac) => "A_FLAC"`
+  （原先这里直接 return Err）；`convert_sample` 对 FLAC 原样搬。
+
+### 2. WebM：同一个封装器，只换 `DocType` 与白名单
+
+`MkvMuxer` 新增 `set_doc_type(DocType)` / `with_writer_webm()` / `new_webm()`：
+`.webm` 写 `DocType=webm`、版本 2/2；`ensure_webm_codec()` 在 `set_tracks` 阶段就拦
+H.264 / AAC —— 否则会产出"扩展名是 webm、浏览器打不开"的文件。同时补了
+`V_VP8` 映射与 VP8 的透传。
+
+### 3. 裸音频流：`.flac` 与 `.aac`
+
+新增 `me-mux/src/flac.rs`（`FlacMuxer`）与 `me-mux/src/adts.rs`（`AdtsMuxer`），
+API 与 `Mp4Muxer` 对齐（`set_tracks` / `write_packet` / `finish` / `bytes_written`）。
+`.flac` / `.aac` 本身没有"轨"的概念 ⇒ `OutputContainer::audio_only()` 让 CLI **自动只留声音**，
+不要求调用方传 `--audio-only`（宿主没暴露那个开关）。
+ADTS 头生成从 `ts.rs` 搬到 `adts.rs`（`is_adts` / `adts_header`），TS 侧改为 `use crate::adts::*`。
+
+### 4. ⚠️ 修掉的真 bug：MKV 被"晚到的轨"打崩
+
+真素材的**最后一个分片是畸形巨片**（579 KB `moof` + 14.8 MB `mdat`，装了 768 秒音频），
+解封装器一口气吐 **36053 条音频** ⇒ 音频比画面晚到几十秒。旧切簇判据只看"往后超没超"：
+
+- 晚到的采样被塞进旧簇 ⇒ 块内相对时间戳 **-33 s**；
+- `flush_cluster` 里只有 `debug_assert!` ⇒ **debug 构建 panic、release 构建静默截断**成垃圾。
+
+修法：`cluster_start_us` 改为**簇内最早 pts**，新增 `cluster_end_us`，切簇判据用**双向跨度**；
+越界时**返回 Err**（不再 assert / 不再截断）。回归测试
+`a_track_that_arrives_late_does_not_break_the_cluster`。
+
+⚠️ **遗留**：这类输入仍会让产物里某一轨整体晚到（簇的时间序不完美）。根治要把合并侧的
+"按输入轮询"改成"按轨公平拉取"，那需要缓冲几十秒媒体数据，本轮**故意没做**。

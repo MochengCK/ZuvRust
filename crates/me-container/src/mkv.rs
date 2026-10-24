@@ -29,9 +29,10 @@
 //!
 //! ## 明确不支持的（宁可报错，不产出坏文件）
 //!
-//! - **Vorbis**：引擎没有它的解码器，`CodecId` 里也没有这个变体；
-//! - **FLAC in MKV**：`CodecPrivate` 是 `fLaC` 头 + 元数据块序列，与引擎内部的
-//!   `dfLa` 载荷形态不同，转换还没做。
+//! - **Vorbis**：引擎没有它的解码器，`CodecId` 里也没有这个变体。
+//!
+//! FLAC **已支持**：`CodecPrivate` 是 `fLaC` 头 + 元数据块序列，读入时就地规范化成
+//! 引擎内部的 `dfLa` 载荷形态（见 [`crate::flac_config`]，与 Opus 同一条纪律）。
 //!
 //! 字幕轨与非音视频轨**直接跳过**（`.mkv` 带字幕是常态，不该因此整个读不了）；
 //! 但**一条能用的音视频轨都没有**时仍然报错。
@@ -256,6 +257,7 @@ fn codec_of(id: &str) -> Option<CodecId> {
         "A_MPEG/L3" => CodecId::Mp3,
         "A_AC3" => CodecId::Ac3,
         "A_EAC3" => CodecId::Eac3,
+        "A_FLAC" => CodecId::Flac,
         _ => return None,
     })
 }
@@ -496,7 +498,7 @@ impl MkvDemuxer {
 
         let codec = codec_of(&codec_id).ok_or_else(|| {
             MediaError::Unsupported(format!(
-                "这个 Matroska 里的 `{codec_id}` 引擎还不支持（Vorbis 与 FLAC-in-MKV 都还没做）"
+                "这个 Matroska 里的 `{codec_id}` 引擎还不支持（Vorbis 还没做）"
             ))
         })?;
 
@@ -508,8 +510,15 @@ impl MkvDemuxer {
         };
 
         let id = self.info.tracks.len() as u32 + 1;
+        let is_flac = codec == CodecId::Flac;
         let mut t = Track::new(id, kind, codec, Timebase::new(1000));
-        t.extradata = private;
+        // FLAC 的 `CodecPrivate` 是 `fLaC` + 元数据块，而引擎内部统一用 `dfLa` 载荷形态
+        // ⇒ 就地规范化（与 Opus 的 `OpusHead` 同一条纪律，见 `flac_config`）。
+        t.extradata = if is_flac {
+            crate::flac_config::flac_header_to_dfla(&private)?
+        } else {
+            private
+        };
         t.width = width;
         t.height = height;
         t.sample_rate = sample_rate;

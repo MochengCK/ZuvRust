@@ -15,19 +15,23 @@
 //! - 产物要么是**正确的**，要么**报错** —— 绝不静默产出坏文件；
 //! - 封装器**直写落点**（见 [`sink`]）：产物不攒在内存里，内存占用与产物大小无关。
 
+pub mod adts;
 pub mod convert;
+pub mod flac;
 pub mod interleave;
 pub mod mkv;
 pub mod mp4;
 pub mod sink;
 pub mod ts;
 
+pub use adts::AdtsMuxer;
 pub use convert::{
     annexb_to_avcc, annexb_to_avcc_extradata, avcc_to_annexb, avcc_to_annexb_extradata,
     extradata_to_annexb, extradata_to_avcc, looks_like_avcc, nal_length_size,
 };
+pub use flac::FlacMuxer;
 pub use interleave::{interleave_all, Interleaver};
-pub use mkv::MkvMuxer;
+pub use mkv::{DocType, MkvMuxer};
 pub use mp4::Mp4Muxer;
 pub use sink::Sink;
 pub use ts::TsMuxer;

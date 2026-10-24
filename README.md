@@ -36,6 +36,17 @@
 
 **容器**：MPEG-TS、ISO BMFF（mp4 / mov / m4s）、Matroska / WebM（mkv / webm）、Ogg、FLAC、ADTS、MPEG 音频
 
+**合并输出**（按扩展名选封装器，编码不被目标容器支持时**明确报错**，绝不产出坏文件）：
+
+| 扩展名 | 容器 | 装得下的编码 |
+| --- | --- | --- |
+| `.mp4` `.m4s` `.mov` `.m4a` | 分片 fMP4 | H.264 / H.265 / AV1 / VP9 + AAC / MP3 / FLAC / Opus / AC-3 |
+| `.mkv` `.mka` | Matroska | 上面全部 |
+| `.webm` | WebM（Matroska 子集） | **仅** VP8 / VP9 / AV1 + Opus |
+| `.ts` `.m2ts` | MPEG-TS | H.264 / H.265 + AAC / MP3 / AC-3 |
+| `.flac` | 裸 FLAC（只有声音） | 仅 FLAC，自动丢掉画面 |
+| `.aac` | 裸 ADTS（只有声音） | 仅 AAC，自动丢掉画面 |
+
 **协议**：HTTP(S)、HLS、DASH
 
 **编码标识**（容器里认得出，用于写 `stsd` / `PMT`）：

@@ -358,11 +358,19 @@ cargo test --workspace > /tmp/me.log 2>&1; echo "exit=$?"; grep -E "test result|
 - `remux` 需要目标容器支持该编解码器：TS 里 AAC 要带 ADTS、fMP4 里是裸帧，
   这个转换由 muxer 负责（已实现，TS→fMP4→TS 往返有测试）。
 - 合并/转封装的输出容器：**fMP4（`.mp4/.m4s/.mov/.m4a`）、MPEG-TS（`.ts`）、
-  Matroska（`.mkv/.mka`）**；`mux` 支持 `--fragment-ms=<毫秒>`（分片/簇时长）与
-  `--audio-only` / `--video-only`（轨选择：提取音轨 / 丢掉音轨）。宿主侧对应
-  「设置 → 视频」的四项（合并格式 / 分片时长 / 解码线程数 / **解码方式**三档：
-  自适应 / 仅硬解 / 仅软解 → `ME_DECODE`，旧名 `ME_NO_HW` 仍等价于"仅软解"）；
-  MKV 里 **FLAC 明确拒绝**（`fLaC` 形态的 CodecPrivate 转换未做）。
+  Matroska（`.mkv/.mka`）、WebM（`.webm`）、裸 FLAC（`.flac`）、裸 ADTS（`.aac`）**；
+  `mux` 支持 `--fragment-ms=<毫秒>`（分片/簇时长）与 `--audio-only` / `--video-only`
+  （轨选择：提取音轨 / 丢掉音轨）。宿主侧对应「设置 → 视频」的四项（合并格式 /
+  分片时长 / 解码线程数 / **解码方式**三档：自适应 / 仅硬解 / 仅软解 → `ME_DECODE`，
+  旧名 `ME_NO_HW` 仍等价于"仅软解"）。
+  - **WebM 是 Matroska 的受限子集**：只允许 VP8 / VP9 / AV1 画面与 Opus 声音，
+    其它编码在 `set_tracks` 阶段就明确报错（否则会产出"扩展名是 webm、浏览器
+    打不开"的文件）。`DocType` 写 `webm`、版本号 2/2。
+  - **`.flac` / `.aac` 是裸音频流**：容器本身没有"轨"的概念 ⇒ 引擎自动只留声音
+    （调用方不必再传 `--audio-only`），且只能装一条轨。
+  - **FLAC in MKV 已支持**：`CodecPrivate` 要 `fLaC` 头形态，引擎内部是 `dfLa` 载荷，
+    转换收在 `me-container/src/flac_config.rs`（唯一转换处，与 Opus 的
+    `OpusHead`/`dOps` 同一条纪律），读入时规范化、写出时转回去。
 - fMP4 封装支持 **H.264 / H.265 / AV1 / VP9 + AAC / MP3 / FLAC / Opus / AC-3**
   （各自有 `avcC` / `hvcC` / `av1C` / `vpcC` / `esds` / `dfLa` / `dOps` / `dac3` 配置盒，
   见 `me-mux/src/mp4.rs` 的 `write_stsd`）。
@@ -400,7 +408,8 @@ cargo test --workspace > /tmp/me.log 2>&1; echo "exit=$?"; grep -E "test result|
      profile / 位深猜错的 `vpcC` 出去）。要支持这类文件，得补"从第一帧帧头推导
      profile / 位深 / 色彩"的转换 —— 文档里那条 handoff 仍然有效。
   2. Matroska 的 VP9 `CodecPrivate` **就是** `vpcC` 的载荷，有它的文件零转换可用。
-  - 另外 **Vorbis 与 FLAC-in-MKV 还不支持**：前者引擎没有解码器、`CodecId` 里也没有
+  - 另外 **Vorbis 还不支持**：引擎没有解码器、`CodecId` 里也没有这个变体。
+    （FLAC-in-MKV 2026-10-25 已支持，见 `me-container/src/flac_config.rs`。）
     这个变体；后者的 `CodecPrivate`（`fLaC` 头 + 元数据块序列）与内部的 `dfLa` 载荷
     形态不同，转换还没做。两者都会**明确报错**（并指出是哪个 CodecID），不会静默跳过。
   - 字幕轨与非音视频轨**直接跳过**（`.mkv` 带字幕是常态）；一条能用的轨都没有时才报错。

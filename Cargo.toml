@@ -21,6 +21,10 @@ opt-level = 3
 lto = "thin"
 codegen-units = 1
 debug = false
+# 2026-10-25 补：darwin-x64 实测 5,431,184 → 4,521,896 字节（−909 KB / −16.7%），
+# 代价是 panic 回溯里只剩地址。同仓库的 XferRust 早就开了 strip，这里漏了 ——
+# 两个引擎一起装进桌面端，漏这一行等于每个安装包白背 0.9 MB。
+strip = true
 panic = "unwind"
 
 # 测试也走优化：单测里有几处是"逐样本对拍"的长循环，debug 档慢到不想跑，

@@ -17,10 +17,11 @@
 //! 3. **块里的时间戳是"呈现时间"（pts）** —— 与 fMP4 的 `trun`（dts + cto 偏移）不同。
 //! 4. **H.264 / H.265 的采样是长度前缀布局**（`CodecPrivate` = `avcC`/`hvcC` 载荷），
 //!    与 fMP4 同一条转换；AV1（OBU）与 VP9 原样搬；AAC 要剥 `ADTS`。
-//! 5. **FLAC 明确拒绝**：Matroska 要求 `CodecPrivate` 是 `fLaC` 头 + 元数据块序列，
-//!    而引擎内部是 fMP4 形态的 `dfLa` 载荷 —— 形态转换还没做。宁可报错，也不产出一个
-//!    "有数据但解不出来"的文件（我们的读取侧同样明确拒绝 FLAC-in-MKV）。
-//! 6. **关键帧位（`SimpleBlock` 的 0x80）要如实写**：视频按 `Packet::keyframe`，
+//! 5. **FLAC 的 `CodecPrivate` 是 `fLaC` 头**，而引擎内部存的是 `dfLa` 载荷 ⇒
+//!    写之前先转换（`me_container::flac_config`）；帧数据原样搬。
+//! 6. **`.webm` 用同一个封装器**，只换 `DocType` 与编码白名单（VP8/VP9/AV1 +
+//!    Opus），见 [`DocType`] 与 [`ensure_webm_codec`]。
+//! 7. **关键帧位（`SimpleBlock` 的 0x80）要如实写**：视频按 `Packet::keyframe`，
 //!    音频全部置位（音频帧都是关键帧）。与 fMP4 的 `sidx` 同一道理，**不许无条件
 //!    写"是关键帧"** —— 那会让 seek 到 Cluster 中间直接解码出花屏。
 
@@ -152,18 +153,13 @@ fn codec_id_of(t: &Track) -> Result<&'static str> {
         (MediaKind::Video, CodecId::H265) => "V_MPEGH/ISO/HEVC",
         (MediaKind::Video, CodecId::Av1) => "V_AV1",
         (MediaKind::Video, CodecId::Vp9) => "V_VP9",
+        (MediaKind::Video, CodecId::Vp8) => "V_VP8",
         (MediaKind::Audio, CodecId::Aac) => "A_AAC",
         (MediaKind::Audio, CodecId::Opus) => "A_OPUS",
         (MediaKind::Audio, CodecId::Mp3) => "A_MPEG/L3",
         (MediaKind::Audio, CodecId::Ac3) => "A_AC3",
         (MediaKind::Audio, CodecId::Eac3) => "A_EAC3",
-        (MediaKind::Audio, CodecId::Flac) => {
-            return Err(MediaError::Unsupported(
-                "Matroska 里的 FLAC 需要 `fLaC` 头形态的 CodecPrivate（引擎内部是 fMP4 的 \
-                 `dfLa` 载荷），这个转换还没做 —— 换 fMP4/TS 产物，或先转成别的容器"
-                    .into(),
-            ))
-        }
+        (MediaKind::Audio, CodecId::Flac) => "A_FLAC",
         (kind, codec) => {
             return Err(MediaError::Unsupported(format!(
                 "Matroska 封装暂不支持 {kind:?} 的 {}",
@@ -171,6 +167,27 @@ fn codec_id_of(t: &Track) -> Result<&'static str> {
             )))
         }
     })
+}
+
+/// WebM 是 Matroska 的**受限子集**：只认 VP8 / VP9 / AV1 画面与 Opus / Vorbis 声音。
+///
+/// 不在这里拦一道的话，`.webm` 会静默产出"H.264 + AAC"的文件 —— 扩展名与
+/// DocType 都说 WebM，浏览器却不认里面的编码，症状是"能打开但黑屏/没声音"。
+fn ensure_webm_codec(t: &Track) -> Result<()> {
+    let ok = match t.kind {
+        MediaKind::Video => matches!(t.codec, CodecId::Vp8 | CodecId::Vp9 | CodecId::Av1),
+        MediaKind::Audio => matches!(t.codec, CodecId::Opus),
+        _ => false,
+    };
+    if ok {
+        return Ok(());
+    }
+    Err(MediaError::Unsupported(format!(
+        "WebM 装不下 {} / {:?}：WebM 只允许 VP8 / VP9 / AV1 画面与 Opus 声音。\
+         换成 `.mkv` 或 `.mp4`（它们什么都能装）",
+        t.codec.name(),
+        t.kind
+    )))
 }
 
 /// `OpusHead` 的 pre-skip（采样数）→ `CodecDelay`（纳秒）。
@@ -200,15 +217,51 @@ struct Sample {
 struct EsTrack {
     track: Track,
     codec_id: &'static str,
+    /// 要写进 `CodecPrivate` 的字节。
+    ///
+    /// 大多数编码就是 `track.extradata` 原样；**FLAC 例外**：引擎内部是 `dfLa`
+    /// 载荷，而 Matroska 要 `fLaC` 头（见 `me_container::flac_config`）。
+    codec_private: Vec<u8>,
     nal_len: u8,
     samples: Vec<Sample>,
     last_pts_us: Option<i64>,
+}
+
+/// Matroska 的「文档类型」：`.mkv` 与 `.webm` 用的是**同一个封装器**，
+/// 差别只有 `DocType` 字符串与"允许哪些编码"（WebM 是 Matroska 的受限子集）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DocType {
+    /// `.mkv` / `.mka`：什么都能装。
+    Matroska,
+    /// `.webm`：只允许 VP8 / VP9 / AV1 + Opus / Vorbis（本引擎没有 Vorbis）。
+    WebM,
+}
+
+impl DocType {
+    fn name(self) -> &'static str {
+        match self {
+            DocType::Matroska => "matroska",
+            DocType::WebM => "webm",
+        }
+    }
+
+    /// (DocTypeVersion, DocTypeReadVersion)。
+    ///
+    /// WebM 规范钉的是 2/2；Matroska 这边我们用 4/2（4 是从 `DefaultDuration`
+    /// 那一代开始的版本号，写 4 更符合实际用到的元素）。
+    fn versions(self) -> (u64, u64) {
+        match self {
+            DocType::Matroska => (4, 2),
+            DocType::WebM => (2, 2),
+        }
+    }
 }
 
 /// Matroska 封装器（API 与 [`crate::Mp4Muxer`] 对齐，CLI 里两个容器可以互换）。
 pub struct MkvMuxer {
     tracks: Vec<EsTrack>,
     sink: Sink,
+    doc_type: DocType,
     cluster_us: i64,
     header_written: bool,
     packets_written: u64,
@@ -216,7 +269,12 @@ pub struct MkvMuxer {
     /// 时间轴基准（微秒）：`None` = 由第一条采样决定（合并时每段从头归零）。
     base_us: Option<i64>,
     /// 当前 Cluster 的起点（微秒）。`i64::MAX` = 空簇。
+    ///
+    /// ⚠️ 它是簇内**最早**的 pts，不是"第一条采样"的 pts —— 采样可能乱序到达
+    /// （见 `write_packet` 的注释），若拿第一条当基准，晚到的采样会算出负偏移。
     cluster_start_us: i64,
+    /// 当前 Cluster 里最晚的 pts（微秒）。与 `cluster_start_us` 一起决定"该不该切"。
+    cluster_end_us: i64,
     /// `Info.Duration` 的**提示值**（微秒）。
     ///
     /// 流式直写时总时长本来是不知道的（与 fMP4 的 `mvhd.duration = 0` 同一个道理），
@@ -238,6 +296,13 @@ impl MkvMuxer {
         Self::with_sink(Sink::mem())
     }
 
+    /// 内存落点的 `.webm` 封装器（测试用）。
+    pub fn new_webm() -> Self {
+        let mut m = Self::new();
+        m.set_doc_type(DocType::WebM);
+        m
+    }
+
     /// 直写目标：产物**不驻留内存**（大文件合并走这条）。
     pub fn with_writer(w: Box<dyn Write + Send>) -> Self {
         Self::with_sink(Sink::writer(w))
@@ -247,14 +312,29 @@ impl MkvMuxer {
         Self {
             tracks: Vec::new(),
             sink,
+            doc_type: DocType::Matroska,
             cluster_us: DEFAULT_CLUSTER_US,
             header_written: false,
             packets_written: 0,
             clusters_written: 0,
             base_us: None,
             cluster_start_us: i64::MAX,
+            cluster_end_us: i64::MIN,
             duration_hint_us: None,
         }
+    }
+
+    /// 切换文档类型（`.mkv` ↔ `.webm`）。**必须在 `set_tracks` 之前调用**：
+    /// `DocType` 是 `EBML` 头的一部分，写完就定型了。
+    pub fn set_doc_type(&mut self, doc_type: DocType) {
+        self.doc_type = doc_type;
+    }
+
+    /// `.webm` 封装器（受限的 Matroska，见 [`DocType::WebM`]）。
+    pub fn with_writer_webm(w: Box<dyn Write + Send>) -> Self {
+        let mut m = Self::with_writer(w);
+        m.set_doc_type(DocType::WebM);
+        m
     }
 
     /// 给 `Info.Duration` 一个提示值（微秒，见字段说明）。
@@ -290,6 +370,15 @@ impl MkvMuxer {
         self.tracks.clear();
         for t in tracks {
             let codec_id = codec_id_of(t)?;
+            if self.doc_type == DocType::WebM {
+                ensure_webm_codec(t)?;
+            }
+            // FLAC：`dfLa` 载荷 → `fLaC` 头（Matroska/WebM 的 CodecPrivate 要后者）
+            let codec_private = if t.codec == CodecId::Flac {
+                me_container::flac_config::dfla_to_flac_header(&t.extradata)?
+            } else {
+                t.extradata.clone()
+            };
             let nal_len = if matches!(t.kind, MediaKind::Video) && !t.extradata.is_empty() {
                 convert::nal_length_size(&t.codec, &t.extradata)
             } else {
@@ -298,6 +387,7 @@ impl MkvMuxer {
             self.tracks.push(EsTrack {
                 track: t.clone(),
                 codec_id,
+                codec_private,
                 nal_len,
                 samples: Vec::new(),
                 last_pts_us: None,
@@ -336,9 +426,14 @@ impl MkvMuxer {
                 )));
             }
         }
-        // 本簇装不下这条（超目标时长，或临近 i16 毫秒上限）⇒ 先把已有的一簇落盘
+        // 本簇装不下这条 ⇒ 先把已有的一簇落盘。
+        //
+        // ⚠️ 判据必须**双向**：既看"往后超了目标时长"，也看"这条比簇里最早的还早"。
+        // 后者不是理论情况 —— 真实素材里出现过解封装器一口气吐出 768 秒音频
+        // （源文件最后一个分片是畸形巨片），音频于是比画面晚到 30 秒；
+        // 只判"往后"的话这些晚到的采样会被塞进旧簇，块内相对时间戳变成负数。
         if self.cluster_start_us != i64::MAX {
-            let span = pts_us - self.cluster_start_us;
+            let span = (pts_us.max(self.cluster_end_us) - pts_us.min(self.cluster_start_us)).abs();
             if span >= self.cluster_us || span >= MAX_CLUSTER_US {
                 self.flush_cluster()?;
             }
@@ -346,7 +441,10 @@ impl MkvMuxer {
         // 空簇：起点由这一条决定（**当前簇的起点**，不是全片起点）
         if self.cluster_start_us == i64::MAX {
             self.cluster_start_us = pts_us;
+            self.cluster_end_us = pts_us;
         }
+        self.cluster_start_us = self.cluster_start_us.min(pts_us);
+        self.cluster_end_us = self.cluster_end_us.max(pts_us);
         let data = self.convert_sample(idx, p)?;
         let t = &mut self.tracks[idx];
         t.samples.push(Sample { pts_us, keyframe: p.keyframe, data });
@@ -376,7 +474,11 @@ impl MkvMuxer {
         let kind = self.tracks[idx].track.kind;
         let codec = self.tracks[idx].track.codec.clone();
         match kind {
-            MediaKind::Video if matches!(codec, CodecId::Av1 | CodecId::Vp9) => Ok(p.data.clone()),
+            MediaKind::Video
+                if matches!(codec, CodecId::Av1 | CodecId::Vp9 | CodecId::Vp8) =>
+            {
+                Ok(p.data.clone())
+            }
             MediaKind::Video => {
                 let nal_len = self.tracks[idx].nal_len;
                 if me_container::codec::split_annexb(&p.data).is_empty() {
@@ -398,9 +500,10 @@ impl MkvMuxer {
         ebml.extend_from_slice(&el_uint(ID_EBML_READ_VERSION, 1));
         ebml.extend_from_slice(&el_uint(ID_EBML_MAX_ID_LENGTH, 4));
         ebml.extend_from_slice(&el_uint(ID_EBML_MAX_SIZE_LENGTH, 8));
-        ebml.extend_from_slice(&el_str(ID_DOC_TYPE, "matroska"));
-        ebml.extend_from_slice(&el_uint(ID_DOC_TYPE_VERSION, 4));
-        ebml.extend_from_slice(&el_uint(ID_DOC_TYPE_READ_VERSION, 2));
+        ebml.extend_from_slice(&el_str(ID_DOC_TYPE, self.doc_type.name()));
+        let (doc_version, read_version) = self.doc_type.versions();
+        ebml.extend_from_slice(&el_uint(ID_DOC_TYPE_VERSION, doc_version));
+        ebml.extend_from_slice(&el_uint(ID_DOC_TYPE_READ_VERSION, read_version));
         let mut out = el(ID_EBML, &ebml);
 
         let mut info = el_uint(ID_TIMESTAMP_SCALE, TIMESTAMP_SCALE_NS);
@@ -432,6 +535,7 @@ impl MkvMuxer {
         }
         if self.tracks.iter().all(|t| t.samples.is_empty()) {
             self.cluster_start_us = i64::MAX;
+            self.cluster_end_us = i64::MIN;
             return Ok(());
         }
         // 簇基准（毫秒，向下取整；负值夹到 0 —— 时间轴已归零，负的只可能是重排余量）
@@ -451,10 +555,16 @@ impl MkvMuxer {
             let t = &self.tracks[ti];
             let s = &t.samples[si];
             let rel_ms = pts_us.div_euclid(1000) - cluster_ts_ms;
-            debug_assert!(
-                (-32_768..=32_767).contains(&rel_ms),
-                "块内相对时间戳越出 i16（{rel_ms} ms）：Cluster 该提前切"
-            );
+            // 超出 i16 就**报错**，不能靠 `as i16` 截断：那会把时间戳静默变成
+            // 一个看似合法的大负数，产物能生成但播放器一跳到这段就错位。
+            // 切簇判据已经把跨度压到 cluster_us（2 秒）以内，走到这里说明调用方
+            // 送进来的时间轴本身有问题（比如两条轨的时基差了一个数量级）。
+            if !(-32_768..=32_767).contains(&rel_ms) {
+                return Err(MediaError::Container(format!(
+                    "簇内相对时间戳 {rel_ms} ms 超出 i16（簇基准 {cluster_ts_ms} ms，样本 {pts_us} us）：\
+                     时间轴异常，拒绝产出坏文件"
+                )));
+            }
             let mut blk = vint(Some(t.track.id as u64));
             blk.extend_from_slice(&(rel_ms as i16).to_be_bytes());
             // 关键帧位：视频如实写、音频恒为关键帧（见模块抬头第 6 条）
@@ -469,6 +579,7 @@ impl MkvMuxer {
             t.samples.clear();
         }
         self.cluster_start_us = i64::MAX;
+        self.cluster_end_us = i64::MIN;
         self.clusters_written += 1;
         Ok(())
     }
@@ -483,8 +594,8 @@ fn track_entry(t: &EsTrack) -> Vec<u8> {
     e.extend_from_slice(&el_uint(ID_TRACK_TYPE, track_type));
     e.extend_from_slice(&el_uint(ID_FLAG_LACING, 0));
     e.extend_from_slice(&el_str(ID_CODEC_ID, t.codec_id));
-    if !track.extradata.is_empty() {
-        e.extend_from_slice(&el(ID_CODEC_PRIVATE, &track.extradata));
+    if !t.codec_private.is_empty() {
+        e.extend_from_slice(&el(ID_CODEC_PRIVATE, &t.codec_private));
     }
     if track.codec == CodecId::Opus {
         if let Some(delay) = opus_codec_delay_ns(&track.extradata) {
@@ -550,7 +661,19 @@ mod tests {
         let mut t = Track::new(3, MediaKind::Audio, CodecId::Flac, Timebase::new(48_000));
         t.sample_rate = 48_000;
         t.channels = 2;
+        t.extradata = flac_dfla();
         t
+    }
+
+    /// `dfLa` 载荷：version/flags + STREAMINFO 块（48 kHz / 2 声道 / 16 bit）。
+    fn flac_dfla() -> Vec<u8> {
+        let mut si = vec![0u8; 34];
+        let w = (48_000u32 << 12) | (1u32 << 9) | (15u32 << 4);
+        si[10..14].copy_from_slice(&w.to_be_bytes());
+        let mut v = vec![0, 0, 0, 0];
+        v.extend_from_slice(&[0x80, 0x00, 0x00, 34]);
+        v.extend_from_slice(&si);
+        v
     }
 
     /// 一条视频采样（Annex-B，起始码 + NAL 类型 + 载荷）。
@@ -704,13 +827,101 @@ mod tests {
     }
 
     #[test]
-    fn flac_is_rejected_with_a_clear_message() {
-        let err = MkvMuxer::new()
-            .set_tracks(&[flac_track()])
-            .expect_err("FLAC 在 MKV 里还没做，必须明确拒绝");
+    fn webm_uses_its_own_doc_type_and_rejects_foreign_codecs() {
+        // 同一个封装器，DocType 不同：`.webm` 必须写 "webm"，Matroska 写 "matroska"
+        let mut m = MkvMuxer::new_webm();
+        let mut t = video_track();
+        t.codec = CodecId::Vp9; // WebM 允许的编码
+        t.extradata.clear();
+        m.set_tracks(&[t]).expect("VP9 应当能进 WebM");
+        m.write_packet(&video_packet(0, true)).unwrap();
+        let bytes = m.finish().unwrap();
+        assert!(
+            bytes.windows(4).any(|w| w == b"webm"),
+            "DocType 必须是 webm"
+        );
+
+        // H.264 不能进 WebM：要在 set_tracks 就报错，而不是写出一个浏览器打不开的文件
+        let err = MkvMuxer::new_webm()
+            .set_tracks(&[video_track()])
+            .expect_err("H.264 + WebM 必须明确拒绝");
         let msg = format!("{err}");
-        assert!(msg.contains("FLAC"), "要说清是哪种编码：{msg}");
-        assert!(msg.contains("CodecPrivate"), "要说清缺的是什么：{msg}");
+        assert!(msg.contains("WebM") && msg.contains("VP8"), "{msg}");
+    }
+
+    #[test]
+    fn a_track_that_arrives_late_does_not_break_the_cluster() {
+        // 真实素材踩出来的：源文件最后一个分片是畸形巨片（579 KB 的 moof 装着
+        // 768 秒音频），解封装器一口气吐出三万条音频 ⇒ 音频比画面晚到几十秒。
+        // 旧的切簇判据只看"往后超了没"，这些晚到的采样被塞进旧簇，块内相对
+        // 时间戳变成 -33 秒（debug 构建 panic、release 构建静默截断成垃圾）。
+        let mut m = MkvMuxer::new();
+        m.set_tracks(&[video_track(), audio_track()]).unwrap();
+        // 先灌 40 秒画面（没有任何音频）
+        for i in 0..40 * 25 {
+            m.write_packet(&video_packet(i as i64 * 40, i % 25 == 0)).unwrap();
+        }
+        // 再灌 40 秒音频（迟到的那一路）
+        for i in 0..40 * 47 {
+            m.write_packet(&Packet::new(2, i * 21, i * 21, 21, vec![0x11, 0x22])).unwrap();
+        }
+        let bytes = m.finish().expect("晚到的轨道不该让封装失败");
+
+        let mut d = open(bytes);
+        let mut v = 0;
+        let mut a = 0;
+        while let Some(p) = d.next_packet().expect("读采样") {
+            match p.track_id {
+                1 => v += 1,
+                2 => a += 1,
+                _ => {}
+            }
+        }
+        assert_eq!(v, 40 * 25, "画面一条都不能丢");
+        assert_eq!(a, 40 * 47, "晚到的音频也要一条不少地写进去");
+    }
+
+    #[test]
+    fn flac_round_trips_through_matroska() {
+        // FLAC in MKV：`CodecPrivate` 要 `fLaC` 头形态，而引擎内部是 `dfLa` 载荷。
+        // 写的时候转出去、读回来再转回来，两个形态必须逐字节对齐 —— 否则
+        // 产物"能生成但解不出来"。
+        let mut m = MkvMuxer::new();
+        m.set_tracks(&[flac_track()]).unwrap();
+        for i in 0..5 {
+            let frame = vec![0xFF, 0xF8, 0x69, 0x08, 0x00, i as u8, 0xAA];
+            m.write_packet(&Packet::new(3, i * 4096, i * 4096, 4096, frame)).unwrap();
+        }
+        let bytes = m.finish().unwrap();
+
+        // 产物里应当出现 A_FLAC 与 fLaC 头
+        assert!(
+            bytes.windows(6).any(|w| w == b"A_FLAC"),
+            "CodecID 必须是 A_FLAC"
+        );
+        assert!(
+            bytes.windows(4).any(|w| w == b"fLaC"),
+            "CodecPrivate 必须是 fLaC 头（不是 dfLa 载荷）"
+        );
+
+        // 读回来：extradata 必须重新变成 dfLa 载荷（引擎内部形态）
+        let mut d = open(bytes);
+        let info = d.info();
+        assert_eq!(info.tracks.len(), 1);
+        assert_eq!(info.tracks[0].codec, CodecId::Flac);
+        assert_eq!(info.tracks[0].sample_rate, 48_000);
+        assert_eq!(info.tracks[0].channels, 2);
+        assert_eq!(
+            info.tracks[0].extradata,
+            flac_dfla(),
+            "读回来要还原成 dfLa 载荷（否则解码器拿到的形态就错了）"
+        );
+
+        let mut n = 0;
+        while d.next_packet().expect("读采样").is_some() {
+            n += 1;
+        }
+        assert_eq!(n, 5, "FLAC 帧要原样搬过去");
     }
 
     #[test]
