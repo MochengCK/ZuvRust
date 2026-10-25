@@ -473,6 +473,8 @@ mod x86 {
         );
         let mul = _mm256_set1_epi16(super::horiz_round_mul(round));
         let add = _mm256_set1_epi16(super::horiz_round_add(round));
+        // 边界块的钳位窗口（[`MAX_SB_SIZE`] + 6）；只有 `!interior_x` 会用到。
+        let mut scratch = [0u16; 136];
         for r in 0..h {
             // 行下标**现算**，不收 `&[usize]`：调用方为它开一个
             // `[0usize; MAX_SB_SIZE + 16]` 的数组就等于每次调用先把 1.1 KB 清零
@@ -524,12 +526,53 @@ mod x86 {
                 }
                 continue;
             }
+            // ── 边界块（`!interior_x`）：把窗口**钳位复制到栈上**，再走同一条 SIMD ──
+            //
+            // 原来整行逐样本标量（每像素 8 次"钳位 + 乘加"）。行宽 ≤ 128 ⇒ 窗口
+            // ≤ 134 个样本；先把 `[base-3, base+wu+3)` 钳位拷进 scratch，后面的
+            // 16 宽 / 8 宽 / 标量尾都从 scratch 读，**语义与逐样本钳位逐位相同**。
+            // （真素材上边界块约占 MC 横向时间的 3%。）
+            if crate::video::flags::no_horiz_edge_simd() {
+                while c < wu {
+                    let bc = base + c as isize;
+                    let mut s = 0i32;
+                    for (t, k) in coef.iter().enumerate() {
+                        let sx = (bc + t as isize - 3).clamp(0, last_x as isize) as usize;
+                        s += *k as i32 * i32::from(*row.add(sx));
+                    }
+                    *out_row.add(c) = rnd_scalar(s, round) as i16;
+                    c += 1;
+                }
+                continue;
+            }
+            let n = wu + 6;
+            debug_assert!(n <= 136, "边界块的钳位窗口超出栈缓冲");
+            for i in 0..n {
+                let sx = (base + i as isize - 3).clamp(0, last_x as isize) as usize;
+                scratch[i] = *row.add(sx);
+            }
+            let sc = scratch.as_ptr();
+            while c + 16 <= wu {
+                let p = sc.add(c);
+                let mut acc = _mm256_set1_epi16(super::HORIZ16_BIAS);
+                for (t, cvv) in cv.iter().enumerate() {
+                    let s = _mm256_loadu_si256(p.add(t) as *const __m256i);
+                    acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(s, *cvv));
+                }
+                _mm256_storeu_si256(
+                    out_row.add(c) as *mut __m256i,
+                    _mm256_add_epi16(_mm256_mulhrs_epi16(acc, mul), add),
+                );
+                c += 16;
+            }
+            while c + 8 <= wu {
+                mc_horiz8_8bpc(sc, (c + 3) as isize, coef, round, out_row.add(c));
+                c += 8;
+            }
             while c < wu {
-                let bc = base + c as isize;
                 let mut s = 0i32;
                 for (t, k) in coef.iter().enumerate() {
-                    let sx = (bc + t as isize - 3).clamp(0, last_x as isize) as usize;
-                    s += *k as i32 * i32::from(*row.add(sx));
+                    s += *k as i32 * i32::from(*sc.add(c + t));
                 }
                 *out_row.add(c) = rnd_scalar(s, round) as i16;
                 c += 1;
@@ -648,6 +691,464 @@ mod x86 {
         }
     }
 
+    /// **纵向 8 抽头 + 直接写 u16 平面**（单参考、8bit 的直写路径）。
+    ///
+    /// 与 [`Self::mc_vert_rows_8bpc`] 的算术**逐位相同**（同一串 `pmaddwd` 累加、
+    /// 同一取整），只是把"i32 中间缓冲"换成"取整 → 钳到 `[0, max]` → `packus` →
+    /// 一次 32 字节写进目标平面"。省掉的是：
+    ///
+    /// * 整块 `w·h·4` 字节的暂存写（1080p 一帧几 MB），
+    /// * 以及之后"再读一遍 i32、逐行钳位、转 u16、写平面"的整趟拷贝。
+    ///
+    /// 钳位在这里做（`packus` 只饱和到 0..65535，8bit 还要收到 `max`）。
+    ///
+    /// # Safety
+    /// - 必须已确认 AVX2 可用。
+    /// - `inter` 至少 `(h+7) * wu` 项；`dst` 起址之后每一行 `[0, wu)` 可写
+    ///   （`dst_stride` 是平面步长，`dst` 已含块的 `(x, y)` 偏移）。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn mc_vert_rows_u16(
+        inter: &[i16],
+        wu: usize,
+        h: usize,
+        coef: &[i16; 8],
+        round: u32,
+        max: i32,
+        dst: *mut u16,
+        dst_stride: isize,
+    ) {
+        let ip = inter.as_ptr();
+        let vmax = _mm256_set1_epi32(max);
+        let zero = _mm256_setzero_si256();
+        let pairs: [__m256i; 4] = std::array::from_fn(|j| {
+            _mm256_set1_epi32(((coef[2 * j + 1] as u16 as i32) << 16) | (coef[2 * j] as u16 as i32))
+        });
+        let clamp = |v: __m256i| _mm256_min_epi32(_mm256_max_epi32(v, zero), vmax);
+        for r in 0..h {
+            let base = ip.add(r * wu);
+            let out_row = dst.offset(r as isize * dst_stride);
+            let mut c = 0usize;
+            while c + 16 <= wu {
+                let mut lo_acc = _mm256_setzero_si256();
+                let mut hi_acc = _mm256_setzero_si256();
+                for (j, pair) in pairs.iter().enumerate() {
+                    let t = 2 * j;
+                    let a = _mm256_loadu_si256(base.add(t * wu + c) as *const __m256i);
+                    let b = _mm256_loadu_si256(base.add((t + 1) * wu + c) as *const __m256i);
+                    lo_acc = _mm256_add_epi32(
+                        lo_acc,
+                        _mm256_madd_epi16(_mm256_unpacklo_epi16(a, b), *pair),
+                    );
+                    hi_acc = _mm256_add_epi32(
+                        hi_acc,
+                        _mm256_madd_epi16(_mm256_unpackhi_epi16(a, b), *pair),
+                    );
+                }
+                // 累加器的通道顺序是 `{0..4, 8..12}` / `{4..8, 12..16}`，
+                // 先按 128 位道拼回 0..16，再 `packus` + `permute4x64(0xD8)` 排好序。
+                let lo = clamp(rnd(lo_acc, round));
+                let hi = clamp(rnd(hi_acc, round));
+                let v0 = _mm256_permute2x128_si256::<0x20>(lo, hi);
+                let v1 = _mm256_permute2x128_si256::<0x31>(lo, hi);
+                let packed = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi32(v0, v1));
+                _mm256_storeu_si256(out_row.add(c) as *mut __m256i, packed);
+                c += 16;
+            }
+            let pairs128: [__m128i; 4] = std::array::from_fn(|j| {
+                _mm_set1_epi32(
+                    ((coef[2 * j + 1] as u16 as i32) << 16) | (coef[2 * j] as u16 as i32),
+                )
+            });
+            let vmax128 = _mm_set1_epi32(max);
+            let zero128 = _mm_setzero_si128();
+            let clamp128 =
+                |v: __m128i| _mm_min_epi32(_mm_max_epi32(v, zero128), vmax128);
+            while c + 8 <= wu {
+                let mut lo_acc = _mm_setzero_si128();
+                let mut hi_acc = _mm_setzero_si128();
+                for (j, pair) in pairs128.iter().enumerate() {
+                    let t = 2 * j;
+                    let a = _mm_loadu_si128(base.add(t * wu + c) as *const __m128i);
+                    let b = _mm_loadu_si128(base.add((t + 1) * wu + c) as *const __m128i);
+                    lo_acc =
+                        _mm_add_epi32(lo_acc, _mm_madd_epi16(_mm_unpacklo_epi16(a, b), *pair));
+                    hi_acc =
+                        _mm_add_epi32(hi_acc, _mm_madd_epi16(_mm_unpackhi_epi16(a, b), *pair));
+                }
+                let lo = clamp128(rnd128(lo_acc, round));
+                let hi = clamp128(rnd128(hi_acc, round));
+                _mm_storeu_si128(
+                    out_row.add(c) as *mut __m128i,
+                    _mm_packus_epi32(lo, hi),
+                );
+                c += 8;
+            }
+            while c + 4 <= wu {
+                let mut acc = _mm_setzero_si128();
+                for (j, pair) in pairs128.iter().enumerate() {
+                    let t = 2 * j;
+                    let a = _mm_loadl_epi64(base.add(t * wu + c) as *const __m128i);
+                    let b = _mm_loadl_epi64(base.add((t + 1) * wu + c) as *const __m128i);
+                    acc = _mm_add_epi32(acc, _mm_madd_epi16(_mm_unpacklo_epi16(a, b), *pair));
+                }
+                let v = clamp128(rnd128(acc, round));
+                _mm_storel_epi64(
+                    out_row.add(c) as *mut __m128i,
+                    _mm_packus_epi32(v, v),
+                );
+                c += 4;
+            }
+            while c < wu {
+                let mut s = 0i32;
+                for (t, k) in coef.iter().enumerate() {
+                    s += *k as i32 * i32::from(*ip.add((r + t) * wu + c));
+                }
+                *out_row.add(c) = rnd_scalar(s, round).clamp(0, max) as u16;
+                c += 1;
+            }
+        }
+    }
+
+    /// **纵向两路 + AVERAGE 混合融合**（复合 AVERAGE、8bit、不缩放）。
+    ///
+    /// 输入是两路各自的横向中间量（i16），输出直接是目标平面的 u16：
+    /// `Clip1(Round2(p0 + p1, 1 + InterPostRound))`，其中 `p = Round2(Σ fy·mid, InterRound1)`。
+    /// 与"两路各跑一遍 `mc_vert_rows_8bpc` 写 i32、再 `blend_avg8`"逐位相同，
+    /// 但**两路中间结果都不落内存**（省掉 2×(4B 写 + 4B 读) 每像素）。
+    ///
+    /// # Safety
+    /// - 已确认 AVX2 可用；`h + 7 <= a.len()/wu`、`h + 7 <= b.len()/wu`；
+    /// - `dst` 的 `h` 行（`dst_stride` 步长）各 `[0, wu)` 可写；
+    /// - `round ∈ 1..=14`、`blend_shift ∈ 1..=31`。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn mc_vert2_avg_u16(
+        a: &[i16],
+        b: &[i16],
+        wu: usize,
+        h: usize,
+        fya: &[i16; 8],
+        fyb: &[i16; 8],
+        round: u32,
+        blend_shift: u32,
+        max: i32,
+        dst: *mut u16,
+        dst_stride: isize,
+    ) {
+        let ap = a.as_ptr();
+        let bp = b.as_ptr();
+        let vmax = _mm256_set1_epi32(max);
+        let zero = _mm256_setzero_si256();
+        let bias = _mm256_set1_epi32(1i32 << (blend_shift - 1));
+        let pair = |c: &[i16; 8], j: usize| -> __m256i {
+            _mm256_set1_epi32(((c[2 * j + 1] as u16 as i32) << 16) | (c[2 * j] as u16 as i32))
+        };
+        let pa: [__m256i; 4] = std::array::from_fn(|j| pair(fya, j));
+        let pb: [__m256i; 4] = std::array::from_fn(|j| pair(fyb, j));
+        let pair128 = |c: &[i16; 8], j: usize| -> __m128i {
+            _mm_set1_epi32(((c[2 * j + 1] as u16 as i32) << 16) | (c[2 * j] as u16 as i32))
+        };
+        let pa128: [__m128i; 4] = std::array::from_fn(|j| pair128(fya, j));
+        let pb128: [__m128i; 4] = std::array::from_fn(|j| pair128(fyb, j));
+        let vmax128 = _mm_set1_epi32(max);
+        let zero128 = _mm_setzero_si128();
+        let bias128 = _mm_set1_epi32(1i32 << (blend_shift - 1));
+        let mix = |x: __m256i, y: __m256i| -> __m256i {
+            let s = _mm256_add_epi32(_mm256_add_epi32(rnd(x, round), rnd(y, round)), bias);
+            let sh = _mm256_set1_epi32(blend_shift as i32);
+            let v = _mm256_srav_epi32(s, sh);
+            _mm256_min_epi32(_mm256_max_epi32(v, zero), vmax)
+        };
+        let mix128 = |x: __m128i, y: __m128i| -> __m128i {
+            let s = _mm_add_epi32(_mm_add_epi32(rnd128(x, round), rnd128(y, round)), bias128);
+            let v = _mm_sra_epi32(s, _mm_cvtsi32_si128(blend_shift as i32));
+            _mm_min_epi32(_mm_max_epi32(v, zero128), vmax128)
+        };
+        for r in 0..h {
+            let ba = ap.add(r * wu);
+            let bb = bp.add(r * wu);
+            let out_row = dst.offset(r as isize * dst_stride);
+            let mut c = 0usize;
+            while c + 16 <= wu {
+                let mut alo = _mm256_setzero_si256();
+                let mut ahi = _mm256_setzero_si256();
+                let mut blo = _mm256_setzero_si256();
+                let mut bhi = _mm256_setzero_si256();
+                for (j, (qa, qb)) in pa.iter().zip(pb.iter()).enumerate() {
+                    let t = 2 * j;
+                    let a0 = _mm256_loadu_si256(ba.add(t * wu + c) as *const __m256i);
+                    let a1 = _mm256_loadu_si256(ba.add((t + 1) * wu + c) as *const __m256i);
+                    alo = _mm256_add_epi32(alo, _mm256_madd_epi16(_mm256_unpacklo_epi16(a0, a1), *qa));
+                    ahi = _mm256_add_epi32(ahi, _mm256_madd_epi16(_mm256_unpackhi_epi16(a0, a1), *qa));
+                    let b0 = _mm256_loadu_si256(bb.add(t * wu + c) as *const __m256i);
+                    let b1 = _mm256_loadu_si256(bb.add((t + 1) * wu + c) as *const __m256i);
+                    blo = _mm256_add_epi32(blo, _mm256_madd_epi16(_mm256_unpacklo_epi16(b0, b1), *qb));
+                    bhi = _mm256_add_epi32(bhi, _mm256_madd_epi16(_mm256_unpackhi_epi16(b0, b1), *qb));
+                }
+                let lo = mix(alo, blo);
+                let hi = mix(ahi, bhi);
+                let v0 = _mm256_permute2x128_si256::<0x20>(lo, hi);
+                let v1 = _mm256_permute2x128_si256::<0x31>(lo, hi);
+                let packed = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi32(v0, v1));
+                _mm256_storeu_si256(out_row.add(c) as *mut __m256i, packed);
+                c += 16;
+            }
+            while c + 8 <= wu {
+                let mut alo = _mm_setzero_si128();
+                let mut ahi = _mm_setzero_si128();
+                let mut blo = _mm_setzero_si128();
+                let mut bhi = _mm_setzero_si128();
+                for (j, (qa, qb)) in pa128.iter().zip(pb128.iter()).enumerate() {
+                    let t = 2 * j;
+                    let a0 = _mm_loadu_si128(ba.add(t * wu + c) as *const __m128i);
+                    let a1 = _mm_loadu_si128(ba.add((t + 1) * wu + c) as *const __m128i);
+                    alo = _mm_add_epi32(alo, _mm_madd_epi16(_mm_unpacklo_epi16(a0, a1), *qa));
+                    ahi = _mm_add_epi32(ahi, _mm_madd_epi16(_mm_unpackhi_epi16(a0, a1), *qa));
+                    let b0 = _mm_loadu_si128(bb.add(t * wu + c) as *const __m128i);
+                    let b1 = _mm_loadu_si128(bb.add((t + 1) * wu + c) as *const __m128i);
+                    blo = _mm_add_epi32(blo, _mm_madd_epi16(_mm_unpacklo_epi16(b0, b1), *qb));
+                    bhi = _mm_add_epi32(bhi, _mm_madd_epi16(_mm_unpackhi_epi16(b0, b1), *qb));
+                }
+                let lo = mix128(alo, blo);
+                let hi = mix128(ahi, bhi);
+                _mm_storeu_si128(out_row.add(c) as *mut __m128i, _mm_packus_epi32(lo, hi));
+                c += 8;
+            }
+            while c + 4 <= wu {
+                let mut aa = _mm_setzero_si128();
+                let mut ab = _mm_setzero_si128();
+                for (j, (qa, qb)) in pa128.iter().zip(pb128.iter()).enumerate() {
+                    let t = 2 * j;
+                    let a0 = _mm_loadl_epi64(ba.add(t * wu + c) as *const __m128i);
+                    let a1 = _mm_loadl_epi64(ba.add((t + 1) * wu + c) as *const __m128i);
+                    aa = _mm_add_epi32(aa, _mm_madd_epi16(_mm_unpacklo_epi16(a0, a1), *qa));
+                    let b0 = _mm_loadl_epi64(bb.add(t * wu + c) as *const __m128i);
+                    let b1 = _mm_loadl_epi64(bb.add((t + 1) * wu + c) as *const __m128i);
+                    ab = _mm_add_epi32(ab, _mm_madd_epi16(_mm_unpacklo_epi16(b0, b1), *qb));
+                }
+                let v = mix128(aa, ab);
+                _mm_storel_epi64(out_row.add(c) as *mut __m128i, _mm_packus_epi32(v, v));
+                c += 4;
+            }
+            while c < wu {
+                let (mut sa, mut sb) = (0i32, 0i32);
+                for t in 0..8usize {
+                    sa += fya[t] as i32 * i32::from(*ap.add((r + t) * wu + c));
+                    sb += fyb[t] as i32 * i32::from(*bp.add((r + t) * wu + c));
+                }
+                let v = (rnd_scalar(sa, round) + rnd_scalar(sb, round) + (1 << (blend_shift - 1)))
+                    >> blend_shift;
+                *out_row.add(c) = v.clamp(0, max) as u16;
+                c += 1;
+            }
+        }
+    }
+
+    /// **残差加回（带水平翻转）**：`dst[j] = clip1(dst[j] + res[n-1-j])`。
+    ///
+    /// 逆变换带 `flip_lr` 的块（部分 ADST 变体）原来走逐像素标量；这里把
+    /// 残差行**倒序**后再走同一条 16 宽流水线（`permutevar8x32` 两次 + 交换两半）。
+    ///
+    /// # Safety
+    /// 已确认 AVX2；`dst` 可读写 `n` 个 u16、`res` 可读 `n` 个 i32。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn add_residual_u16_rev(
+        dst: *mut u16,
+        res: *const i32,
+        n: usize,
+        max: i32,
+    ) {
+        let zero = _mm256_setzero_si256();
+        let vmax = _mm256_set1_epi32(max);
+        let rev = _mm256_setr_epi32(7, 6, 5, 4, 3, 2, 1, 0);
+        let mut j = 0usize;
+        while j + 16 <= n {
+            // 目标 `[j, j+16)` 对应残差 `[n-j-16, n-j)`（倒序）
+            let base = n - j - 16;
+            let a = _mm256_permutevar8x32_epi32(
+                _mm256_loadu_si256(res.add(base) as *const __m256i),
+                rev,
+            );
+            let b = _mm256_permutevar8x32_epi32(
+                _mm256_loadu_si256(res.add(base + 8) as *const __m256i),
+                rev,
+            );
+            // 倒序后：前 8 个 = b 的倒序、后 8 个 = a 的倒序
+            let d0 = _mm256_cvtepu16_epi32(_mm_loadu_si128(dst.add(j) as *const __m128i));
+            let d1 = _mm256_cvtepu16_epi32(_mm_loadu_si128(dst.add(j + 8) as *const __m128i));
+            let s0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(d0, b), zero), vmax);
+            let s1 = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(d1, a), zero), vmax);
+            let packed = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi32(s0, s1));
+            _mm256_storeu_si256(dst.add(j) as *mut __m256i, packed);
+            j += 16;
+        }
+        while j < n {
+            let v = (i32::from(*dst.add(j)) + *res.add(n - 1 - j)).clamp(0, max);
+            *dst.add(j) = v as u16;
+            j += 1;
+        }
+    }
+
+    /// **反量化（8 个系数一批）**：`dq = sign · (|lv·q| & 0xFFFFFF) >> dqDenom`，
+    /// 再 `Clip3(-(1<<(7+bd)), …, ·)`。
+    ///
+    /// ## 为什么不用 i64
+    ///
+    /// 规范式是 `lv·q`（i64）再取绝对值、掩 24 位。但：
+    /// * `m = (lv·q) mod 2^24` 用 `mullo_epi32` + `& 0xFFFFFF` 就能拿到（低 24 位与
+    ///   64 位乘积一致）；
+    /// * `dq < 0 ⇔ lv < 0`（`q` 恒正）⇒ 符号只看 `lv`；
+    /// * `|dq| mod 2^24 = lv >= 0 ? m : (-m) mod 2^24`。
+    ///
+    /// 于是整条链路都在 **8 路 i32** 里（原实现逐系数标量）。
+    ///
+    /// `n` 是系数个数（`tw·th`）；`q_dc` 用在第 0 个，其余用 `q_ac`。
+    ///
+    /// # Safety
+    /// 已确认 AVX2；`levels` 可读 `n` 个 i32、`t` 可写 `n` 个 i32。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn dequantize_8(
+        levels: *const i32,
+        t: *mut i32,
+        n: usize,
+        q_dc: i32,
+        q_ac: i32,
+        denom_shift: u32,
+        lo: i32,
+        hi: i32,
+    ) {
+        let zero = _mm256_setzero_si256();
+        let mask24 = _mm256_set1_epi32(0x00FF_FFFF);
+        let vlo = _mm256_set1_epi32(lo);
+        let vhi = _mm256_set1_epi32(hi);
+        let q_first = _mm256_setr_epi32(q_dc, q_ac, q_ac, q_ac, q_ac, q_ac, q_ac, q_ac);
+        let q_rest = _mm256_set1_epi32(q_ac);
+        let mut i = 0usize;
+        while i + 8 <= n {
+            let lv = _mm256_loadu_si256(levels.add(i) as *const __m256i);
+            if _mm256_testz_si256(lv, lv) != 0 {
+                _mm256_storeu_si256(t.add(i) as *mut __m256i, zero);
+                i += 8;
+                continue;
+            }
+            let q = if i == 0 { q_first } else { q_rest };
+            let m = _mm256_and_si256(_mm256_mullo_epi32(lv, q), mask24);
+            let neg = _mm256_cmpgt_epi32(zero, lv);
+            let negm = _mm256_and_si256(_mm256_sub_epi32(zero, m), mask24);
+            let mag = _mm256_blendv_epi8(m, negm, neg);
+            let mag = _mm256_srlv_epi32(mag, _mm256_set1_epi32(denom_shift as i32));
+            let v = _mm256_sub_epi32(_mm256_xor_si256(mag, neg), neg);
+            let v = _mm256_min_epi32(_mm256_max_epi32(v, vlo), vhi);
+            _mm256_storeu_si256(t.add(i) as *mut __m256i, v);
+            i += 8;
+        }
+        while i < n {
+            let lv = *levels.add(i);
+            let q = if i == 0 { q_dc } else { q_ac };
+            let dq = lv as i64 * q as i64;
+            let mag = ((dq.abs() & 0xFF_FFFF) >> denom_shift) as i32;
+            let v = if dq < 0 { -mag } else { mag };
+            *t.add(i) = v.clamp(lo, hi);
+            i += 1;
+        }
+    }
+
+    /// **残差加回平面（一行）**：`dst[j] = clip1(dst[j] + res[j])`，16 个样本一批。
+    ///
+    /// 逆变换的收尾原来是**逐像素标量**（每像素 widen + add + clamp + 窄化），
+    /// 1080p 一帧几百万像素。这里 16 个一批：`cvtepu16_epi32` ×2 + 加 + 钳位 +
+    /// `packus` + 一次 32 字节写回。
+    ///
+    /// # Safety
+    /// - 已确认 AVX2；`dst` 可读写 `n` 个 u16，`res` 可读 `n` 个 i32；
+    /// - `max = (1 << bit_depth) - 1`。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn add_residual_u16(dst: *mut u16, res: *const i32, n: usize, max: i32) {
+        let zero = _mm256_setzero_si256();
+        let vmax = _mm256_set1_epi32(max);
+        let mut j = 0usize;
+        while j + 16 <= n {
+            let d0 = _mm256_cvtepu16_epi32(_mm_loadu_si128(dst.add(j) as *const __m128i));
+            let d1 = _mm256_cvtepu16_epi32(_mm_loadu_si128(dst.add(j + 8) as *const __m128i));
+            let r0 = _mm256_loadu_si256(res.add(j) as *const __m256i);
+            let r1 = _mm256_loadu_si256(res.add(j + 8) as *const __m256i);
+            let s0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(d0, r0), zero), vmax);
+            let s1 = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(d1, r1), zero), vmax);
+            let packed = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi32(s0, s1));
+            _mm256_storeu_si256(dst.add(j) as *mut __m256i, packed);
+            j += 16;
+        }
+        while j + 8 <= n {
+            let d0 = _mm256_cvtepu16_epi32(_mm_loadu_si128(dst.add(j) as *const __m128i));
+            let r0 = _mm256_loadu_si256(res.add(j) as *const __m256i);
+            let s0 = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(d0, r0), zero), vmax);
+            let lo = _mm256_castsi256_si128(s0);
+            let hi = _mm256_extracti128_si256::<1>(s0);
+            _mm_storeu_si128(dst.add(j) as *mut __m128i, _mm_packus_epi32(lo, hi));
+            j += 8;
+        }
+        while j < n {
+            let v = (i32::from(*dst.add(j)) + *res.add(j)).clamp(0, max);
+            *dst.add(j) = v as u16;
+            j += 1;
+        }
+    }
+
+    /// **复合 AVERAGE + 双整像素**：两路参考按行取四舍五入平均，直接写目标平面。
+    ///
+    /// 规范式是 `Clip1(Round2(p0 + p1, 1 + InterPostRound))`，而整像素位置的两路
+    /// 预测值都是 `16·src`（`post_round = 14 - (3 + 7) = 4`）⇒
+    /// `(16s0 + 16s1 + 16) >> 5 == (s0 + s1 + 1) >> 1`，正好是 `pavgw`。
+    ///
+    /// # Safety
+    /// - 必须已确认 AVX2 可用；
+    /// - `a`/`b` 的 `[ay + r, ay + r + h) × [ax, ax + w)` 与
+    ///   `[by + r, by + r + h) × [bx, bx + w)` 都在各自平面内（调用方已判内点）；
+    /// - `dst` 的同一矩形可写（帧平面含 `PLANE_PAD` 的填充区）。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn comp_avg_rows(
+        a: *const u16,
+        a_stride: usize,
+        ax: usize,
+        ay: usize,
+        b: *const u16,
+        b_stride: usize,
+        bx: usize,
+        by: usize,
+        dst: *mut u16,
+        dst_stride: usize,
+        dx: usize,
+        dy: usize,
+        w: usize,
+        h: usize,
+    ) {
+        for r in 0..h {
+            let pa = a.add((ay + r) * a_stride + ax);
+            let pb = b.add((by + r) * b_stride + bx);
+            let pd = dst.add((dy + r) * dst_stride + dx);
+            let mut c = 0usize;
+            while c + 16 <= w {
+                let va = _mm256_loadu_si256(pa.add(c) as *const __m256i);
+                let vb = _mm256_loadu_si256(pb.add(c) as *const __m256i);
+                _mm256_storeu_si256(pd.add(c) as *mut __m256i, _mm256_avg_epu16(va, vb));
+                c += 16;
+            }
+            while c + 8 <= w {
+                let va = _mm_loadu_si128(pa.add(c) as *const __m128i);
+                let vb = _mm_loadu_si128(pb.add(c) as *const __m128i);
+                _mm_storeu_si128(pd.add(c) as *mut __m128i, _mm_avg_epu16(va, vb));
+                c += 8;
+            }
+            while c < w {
+                let s = *pa.add(c) as u32 + *pb.add(c) as u32;
+                *pd.add(c) = ((s + 1) >> 1) as u16;
+                c += 1;
+            }
+        }
+    }
+
     /// **整数相位（δ 滤波器）**的横向+纵向合成：一次算 **8 个输出**。
     ///
     /// `pred = Round2(128 · Round2(128 · src, r0), r1)`（见 `inter` 里快路径 1 的说明：
@@ -746,6 +1247,94 @@ mod x86 {
             _mm256_add_epi32(v, _mm256_set1_epi32(1 << (shift - 1))),
             _mm256_set1_epi32(shift as i32),
         );
+        _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, v);
+    }
+
+    /// [`sgr_final_8`] 的**按权重档单态化**版本（2026-10-25）。
+    ///
+    /// `box_filter` 的 3×3 权重只可能是三种固定图案（见 `lr.rs` 里 `wt` 的构造）：
+    /// - `PAT = 0`（`pass == 0`、`i` 偶）：缓冲行 0 与行 2 各 `[5, 6, 5]`；
+    /// - `PAT = 1`（`pass == 0`、`i` 奇）：只有缓冲行 1 是 `[5, 6, 5]`；
+    /// - `PAT = 2`（`pass == 1`）：九格全 4，仅四角为 3。
+    ///
+    /// 三种都能化成"先求和再缩放"：`5Σ+m`、`4Σ−角`。省掉每个缓冲 3~9 次
+    /// `vpmulld`（本机 2 uop）。等价性要求**模 2³² 环运算**：`b_buf` 的
+    /// `p*s_factor` 会溢出 i32 ⇒ 项可以是任意 i32，逐项乘与先和后缩放在
+    /// 模 2³² 下才逐位一致（`5Σ+m` 里 `6m = 5m+m` 同理）。`SHIFT` 是行档常量
+    /// （`pass == 0` 奇数行为 8，其余 9）⇒ 用立即数移位，省一次广播。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn sgr_final_8_pat<const PAT: u8, const SHIFT: i32>(
+        a_buf: &[i32],
+        b_buf: &[i32],
+        aw: usize,
+        base: usize,
+        u: *const u16,
+        out: &mut [i32],
+    ) {
+        #[inline(always)]
+        unsafe fn ld(buf: &[i32], idx: usize) -> __m256i {
+            _mm256_loadu_si256(buf.as_ptr().add(idx) as *const __m256i)
+        }
+        #[inline(always)]
+        unsafe fn wsum<const PAT: u8>(buf: &[i32], base: usize, aw: usize) -> __m256i {
+            match PAT {
+                // `5(r0[c0]+r0[c1]+r0[c2]) + r0[c1]`
+                1 => {
+                    let r0 = ld(buf, base + aw);
+                    let r1 = ld(buf, base + aw + 1);
+                    let r2 = ld(buf, base + aw + 2);
+                    let s = _mm256_add_epi32(_mm256_add_epi32(r0, r1), r2);
+                    _mm256_add_epi32(_mm256_add_epi32(s, _mm256_slli_epi32::<2>(s)), r1)
+                }
+                // `5(行0 六格 + 行2 六格) + (两行中列)`
+                0 => {
+                    let x0 = ld(buf, base);
+                    let x1 = ld(buf, base + 1);
+                    let x2 = ld(buf, base + 2);
+                    let y0 = ld(buf, base + 2 * aw);
+                    let y1 = ld(buf, base + 2 * aw + 1);
+                    let y2 = ld(buf, base + 2 * aw + 2);
+                    let s = _mm256_add_epi32(
+                        _mm256_add_epi32(_mm256_add_epi32(x0, x1), _mm256_add_epi32(x2, y0)),
+                        _mm256_add_epi32(y1, y2),
+                    );
+                    let m = _mm256_add_epi32(x1, y1);
+                    _mm256_add_epi32(_mm256_add_epi32(s, _mm256_slli_epi32::<2>(s)), m)
+                }
+                // `4·Σ9 − 四角`
+                _ => {
+                    let r00 = ld(buf, base);
+                    let r01 = ld(buf, base + 1);
+                    let r02 = ld(buf, base + 2);
+                    let r10 = ld(buf, base + aw);
+                    let r11 = ld(buf, base + aw + 1);
+                    let r12 = ld(buf, base + aw + 2);
+                    let r20 = ld(buf, base + 2 * aw);
+                    let r21 = ld(buf, base + 2 * aw + 1);
+                    let r22 = ld(buf, base + 2 * aw + 2);
+                    let s = _mm256_add_epi32(
+                        _mm256_add_epi32(
+                            _mm256_add_epi32(_mm256_add_epi32(r00, r01), _mm256_add_epi32(r02, r10)),
+                            _mm256_add_epi32(_mm256_add_epi32(r11, r12), _mm256_add_epi32(r20, r21)),
+                        ),
+                        r22,
+                    );
+                    let c = _mm256_add_epi32(
+                        _mm256_add_epi32(r00, r02),
+                        _mm256_add_epi32(r20, r22),
+                    );
+                    _mm256_sub_epi32(_mm256_slli_epi32::<2>(s), c)
+                }
+            }
+        }
+        let va = wsum::<PAT>(a_buf, base, aw);
+        let vb = wsum::<PAT>(b_buf, base, aw);
+        let uv = _mm256_cvtepu16_epi32(_mm_loadu_si128(u as *const __m128i));
+        let v = _mm256_add_epi32(_mm256_mullo_epi32(va, uv), vb);
+        let v = _mm256_srai_epi32::<SHIFT>(_mm256_add_epi32(
+            v,
+            _mm256_set1_epi32(1 << (SHIFT - 1)),
+        ));
         _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, v);
     }
 
@@ -881,23 +1470,46 @@ mod x86 {
             _mm256_mullo_epi32(p, _mm256_set1_epi32(s_factor)),
             mtab_bits,
         );
-        let mut zs = [0i32; 8];
-        _mm256_storeu_si256(zs.as_mut_ptr() as *mut __m256i, z);
-        let mut a2s = [0i32; 8];
-        for k in 0..8 {
-            let zz = zs[k];
-            a2s[k] = if zz >= 255 {
-                256
-            } else if zz > 0 {
-                table[zz as usize]
-            } else if zz == 0 {
-                1
-            } else {
-                // `SGRPROJ_SGR_BITS == 8`（与 `lr.rs` 的那个常量同源）
-                ((zz << 8) + (zz / 2)) / (zz + 1)
-            };
+        // 2026-10-25：**gather 查表**。原来逐通道 8 次"比较 + 查表 + 分支"，
+        // 而 `z` 的分布很散、分支预测不上。改成一次 `vpgatherdd`：
+        // 先把 `z` 夹到 `[0,255]`（表末项已改成 256 ⇒ `z >= 255` 也正确），
+        // 负值（真实素材里会因 i32 溢出出现）再用标量兜底。
+        let idx = _mm256_min_epi32(_mm256_max_epi32(z, _mm256_setzero_si256()), _mm256_set1_epi32(255));
+        let mut a2v = if crate::video::flags::no_sgr_gather() {
+            let mut zs = [0i32; 8];
+            _mm256_storeu_si256(zs.as_mut_ptr() as *mut __m256i, z);
+            let mut a2s = [0i32; 8];
+            for k in 0..8 {
+                let zz = zs[k];
+                a2s[k] = if zz >= 255 {
+                    256
+                } else if zz > 0 {
+                    table[zz as usize]
+                } else if zz == 0 {
+                    1
+                } else {
+                    ((zz << 8) + (zz / 2)) / (zz + 1)
+                };
+            }
+            _mm256_loadu_si256(a2s.as_ptr() as *const __m256i)
+        } else {
+            _mm256_i32gather_epi32::<4>(table.as_ptr(), idx)
+        };
+        let neg = _mm256_cmpgt_epi32(_mm256_setzero_si256(), z);
+        if _mm256_movemask_epi8(neg) != 0 {
+            let mut zs = [0i32; 8];
+            _mm256_storeu_si256(zs.as_mut_ptr() as *mut __m256i, z);
+            let mut a2s = [0i32; 8];
+            _mm256_storeu_si256(a2s.as_mut_ptr() as *mut __m256i, a2v);
+            for k in 0..8 {
+                let zz = zs[k];
+                if zz < 0 {
+                    // `SGRPROJ_SGR_BITS == 8`（与 `lr.rs` 的那个常量同源）
+                    a2s[k] = ((zz << 8) + (zz / 2)) / (zz + 1);
+                }
+            }
+            a2v = _mm256_loadu_si256(a2s.as_ptr() as *const __m256i);
         }
-        let a2v = _mm256_loadu_si256(a2s.as_ptr() as *const __m256i);
         // `b2 = (256 - a2) · D · one_over_n`。⚠️ 中间乘积会**在 i32 里回绕**
         // （256 · 6375 · 4096 ≈ 6.7e9 > 2³¹）—— 与标量的 `*` 同样按低 32 位算，
         // `mullo_epi32` 恰好同语义；**这不是 bug，别"顺手"换 i64**。
@@ -1125,8 +1737,15 @@ mod x86 {
         let sec_t = _mm256_set1_epi16(sec_thr as i16);
         let pri_s = _mm_cvtsi32_si128(pri_adj as i32);
         let sec_s = _mm_cvtsi32_si128(sec_adj as i32);
-        let tap_v: [__m256i; super::CDEF_CANDS] =
-            std::array::from_fn(|c| _mm256_set1_epi16(taps[c] as i16));
+        // 抽头归并后只剩 4 个不同值（主 c=0/2、次 c=4/8）。
+        let pri_taps = [
+            _mm256_set1_epi16(taps[0] as i16),
+            _mm256_set1_epi16(taps[2] as i16),
+        ];
+        let sec_taps = [
+            _mm256_set1_epi16(taps[4] as i16),
+            _mm256_set1_epi16(taps[8] as i16),
+        ];
         let mut r = 0usize;
         while r < h {
             // `h` 为奇数时最后一行只算一次（高半读同一行）、只写一次。
@@ -1141,25 +1760,43 @@ mod x86 {
             let mut acc = zero;
             let mut mx = cur;
             let mut mn = cur;
-            for c in 0..super::CDEF_CANDS {
-                let (thr, sh) = if c < 4 { (pri_t, pri_s) } else { (sec_t, sec_s) };
-                let cand = _mm256_set_m128i(
-                    _mm_loadu_si128(base.offset(off1 + offs[c]) as *const __m128i),
-                    _mm_loadu_si128(base.offset(off0 + offs[c]) as *const __m128i),
-                );
-                // `constrain( cand - cur, thr, adj )`（§7.15.3）：
-                //   sign(diff) · Clip3(0, |diff|, thr - (|diff| >> adj))
-                // `sign_epi16(t, diff)` 正好给"取符号、`diff == 0` 归零"，
-                // 与标量里 `sign = if diff < 0 { -1 } else { 1 }` 逐位一致
-                // （`diff == 0` 时 `mag == 0` ⇒ `t == 0`，谁乘都是 0）。
-                let diff = _mm256_sub_epi16(cand, cur);
-                let mag = _mm256_abs_epi16(diff);
-                let t = _mm256_sub_epi16(thr, _mm256_sra_epi16(mag, sh));
-                let t = _mm256_max_epi16(_mm256_min_epi16(t, mag), zero);
-                let val = _mm256_sign_epi16(t, diff);
-                acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(val, tap_v[c]));
-                mx = _mm256_max_epi16(mx, cand);
-                mn = _mm256_min_epi16(mn, cand);
+            // 同抽头的候选先相加再乘（模 2^16 环等价），`constrain` 用无符号饱和减
+            // —— 与 `cdef_pair16x4` 同一套化简，两版逐位一致（有单测钉住）。
+            for grp in 0..2usize {
+                let mut g = zero;
+                for k in 0..2usize {
+                    let c = grp * 2 + k;
+                    let cand = _mm256_set_m128i(
+                        _mm_loadu_si128(base.offset(off1 + offs[c]) as *const __m128i),
+                        _mm_loadu_si128(base.offset(off0 + offs[c]) as *const __m128i),
+                    );
+                    let diff = _mm256_sub_epi16(cand, cur);
+                    let mag = _mm256_abs_epi16(diff);
+                    let t = _mm256_subs_epu16(pri_t, _mm256_sra_epi16(mag, pri_s));
+                    let t = _mm256_min_epu16(t, mag);
+                    g = _mm256_add_epi16(g, _mm256_sign_epi16(t, diff));
+                    mx = _mm256_max_epi16(mx, cand);
+                    mn = _mm256_min_epi16(mn, cand);
+                }
+                acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(g, pri_taps[grp]));
+            }
+            for grp in 0..2usize {
+                let mut g = zero;
+                for k in 0..4usize {
+                    let c = 4 + grp * 4 + k;
+                    let cand = _mm256_set_m128i(
+                        _mm_loadu_si128(base.offset(off1 + offs[c]) as *const __m128i),
+                        _mm_loadu_si128(base.offset(off0 + offs[c]) as *const __m128i),
+                    );
+                    let diff = _mm256_sub_epi16(cand, cur);
+                    let mag = _mm256_abs_epi16(diff);
+                    let t = _mm256_subs_epu16(sec_t, _mm256_sra_epi16(mag, sec_s));
+                    let t = _mm256_min_epu16(t, mag);
+                    g = _mm256_add_epi16(g, _mm256_sign_epi16(t, diff));
+                    mx = _mm256_max_epi16(mx, cand);
+                    mn = _mm256_min_epi16(mn, cand);
+                }
+                acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(g, sec_taps[grp]));
             }
             // `adjust = sum < 0 ? 1 : 0`；`v = cur + ((8 + sum - adjust) >> 4)`
             let adjust = _mm256_and_si256(_mm256_cmpgt_epi16(zero, acc), one);
@@ -1190,6 +1827,578 @@ mod x86 {
             }
             r += 2;
         }
+    }
+
+    /// [`cdef_pair16`] 的**四行一组**版本：一次算 4 行 × 8 列（两个 YMM）。
+    ///
+    /// 两行一组时每个候选的 `diff → abs → sra → sub → min → max → sign → mul → add`
+    /// 是一条 ~9 级的依赖链；四行版让**两条链同时在飞**（每轮 32 个通道、循环减半），
+    /// 用 ILP 盖住延迟。像素运算与 [`cdef_pair16`] 逐条相同 ⇒ 输出逐位一致
+    /// （`cdef_pair16x4_matches_pair16_bit_for_bit` 钉住）。
+    ///
+    /// # Safety
+    /// - 必须已确认 AVX2 可用；`h` 必须是 **4 的倍数**。
+    /// - 对每个 `r ∈ [0, h)`、每个 `c ∈ [0, 12)`，`data` 必须覆盖
+    ///   `((y0+r)·stride + x0 + offs[c]) .. + 8 个 u16`。
+    /// - `dst` 覆盖 `((y0+h-1)·dst_stride + x0) .. + wu 个 u16`。
+    /// - `adj` 必须 < 16（同 [`cdef_pair16`]）。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn cdef_pair16x4(
+        data: &[u16],
+        stride: isize,
+        x0: isize,
+        y0: isize,
+        h: usize,
+        wu: usize,
+        offs: &[isize; super::CDEF_CANDS],
+        taps: &[i32; super::CDEF_CANDS],
+        pri_thr: i32,
+        pri_adj: u32,
+        sec_thr: i32,
+        sec_adj: u32,
+        dst: *mut u16,
+        dst_stride: isize,
+    ) {
+        debug_assert!(wu == 4 || wu == 8);
+        debug_assert!(h % 4 == 0 && h >= 4);
+        let base = data.as_ptr();
+        let zero = _mm256_setzero_si256();
+        let one = _mm256_set1_epi16(1);
+        let eight = _mm256_set1_epi16(8);
+        let pri_t = _mm256_set1_epi16(pri_thr as i16);
+        let sec_t = _mm256_set1_epi16(sec_thr as i16);
+        let pri_s = _mm_cvtsi32_si128(pri_adj as i32);
+        let sec_s = _mm_cvtsi32_si128(sec_adj as i32);
+        // 抽头归并后只剩 4 个不同值（主 c=0/2、次 c=4/8）⇒ 只广播这 4 个，
+        // 不再建 12 项 YMM 数组（那会把 12×32 字节压到栈上）。
+        let pri_taps = [
+            _mm256_set1_epi16(taps[0] as i16),
+            _mm256_set1_epi16(taps[2] as i16),
+        ];
+        let sec_taps = [
+            _mm256_set1_epi16(taps[4] as i16),
+            _mm256_set1_epi16(taps[8] as i16),
+        ];
+        let mut r = 0usize;
+        while r < h {
+            let off0 = (y0 + r as isize) * stride + x0;
+            let off1 = off0 + stride;
+            let off2 = off1 + stride;
+            let off3 = off2 + stride;
+            // SAFETY: 见函数文档的不变量。
+            let cur_a = _mm256_set_m128i(
+                _mm_loadu_si128(base.offset(off1) as *const __m128i),
+                _mm_loadu_si128(base.offset(off0) as *const __m128i),
+            );
+            let cur_b = _mm256_set_m128i(
+                _mm_loadu_si128(base.offset(off3) as *const __m128i),
+                _mm_loadu_si128(base.offset(off2) as *const __m128i),
+            );
+            let mut acc_a = zero;
+            let mut acc_b = zero;
+            let mut mx_a = cur_a;
+            let mut mx_b = cur_b;
+            let mut mn_a = cur_a;
+            let mut mn_b = cur_b;
+            // ── **同抽头的候选先相加、再乘一次**（2026-10-24）────────────────────
+            // `cdef_candidates` 的抽头是成组的：主抽头 c=0/1 同 tap、c=2/3 同 tap；
+            // 次抽头 c=4..7 同 tap、c=8..11 同 tap。整数加乘在**模 2^16** 下构成环
+            // ⇒ `v0·t + v1·t ≡ (v0+v1)·t`，逐位相同（内核本来就用 `_mm256_add_epi16`
+            // 的回绕，见 `cdef_pair16` 的说明）。
+            // 12 次乘 → 4 次；每组多 1 次相加。
+            for grp in 0..2usize {
+                let mut ga = zero;
+                let mut gb = zero;
+                for k in 0..2usize {
+                    let c = grp * 2 + k;
+                    let o = offs[c];
+                    let cand_a = _mm256_set_m128i(
+                        _mm_loadu_si128(base.offset(off1 + o) as *const __m128i),
+                        _mm_loadu_si128(base.offset(off0 + o) as *const __m128i),
+                    );
+                    let cand_b = _mm256_set_m128i(
+                        _mm_loadu_si128(base.offset(off3 + o) as *const __m128i),
+                        _mm_loadu_si128(base.offset(off2 + o) as *const __m128i),
+                    );
+                    let diff_a = _mm256_sub_epi16(cand_a, cur_a);
+                    let mag_a = _mm256_abs_epi16(diff_a);
+                    let t_a = _mm256_subs_epu16(pri_t, _mm256_sra_epi16(mag_a, pri_s));
+                    let t_a = _mm256_min_epu16(t_a, mag_a);
+                    ga = _mm256_add_epi16(ga, _mm256_sign_epi16(t_a, diff_a));
+                    mx_a = _mm256_max_epi16(mx_a, cand_a);
+                    mn_a = _mm256_min_epi16(mn_a, cand_a);
+
+                    let diff_b = _mm256_sub_epi16(cand_b, cur_b);
+                    let mag_b = _mm256_abs_epi16(diff_b);
+                    let t_b = _mm256_subs_epu16(pri_t, _mm256_sra_epi16(mag_b, pri_s));
+                    let t_b = _mm256_min_epu16(t_b, mag_b);
+                    gb = _mm256_add_epi16(gb, _mm256_sign_epi16(t_b, diff_b));
+                    mx_b = _mm256_max_epi16(mx_b, cand_b);
+                    mn_b = _mm256_min_epi16(mn_b, cand_b);
+                }
+                acc_a = _mm256_add_epi16(acc_a, _mm256_mullo_epi16(ga, pri_taps[grp]));
+                acc_b = _mm256_add_epi16(acc_b, _mm256_mullo_epi16(gb, pri_taps[grp]));
+            }
+            for grp in 0..2usize {
+                let mut ga = zero;
+                let mut gb = zero;
+                for k in 0..4usize {
+                    let c = 4 + grp * 4 + k;
+                    let o = offs[c];
+                    let cand_a = _mm256_set_m128i(
+                        _mm_loadu_si128(base.offset(off1 + o) as *const __m128i),
+                        _mm_loadu_si128(base.offset(off0 + o) as *const __m128i),
+                    );
+                    let cand_b = _mm256_set_m128i(
+                        _mm_loadu_si128(base.offset(off3 + o) as *const __m128i),
+                        _mm_loadu_si128(base.offset(off2 + o) as *const __m128i),
+                    );
+                    let diff_a = _mm256_sub_epi16(cand_a, cur_a);
+                    let mag_a = _mm256_abs_epi16(diff_a);
+                    let t_a = _mm256_subs_epu16(sec_t, _mm256_sra_epi16(mag_a, sec_s));
+                    let t_a = _mm256_min_epu16(t_a, mag_a);
+                    ga = _mm256_add_epi16(ga, _mm256_sign_epi16(t_a, diff_a));
+                    mx_a = _mm256_max_epi16(mx_a, cand_a);
+                    mn_a = _mm256_min_epi16(mn_a, cand_a);
+
+                    let diff_b = _mm256_sub_epi16(cand_b, cur_b);
+                    let mag_b = _mm256_abs_epi16(diff_b);
+                    let t_b = _mm256_subs_epu16(sec_t, _mm256_sra_epi16(mag_b, sec_s));
+                    let t_b = _mm256_min_epu16(t_b, mag_b);
+                    gb = _mm256_add_epi16(gb, _mm256_sign_epi16(t_b, diff_b));
+                    mx_b = _mm256_max_epi16(mx_b, cand_b);
+                    mn_b = _mm256_min_epi16(mn_b, cand_b);
+                }
+                acc_a = _mm256_add_epi16(acc_a, _mm256_mullo_epi16(ga, sec_taps[grp]));
+                acc_b = _mm256_add_epi16(acc_b, _mm256_mullo_epi16(gb, sec_taps[grp]));
+            }
+            let adj_a = _mm256_and_si256(_mm256_cmpgt_epi16(zero, acc_a), one);
+            let va = _mm256_add_epi16(
+                cur_a,
+                _mm256_srai_epi16::<4>(_mm256_add_epi16(
+                    _mm256_sub_epi16(eight, adj_a),
+                    acc_a,
+                )),
+            );
+            let va = _mm256_min_epi16(_mm256_max_epi16(va, mn_a), mx_a);
+            let adj_b = _mm256_and_si256(_mm256_cmpgt_epi16(zero, acc_b), one);
+            let vb = _mm256_add_epi16(
+                cur_b,
+                _mm256_srai_epi16::<4>(_mm256_add_epi16(
+                    _mm256_sub_epi16(eight, adj_b),
+                    acc_b,
+                )),
+            );
+            let vb = _mm256_min_epi16(_mm256_max_epi16(vb, mn_b), mx_b);
+            let mut out = [
+                _mm256_castsi256_si128(va),
+                _mm256_extracti128_si256::<1>(va),
+                _mm256_castsi256_si128(vb),
+                _mm256_extracti128_si256::<1>(vb),
+            ];
+            for (i, v) in out.iter_mut().enumerate() {
+                let d = dst.offset((y0 + (r + i) as isize) * dst_stride + x0);
+                if wu == 8 {
+                    _mm_storeu_si128(d as *mut __m128i, *v);
+                } else {
+                    _mm_storel_epi64(d as *mut __m128i, *v);
+                }
+            }
+            r += 4;
+        }
+    }
+
+    /// CDEF **方向搜索**（§7.15.2）的 AVX2 版 —— partial 全程在寄存器里。
+    ///
+    /// ## 为什么换（2026-10-23）
+    ///
+    /// 旧实现把 8 个方向的 partial 放在 512 B 栈数组里，每行对 6 个方向做
+    /// "读 32 B → 加 → 写 32 B"；相邻两行写的窗口**重叠 7 项** ⇒
+    /// store-to-load forwarding 每次都失败（约 10 周期），一行 6 次。
+    /// 实测方向搜索 ≈ 4 ms/帧，比亮度滤波内核还贵。
+    ///
+    /// ## 做法
+    ///
+    /// * 每个方向只开两个 XMM 累加器：`lo` = 位置 0..7、`hi` = 位置 8..15。
+    ///   一行 8 个 i16 用两条 `pshufb`（常量掩码，按 `base` 查表）搬到
+    ///   `[base, base+8)`，分别加进 lo/hi —— **纯寄存器**。
+    /// * 代价用 `pmaddwd` 求**对称位置**的平方和（i16→i32），再 `vpmulld`
+    ///   乘 Div 表、横加。对称位置权重相同（`Div[|k-7|+1]`），与标量的
+    ///   `(p[k]² + p[14-k]²)·Div[k+1]` **逐位相同**。
+    /// * 所有中间量是 i16：`|partial| ≤ 8·128 = 1024`；平方和扩到 i32。
+    ///
+    /// 方向 0/4 的 partial 是对角线（`p0[i+j] += s[i][j]`）、1/3/5/7 是
+    /// "两步一折"（`j/2`/`i/2`），逐方向的 `(值向量, base)` 见下面的循环。
+    ///
+    /// # Safety
+    /// 必须已确认 AVX2；`data` 覆盖 `(y0..y0+8)×(x0..x0+8)`。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn cdef_direction_avx2(
+        data: &[u16],
+        stride: usize,
+        x0: usize,
+        y0: usize,
+        sh: u32,
+    ) -> (usize, i32) {
+        use std::arch::x86_64::*;
+
+        // 一行 8 个 i16 的"搬到 [base, base+8)"掩码（`pshufb`，0x80 = 清零）。
+        const fn shift_lo(base: usize) -> [u8; 16] {
+            let mut m = [0x80u8; 16];
+            let mut l = base;
+            while l < 8 {
+                m[2 * l] = ((l - base) * 2) as u8;
+                m[2 * l + 1] = ((l - base) * 2 + 1) as u8;
+                l += 1;
+            }
+            m
+        }
+        const fn shift_hi(base: usize) -> [u8; 16] {
+            let mut m = [0x80u8; 16];
+            let mut l = 0;
+            while l < base {
+                m[2 * l] = ((8 - base + l) * 2) as u8;
+                m[2 * l + 1] = ((8 - base + l) * 2 + 1) as u8;
+                l += 1;
+            }
+            m
+        }
+        const SHIFT_LO: [[u8; 16]; 8] = [
+            shift_lo(0), shift_lo(1), shift_lo(2), shift_lo(3),
+            shift_lo(4), shift_lo(5), shift_lo(6), shift_lo(7),
+        ];
+        const SHIFT_HI: [[u8; 16]; 8] = [
+            shift_hi(0), shift_hi(1), shift_hi(2), shift_hi(3),
+            shift_hi(4), shift_hi(5), shift_hi(6), shift_hi(7),
+        ];
+        // 反转 8 个 i16（方向 4 的镜像行）。
+        const REV8: [u8; 16] = [14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1];
+        // 反转 4 个 i16 并把高 4 格清零（方向 3 的 ry）。
+        const REV4Z: [u8; 16] = [6, 7, 4, 5, 2, 3, 0, 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+        // `hi` 的重排：偶方向取 (p8..p14) 的对称项、奇方向取 (p8,p9,p10)。
+        const RH_EVEN: [u8; 16] = [12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1, 0x80, 0x80];
+        const RH_ODD: [u8; 16] = [4, 5, 2, 3, 0, 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+
+        #[inline(always)]
+        unsafe fn add_row(
+            v: __m128i,
+            base: usize,
+            lo: &mut __m128i,
+            hi: &mut __m128i,
+            shift_lo: &[[u8; 16]; 8],
+            shift_hi: &[[u8; 16]; 8],
+        ) {
+            let ml = _mm_loadu_si128(shift_lo[base].as_ptr() as *const __m128i);
+            let mh = _mm_loadu_si128(shift_hi[base].as_ptr() as *const __m128i);
+            *lo = _mm_add_epi16(*lo, _mm_shuffle_epi8(v, ml));
+            *hi = _mm_add_epi16(*hi, _mm_shuffle_epi8(v, mh));
+        }
+
+        // `Σ (lo[k]² + rh[k]²)·w[k]`（8 个 lane 一次 pmaddwd）。
+        #[inline(always)]
+        unsafe fn pair_cost(lo: __m128i, rh: __m128i, w: __m256i) -> i32 {
+            let il = _mm_unpacklo_epi16(lo, rh);
+            let ih = _mm_unpackhi_epi16(lo, rh);
+            let v = _mm256_set_m128i(ih, il);
+            let sq = _mm256_madd_epi16(v, v);
+            let m = _mm256_mullo_epi32(sq, w);
+            let hi = _mm256_extracti128_si256::<1>(m);
+            let sum = _mm_add_epi32(_mm256_castsi256_si128(m), hi);
+            let sum = _mm_hadd_epi32(sum, sum);
+            let sum = _mm_hadd_epi32(sum, sum);
+            _mm_cvtsi128_si32(sum)
+        }
+
+        let c128 = _mm_set1_epi16(128);
+        let zero = _mm_setzero_si128();
+        // 8 行 i16（`s = (sample >> sh) - 128`）。放栈上有两个好处：
+        // 每个方向按需重载（L1 命中）、寄存器压力不随方向数增长。
+        let mut rows = [[0i16; 8]; 8];
+        for i in 0..8usize {
+            let p = data.as_ptr().add((y0 + i) * stride + x0);
+            let v = _mm_loadu_si128(p as *const __m128i);
+            let v = match sh {
+                0 => v,
+                2 => _mm_srli_epi16::<2>(v),
+                _ => _mm_srli_epi16::<4>(v),
+            };
+            let v = _mm_sub_epi16(v, c128);
+            _mm_storeu_si128(rows[i].as_mut_ptr() as *mut __m128i, v);
+        }
+        let row = |i: usize| -> __m128i {
+            _mm_loadu_si128(rows[i].as_ptr() as *const __m128i)
+        };
+
+        // ── 六个"折线"方向：各累加 2 个 XMM ────────────────────────────
+        let (mut lo0, mut hi0) = (zero, zero);
+        let (mut lo4, mut hi4) = (zero, zero);
+        let (mut lo1, mut hi1) = (zero, zero);
+        let (mut lo3, mut hi3) = (zero, zero);
+        let (mut lo5, mut hi5) = (zero, zero);
+        let (mut lo7, mut hi7) = (zero, zero);
+        let rev8 = _mm_loadu_si128(REV8.as_ptr() as *const __m128i);
+        let rev4z = _mm_loadu_si128(REV4Z.as_ptr() as *const __m128i);
+        for i in 0..8usize {
+            let r = row(i);
+            // 0：`p0[i+j] += s[i][j]`
+            add_row(r, i, &mut lo0, &mut hi0, &SHIFT_LO, &SHIFT_HI);
+            // 4：镜像行 `p4[i+j] += s[i][7-j]`
+            add_row(_mm_shuffle_epi8(r, rev8), i, &mut lo4, &mut hi4, &SHIFT_LO, &SHIFT_HI);
+            // 1 / 3：`y[t] = s[2t]+s[2t+1]`（`phaddw`）
+            let y = _mm_hadd_epi16(r, zero);
+            add_row(y, i, &mut lo1, &mut hi1, &SHIFT_LO, &SHIFT_HI);
+            add_row(_mm_shuffle_epi8(y, rev4z), i, &mut lo3, &mut hi3, &SHIFT_LO, &SHIFT_HI);
+            // 5：`p5[3 - i/2 + j] += s[i][j]`
+            add_row(r, 3 - i / 2, &mut lo5, &mut hi5, &SHIFT_LO, &SHIFT_HI);
+            // 7：`p7[i/2 + j] += s[i][j]`
+            add_row(r, i / 2, &mut lo7, &mut hi7, &SHIFT_LO, &SHIFT_HI);
+        }
+        // 6：列和（8 个 i16 lane）。
+        let mut cols = zero;
+        for i in 0..8usize {
+            cols = _mm_add_epi16(cols, row(i));
+        }
+        // 2：行和（标量平方和 × Div[8]）。
+        let ones = _mm_set1_epi16(1);
+        let mut cost2 = 0i32;
+        for i in 0..8usize {
+            let s = _mm_madd_epi16(row(i), ones);
+            let s = _mm_hadd_epi32(s, s);
+            let s = _mm_hadd_epi32(s, s);
+            let t = _mm_cvtsi128_si32(s);
+            cost2 += t * t * 105;
+        }
+
+        let rh_even = _mm_loadu_si128(RH_EVEN.as_ptr() as *const __m128i);
+        let rh_odd = _mm_loadu_si128(RH_ODD.as_ptr() as *const __m128i);
+        let w_even = _mm256_setr_epi32(840, 420, 280, 210, 168, 140, 120, 105);
+        let w_odd = _mm256_setr_epi32(420, 210, 140, 105, 105, 105, 105, 105);
+
+        let cost0 = pair_cost(lo0, _mm_shuffle_epi8(hi0, rh_even), w_even);
+        let cost4 = pair_cost(lo4, _mm_shuffle_epi8(hi4, rh_even), w_even);
+        let cost1 = pair_cost(lo1, _mm_shuffle_epi8(hi1, rh_odd), w_odd);
+        let cost3 = pair_cost(lo3, _mm_shuffle_epi8(hi3, rh_odd), w_odd);
+        let cost5 = pair_cost(lo5, _mm_shuffle_epi8(hi5, rh_odd), w_odd);
+        let cost7 = pair_cost(lo7, _mm_shuffle_epi8(hi7, rh_odd), w_odd);
+        let sq = _mm_madd_epi16(cols, cols);
+        let m = _mm_mullo_epi32(sq, _mm_set1_epi32(105));
+        let m = _mm_hadd_epi32(m, m);
+        let m = _mm_hadd_epi32(m, m);
+        let cost6 = _mm_cvtsi128_si32(m);
+
+        let costs = [cost0, cost1, cost2, cost3, cost4, cost5, cost6, cost7];
+        let mut best_cost = 0i32;
+        let mut y_dir = 0usize;
+        for (i, &c) in costs.iter().enumerate() {
+            if c > best_cost {
+                best_cost = c;
+                y_dir = i;
+            }
+        }
+        (y_dir, (best_cost - costs[(y_dir + 4) & 7]) >> 10)
+    }
+
+    /// [`cdef_direction_avx2`] 的**两块版**：两个相邻的 8×8 块各占一个 128 位半区。
+    ///
+    /// 方向搜索是"逐行 `pshufb` + 加"；`vpshufb` 本来就**按 128 位半区独立**工作
+    /// ⇒ 两个块的同一行用同一套掩码一次算完，**指令数减半**（每半区一条通道）。
+    /// 掩码、`rev8`/`rev4z`、`rh_*` 都是 16 字节，广播到两个半区即可。
+    ///
+    /// # Safety
+    /// 已确认 AVX2；两个块的 8×8 样本都在 `data` 内（`stride` 覆盖）。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn cdef_direction_avx2_x2(
+        data: &[u16],
+        stride: usize,
+        x0a: usize,
+        y0a: usize,
+        x0b: usize,
+        y0b: usize,
+        sh: u32,
+    ) -> ((usize, i32), (usize, i32)) {
+        use std::arch::x86_64::*;
+
+        const fn shift_lo(base: usize) -> [u8; 16] {
+            let mut m = [0x80u8; 16];
+            let mut l = base;
+            while l < 8 {
+                m[2 * l] = ((l - base) * 2) as u8;
+                m[2 * l + 1] = ((l - base) * 2 + 1) as u8;
+                l += 1;
+            }
+            m
+        }
+        const fn shift_hi(base: usize) -> [u8; 16] {
+            let mut m = [0x80u8; 16];
+            let mut l = 0;
+            while l < base {
+                m[2 * l] = ((8 - base + l) * 2) as u8;
+                m[2 * l + 1] = ((8 - base + l) * 2 + 1) as u8;
+                l += 1;
+            }
+            m
+        }
+        const SHIFT_LO: [[u8; 16]; 8] = [
+            shift_lo(0), shift_lo(1), shift_lo(2), shift_lo(3),
+            shift_lo(4), shift_lo(5), shift_lo(6), shift_lo(7),
+        ];
+        const SHIFT_HI: [[u8; 16]; 8] = [
+            shift_hi(0), shift_hi(1), shift_hi(2), shift_hi(3),
+            shift_hi(4), shift_hi(5), shift_hi(6), shift_hi(7),
+        ];
+        const REV8: [u8; 16] = [14, 15, 12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1];
+        const REV4Z: [u8; 16] = [6, 7, 4, 5, 2, 3, 0, 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+        const RH_EVEN: [u8; 16] = [12, 13, 10, 11, 8, 9, 6, 7, 4, 5, 2, 3, 0, 1, 0x80, 0x80];
+        const RH_ODD: [u8; 16] = [4, 5, 2, 3, 0, 1, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80];
+
+        // 掩码广播到两个 128 位半区（`vpshufb` 按半区独立）
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn bcast(m: &[u8; 16]) -> __m256i {
+            _mm256_broadcastsi128_si256(_mm_loadu_si128(m.as_ptr() as *const __m128i))
+        }
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn add_row(
+            v: __m256i,
+            base: usize,
+            lo: &mut __m256i,
+            hi: &mut __m256i,
+            clo: &[[u8; 16]; 8],
+            chi: &[[u8; 16]; 8],
+        ) {
+            *lo = _mm256_add_epi16(*lo, _mm256_shuffle_epi8(v, bcast(&clo[base])));
+            *hi = _mm256_add_epi16(*hi, _mm256_shuffle_epi8(v, bcast(&chi[base])));
+        }
+        /// 每半区各自的 `Σ (lo[k]² + rh[k]²)·w[k]`
+        #[inline]
+        #[target_feature(enable = "avx2")]
+        unsafe fn pair_cost2(lo: __m256i, rh: __m256i, wlo: __m256i, whi: __m256i) -> [i32; 2] {
+            let il = _mm256_unpacklo_epi16(lo, rh);
+            let ih = _mm256_unpackhi_epi16(lo, rh);
+            let sl = _mm256_madd_epi16(il, il);
+            let sh2 = _mm256_madd_epi16(ih, ih);
+            let m = _mm256_add_epi32(
+                _mm256_mullo_epi32(sl, wlo),
+                _mm256_mullo_epi32(sh2, whi),
+            );
+            let m = _mm256_hadd_epi32(m, m);
+            let m = _mm256_hadd_epi32(m, m);
+            [
+                _mm_cvtsi128_si32(_mm256_castsi256_si128(m)),
+                _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(m)),
+            ]
+        }
+
+        let c128 = _mm256_set1_epi16(128);
+        let zero = _mm256_setzero_si256();
+        let mut rows = [[0i16; 16]; 8];
+        for i in 0..8usize {
+            let pa = data.as_ptr().add((y0a + i) * stride + x0a);
+            let pb = data.as_ptr().add((y0b + i) * stride + x0b);
+            let v = _mm256_set_m128i(
+                _mm_loadu_si128(pb as *const __m128i),
+                _mm_loadu_si128(pa as *const __m128i),
+            );
+            let v = match sh {
+                0 => v,
+                2 => _mm256_srli_epi16::<2>(v),
+                _ => _mm256_srli_epi16::<4>(v),
+            };
+            let v = _mm256_sub_epi16(v, c128);
+            _mm256_storeu_si256(rows[i].as_mut_ptr() as *mut __m256i, v);
+        }
+        let row = |i: usize| -> __m256i {
+            _mm256_loadu_si256(rows[i].as_ptr() as *const __m256i)
+        };
+
+        let (mut lo0, mut hi0) = (zero, zero);
+        let (mut lo4, mut hi4) = (zero, zero);
+        let (mut lo1, mut hi1) = (zero, zero);
+        let (mut lo3, mut hi3) = (zero, zero);
+        let (mut lo5, mut hi5) = (zero, zero);
+        let (mut lo7, mut hi7) = (zero, zero);
+        let rev8 = bcast(&REV8);
+        let rev4z = bcast(&REV4Z);
+        for i in 0..8usize {
+            let r = row(i);
+            add_row(r, i, &mut lo0, &mut hi0, &SHIFT_LO, &SHIFT_HI);
+            add_row(
+                _mm256_shuffle_epi8(r, rev8),
+                i,
+                &mut lo4,
+                &mut hi4,
+                &SHIFT_LO,
+                &SHIFT_HI,
+            );
+            let y = _mm256_hadd_epi16(r, zero);
+            add_row(y, i, &mut lo1, &mut hi1, &SHIFT_LO, &SHIFT_HI);
+            add_row(
+                _mm256_shuffle_epi8(y, rev4z),
+                i,
+                &mut lo3,
+                &mut hi3,
+                &SHIFT_LO,
+                &SHIFT_HI,
+            );
+            add_row(r, 3 - i / 2, &mut lo5, &mut hi5, &SHIFT_LO, &SHIFT_HI);
+            add_row(r, i / 2, &mut lo7, &mut hi7, &SHIFT_LO, &SHIFT_HI);
+        }
+        let mut cols = zero;
+        for i in 0..8usize {
+            cols = _mm256_add_epi16(cols, row(i));
+        }
+        let ones = _mm256_set1_epi16(1);
+        let mut cost2 = [0i32; 2];
+        for i in 0..8usize {
+            let s = _mm256_madd_epi16(row(i), ones);
+            let s = _mm256_hadd_epi32(s, s);
+            let s = _mm256_hadd_epi32(s, s);
+            let a = _mm_cvtsi128_si32(_mm256_castsi256_si128(s));
+            let b = _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(s));
+            cost2[0] += a * a * 105;
+            cost2[1] += b * b * 105;
+        }
+
+        let rh_even = bcast(&RH_EVEN);
+        let rh_odd = bcast(&RH_ODD);
+        let w_lo = _mm256_setr_epi32(840, 420, 280, 210, 840, 420, 280, 210);
+        let w_hi = _mm256_setr_epi32(168, 140, 120, 105, 168, 140, 120, 105);
+        let w_lo_odd = _mm256_setr_epi32(420, 210, 140, 105, 420, 210, 140, 105);
+        let w_hi_odd = _mm256_setr_epi32(105, 105, 105, 105, 105, 105, 105, 105);
+
+        let c0 = pair_cost2(lo0, _mm256_shuffle_epi8(hi0, rh_even), w_lo, w_hi);
+        let c4 = pair_cost2(lo4, _mm256_shuffle_epi8(hi4, rh_even), w_lo, w_hi);
+        let c1 = pair_cost2(lo1, _mm256_shuffle_epi8(hi1, rh_odd), w_lo_odd, w_hi_odd);
+        let c3 = pair_cost2(lo3, _mm256_shuffle_epi8(hi3, rh_odd), w_lo_odd, w_hi_odd);
+        let c5 = pair_cost2(lo5, _mm256_shuffle_epi8(hi5, rh_odd), w_lo_odd, w_hi_odd);
+        let c7 = pair_cost2(lo7, _mm256_shuffle_epi8(hi7, rh_odd), w_lo_odd, w_hi_odd);
+        let sq = _mm256_madd_epi16(cols, cols);
+        let m = _mm256_mullo_epi32(sq, _mm256_set1_epi32(105));
+        let m = _mm256_hadd_epi32(m, m);
+        let m = _mm256_hadd_epi32(m, m);
+        let c6 = [
+            _mm_cvtsi128_si32(_mm256_castsi256_si128(m)),
+            _mm_cvtsi128_si32(_mm256_extracti128_si256::<1>(m)),
+        ];
+
+        let mut out = [(0usize, 0i32); 2];
+        for half in 0..2 {
+            let costs = [
+                c0[half], c1[half], cost2[half], c3[half], c4[half], c5[half], c6[half], c7[half],
+            ];
+            let mut best_cost = 0i32;
+            let mut y_dir = 0usize;
+            for (i, &c) in costs.iter().enumerate() {
+                if c > best_cost {
+                    best_cost = c;
+                    y_dir = i;
+                }
+            }
+            out[half] = (y_dir, (best_cost - costs[(y_dir + 4) & 7]) >> 10);
+        }
+        (out[0], out[1])
     }
 
     /// **CDEF**（§7.15.3）一次滤完**四行 × 四列**（16 个 i16 通道，**全部用满**）。
@@ -1243,8 +2452,14 @@ mod x86 {
         let sec_t = _mm256_set1_epi16(sec_thr as i16);
         let pri_s = _mm_cvtsi32_si128(pri_adj as i32);
         let sec_s = _mm_cvtsi32_si128(sec_adj as i32);
-        let tap_v: [__m256i; super::CDEF_CANDS] =
-            std::array::from_fn(|c| _mm256_set1_epi16(taps[c] as i16));
+        let pri_taps = [
+            _mm256_set1_epi16(taps[0] as i16),
+            _mm256_set1_epi16(taps[2] as i16),
+        ];
+        let sec_taps = [
+            _mm256_set1_epi16(taps[4] as i16),
+            _mm256_set1_epi16(taps[8] as i16),
+        ];
         // 把 4 行（每行 4 个 u16）拼成一个 256 位向量：qword `j` = 行 `j`。
         // `lin` 是**相对块左上角**的线性偏移（候选位移就在这个尺度上），
         // 所以基准地址要带上 `y0·stride` —— 漏掉它就读成第 0..3 行了
@@ -1268,18 +2483,37 @@ mod x86 {
         let mut acc = zero;
         let mut mx = cur;
         let mut mn = cur;
-        for c in 0..super::CDEF_CANDS {
-            let (thr, sh) = if c < 4 { (pri_t, pri_s) } else { (sec_t, sec_s) };
-            let cand = gather(offs[c]);
-            // `constrain( cand - cur, thr, adj )`（§7.15.3），与 `cdef_pair16` 同式。
-            let diff = _mm256_sub_epi16(cand, cur);
-            let mag = _mm256_abs_epi16(diff);
-            let t = _mm256_sub_epi16(thr, _mm256_sra_epi16(mag, sh));
-            let t = _mm256_max_epi16(_mm256_min_epi16(t, mag), zero);
-            let val = _mm256_sign_epi16(t, diff);
-            acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(val, tap_v[c]));
-            mx = _mm256_max_epi16(mx, cand);
-            mn = _mm256_min_epi16(mn, cand);
+        // 同抽头的候选先相加、再乘一次（与 `cdef_pair16x4` 同一套推导：模 2^16 环上
+        // `v0·t + v1·t ≡ (v0+v1)·t`，逐位相同）。12 次乘 → 4 次。
+        for grp in 0..2usize {
+            let mut g = zero;
+            for k in 0..2usize {
+                let c = grp * 2 + k;
+                let cand = gather(offs[c]);
+                let diff = _mm256_sub_epi16(cand, cur);
+                let mag = _mm256_abs_epi16(diff);
+                let t = _mm256_subs_epu16(pri_t, _mm256_sra_epi16(mag, pri_s));
+                let t = _mm256_min_epu16(t, mag);
+                g = _mm256_add_epi16(g, _mm256_sign_epi16(t, diff));
+                mx = _mm256_max_epi16(mx, cand);
+                mn = _mm256_min_epi16(mn, cand);
+            }
+            acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(g, pri_taps[grp]));
+        }
+        for grp in 0..2usize {
+            let mut g = zero;
+            for k in 0..4usize {
+                let c = 4 + grp * 4 + k;
+                let cand = gather(offs[c]);
+                let diff = _mm256_sub_epi16(cand, cur);
+                let mag = _mm256_abs_epi16(diff);
+                let t = _mm256_subs_epu16(sec_t, _mm256_sra_epi16(mag, sec_s));
+                let t = _mm256_min_epu16(t, mag);
+                g = _mm256_add_epi16(g, _mm256_sign_epi16(t, diff));
+                mx = _mm256_max_epi16(mx, cand);
+                mn = _mm256_min_epi16(mn, cand);
+            }
+            acc = _mm256_add_epi16(acc, _mm256_mullo_epi16(g, sec_taps[grp]));
         }
         let adjust = _mm256_and_si256(_mm256_cmpgt_epi16(zero, acc), one);
         let v = _mm256_add_epi16(
@@ -1626,6 +2860,284 @@ mod x86 {
             (row.offset(stride) as *mut u32).write_unaligned(_mm_extract_epi32::<1>(t) as u32);
             (row.offset(2 * stride) as *mut u32).write_unaligned(_mm_extract_epi32::<2>(t) as u32);
             (row.offset(3 * stride) as *mut u32).write_unaligned(_mm_extract_epi32::<3>(t) as u32);
+        }
+    }
+
+    /// 8 路版辅助：`|a-b|`（i32 通道）。
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dbl8_adiff(a: __m256i, b: __m256i) -> __m256i {
+        _mm256_abs_epi32(_mm256_sub_epi32(a, b))
+    }
+
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dbl8_clamp(v: __m256i, bit_depth: i32) -> __m256i {
+        let lo = _mm256_set1_epi32(-(1 << (bit_depth - 1)));
+        let hi = _mm256_set1_epi32((1 << (bit_depth - 1)) - 1);
+        _mm256_min_epi32(_mm256_max_epi32(v, lo), hi)
+    }
+
+    /// 窄滤波器（8 路）：与 [`super::dbl_narrow`] 逐式相同，只是通道数翻倍。
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    unsafe fn dbl8_narrow(v: &[__m256i; 16], hev: __m256i, bit_depth: i32) -> [__m256i; 4] {
+        let off = _mm256_set1_epi32(0x80 << (bit_depth - 8));
+        let (q0, q1, p0, p1) = (v[vi(0)], v[vi(1)], v[vi(-1)], v[vi(-2)]);
+        let ps1 = _mm256_sub_epi32(p1, off);
+        let ps0 = _mm256_sub_epi32(p0, off);
+        let qs0 = _mm256_sub_epi32(q0, off);
+        let qs1 = _mm256_sub_epi32(q1, off);
+        let f0 = _mm256_and_si256(hev, dbl8_clamp(_mm256_sub_epi32(ps1, qs1), bit_depth));
+        let d3 = {
+            let d = _mm256_sub_epi32(qs0, ps0);
+            _mm256_add_epi32(d, _mm256_slli_epi32::<1>(d))
+        };
+        let filter = dbl8_clamp(_mm256_add_epi32(f0, d3), bit_depth);
+        let filter1 = _mm256_srai_epi32::<3>(dbl8_clamp(
+            _mm256_add_epi32(filter, _mm256_set1_epi32(4)),
+            bit_depth,
+        ));
+        let filter2 = _mm256_srai_epi32::<3>(dbl8_clamp(
+            _mm256_add_epi32(filter, _mm256_set1_epi32(3)),
+            bit_depth,
+        ));
+        let oq0 = _mm256_add_epi32(dbl8_clamp(_mm256_sub_epi32(qs0, filter1), bit_depth), off);
+        let op0 = _mm256_add_epi32(dbl8_clamp(_mm256_add_epi32(ps0, filter2), bit_depth), off);
+        let fh = _mm256_srai_epi32::<1>(_mm256_add_epi32(filter1, _mm256_set1_epi32(1)));
+        let oq1 = _mm256_add_epi32(dbl8_clamp(_mm256_sub_epi32(qs1, fh), bit_depth), off);
+        let op1 = _mm256_add_epi32(dbl8_clamp(_mm256_add_epi32(ps1, fh), bit_depth), off);
+        [
+            _mm256_blendv_epi8(op1, p1, hev),
+            op0,
+            oq0,
+            _mm256_blendv_epi8(oq1, q1, hev),
+        ]
+    }
+
+    #[inline(always)]
+    fn dbl8_at<const N: i32>(v: &[__m256i; 16], k: i32) -> __m256i {
+        v[vi(k.clamp(-(N + 1), N))]
+    }
+
+    /// 宽滤波器（8 路）：与 [`super::dbl_wide`] 同一递推、同一判据。
+    #[target_feature(enable = "avx2")]
+    #[inline]
+    unsafe fn dbl8_wide<const N: i32, const N2: i32, const L2: i32>(
+        v: &[__m256i; 16],
+    ) -> [__m256i; 12] {
+        let half = _mm256_set1_epi32(1 << (L2 - 1));
+        let mut a = _mm256_setzero_si256();
+        let mut j = -N;
+        while j <= N {
+            let s = dbl8_at::<N>(v, j - N);
+            a = _mm256_add_epi32(a, if j.abs() <= N2 { _mm256_slli_epi32::<1>(s) } else { s });
+            j += 1;
+        }
+        let mut f = [_mm256_setzero_si256(); 12];
+        let mut i = -N;
+        f[0] = _mm256_srai_epi32::<L2>(_mm256_add_epi32(a, half));
+        while i < N - 1 {
+            a = _mm256_add_epi32(a, dbl8_at::<N>(v, i + N + 1));
+            a = _mm256_sub_epi32(a, dbl8_at::<N>(v, i - N));
+            a = _mm256_add_epi32(a, dbl8_at::<N>(v, i + N2 + 1));
+            a = _mm256_sub_epi32(a, dbl8_at::<N>(v, i - N2));
+            i += 1;
+            f[(i + N) as usize] = _mm256_srai_epi32::<L2>(_mm256_add_epi32(a, half));
+        }
+        f
+    }
+
+    /// 8 路去块的**掩码 + 滤波器 + 融合**（横/竖两条边共用）：
+    /// 入参是已经按"通道 = 沿边方向的 8 个像素"排好的 16 个窗口向量，
+    /// 返回 `(out, n)`：`out[i]` = 列 `xp-n+i`（横边则是行 `yp-n+i`）。
+    #[inline]
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn dbl8_core(
+        v: &[__m256i; 16],
+        plane: u8,
+        filter_size: i32,
+        bd_shift: i32,
+        bit_depth: i32,
+        limit: i32,
+        blimit: i32,
+        thresh: i32,
+    ) -> Option<([__m256i; 12], usize)> {
+        let zero = _mm256_setzero_si256();
+        let (p1, p0, q0, q1) = (v[vi(-2)], v[vi(-1)], v[vi(0)], v[vi(1)]);
+        let thresh_v = _mm256_set1_epi32(thresh << bd_shift);
+        let hev = _mm256_or_si256(
+            _mm256_cmpgt_epi32(dbl8_adiff(p1, p0), thresh_v),
+            _mm256_cmpgt_epi32(dbl8_adiff(q1, q0), thresh_v),
+        );
+        let limit_v = _mm256_set1_epi32(limit << bd_shift);
+        let blimit_v = _mm256_set1_epi32(blimit << bd_shift);
+        let mut m = _mm256_or_si256(
+            _mm256_cmpgt_epi32(dbl8_adiff(p1, p0), limit_v),
+            _mm256_cmpgt_epi32(dbl8_adiff(q1, q0), limit_v),
+        );
+        let t = _mm256_add_epi32(
+            _mm256_slli_epi32::<1>(dbl8_adiff(p0, q0)),
+            _mm256_srai_epi32::<1>(dbl8_adiff(p1, q1)),
+        );
+        m = _mm256_or_si256(m, _mm256_cmpgt_epi32(t, blimit_v));
+        if filter_size != 4 {
+            let (p2, q2) = (v[vi(-3)], v[vi(2)]);
+            m = _mm256_or_si256(m, _mm256_cmpgt_epi32(dbl8_adiff(p2, p1), limit_v));
+            m = _mm256_or_si256(m, _mm256_cmpgt_epi32(dbl8_adiff(q2, q1), limit_v));
+            if plane == 0 {
+                let (p3, q3) = (v[vi(-4)], v[vi(3)]);
+                m = _mm256_or_si256(m, _mm256_cmpgt_epi32(dbl8_adiff(p3, p2), limit_v));
+                m = _mm256_or_si256(m, _mm256_cmpgt_epi32(dbl8_adiff(q3, q2), limit_v));
+            }
+        }
+        let pass_mask = _mm256_cmpeq_epi32(m, zero);
+        if _mm256_movemask_epi8(pass_mask) == 0 {
+            return None;
+        }
+        let mut flat = zero;
+        let mut flat2 = zero;
+        if filter_size >= 8 {
+            let th = _mm256_set1_epi32(1 << bd_shift);
+            let (p2, q2) = (v[vi(-3)], v[vi(2)]);
+            flat = _mm256_or_si256(
+                _mm256_cmpgt_epi32(dbl8_adiff(p1, p0), th),
+                _mm256_cmpgt_epi32(dbl8_adiff(q1, q0), th),
+            );
+            flat = _mm256_or_si256(flat, _mm256_cmpgt_epi32(dbl8_adiff(p2, p0), th));
+            flat = _mm256_or_si256(flat, _mm256_cmpgt_epi32(dbl8_adiff(q2, q0), th));
+            if plane == 0 {
+                let (p3, q3) = (v[vi(-4)], v[vi(3)]);
+                flat = _mm256_or_si256(flat, _mm256_cmpgt_epi32(dbl8_adiff(p3, p0), th));
+                flat = _mm256_or_si256(flat, _mm256_cmpgt_epi32(dbl8_adiff(q3, q0), th));
+            }
+        }
+        if filter_size >= 16 {
+            let th = _mm256_set1_epi32(1 << bd_shift);
+            for k in [-7i32, -6, -5] {
+                flat2 = _mm256_or_si256(flat2, _mm256_cmpgt_epi32(dbl8_adiff(v[vi(k)], p0), th));
+            }
+            for k in [4i32, 5, 6] {
+                flat2 = _mm256_or_si256(flat2, _mm256_cmpgt_epi32(dbl8_adiff(v[vi(k)], q0), th));
+            }
+        }
+        let flat_mask = _mm256_cmpeq_epi32(flat, zero);
+        let flat2_mask = _mm256_cmpeq_epi32(flat2, zero);
+        let wide_lane = if filter_size >= 8 { flat_mask } else { zero };
+        let wide16_lane = if filter_size >= 16 {
+            _mm256_and_si256(flat_mask, flat2_mask)
+        } else {
+            zero
+        };
+        let wide8_lane = _mm256_andnot_si256(wide16_lane, wide_lane);
+        let narrow_lane = _mm256_andnot_si256(wide_lane, pass_mask);
+        let w8_lane = _mm256_and_si256(wide8_lane, pass_mask);
+        let w16_lane = _mm256_and_si256(wide16_lane, pass_mask);
+        let n = if filter_size == 4 {
+            2usize
+        } else if filter_size >= 16 {
+            6
+        } else if plane == 0 {
+            3
+        } else {
+            2
+        };
+        let nv = if _mm256_movemask_epi8(narrow_lane) != 0 {
+            dbl8_narrow(&v, hev, bit_depth)
+        } else {
+            [zero; 4]
+        };
+        let nw8 = if plane == 0 { 3i32 } else { 2 };
+        let w8 = if _mm256_movemask_epi8(w8_lane) != 0 {
+            if plane == 0 {
+                dbl8_wide::<3, 0, 3>(&v)
+            } else {
+                dbl8_wide::<2, 1, 3>(&v)
+            }
+        } else {
+            [zero; 12]
+        };
+        let w16 = if _mm256_movemask_epi8(w16_lane) != 0 {
+            dbl8_wide::<6, 1, 4>(&v)
+        } else {
+            [zero; 12]
+        };
+        let mut out = [zero; 12];
+        for (i, k) in (-(n as i32)..n as i32).enumerate() {
+            out[i] = v[vi(k)];
+        }
+        if _mm256_movemask_epi8(narrow_lane) != 0 {
+            for k in -2i32..2 {
+                let i = (k + n as i32) as usize;
+                out[i] = _mm256_blendv_epi8(out[i], nv[(k + 2) as usize], narrow_lane);
+            }
+        }
+        if _mm256_movemask_epi8(w8_lane) != 0 {
+            for k in -nw8..nw8 {
+                let i = (k + n as i32) as usize;
+                out[i] = _mm256_blendv_epi8(out[i], w8[(k + nw8) as usize], w8_lane);
+            }
+        }
+        if _mm256_movemask_epi8(w16_lane) != 0 {
+            for k in -6i32..6 {
+                let i = (k + n as i32) as usize;
+                out[i] = _mm256_blendv_epi8(out[i], w16[(k + 6) as usize], w16_lane);
+            }
+        }
+        Some((out, n))
+    }
+
+    /// **横边**的 8 路去块内核：一条横边一次滤 **8 列**（相邻两个 4 像素段）。
+    ///
+    /// 与两次 [`deblock_edge4`]（`xp`、`xp+4`）逐字节相同：横边按**列**独立，
+    /// 两段之间没有读写依赖。竖边要 8×8 转置，暂不走这条。
+    ///
+    /// # Safety
+    /// - 已确认 AVX2；窗口 `[yp-need, yp+need)` × `[xp, xp+8)` 全在帧内
+    ///   （调用方保证 `xp+8 <= w`、`yp >= need`、`yp+need-1 < h`）。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn deblock_edge8_h(
+        data: *mut u16,
+        stride: isize,
+        bit_depth: u8,
+        xp: i32,
+        yp: i32,
+        plane: u8,
+        filter_size: i32,
+        need: i32,
+        limit: i32,
+        blimit: i32,
+        thresh: i32,
+    ) {
+        let (x, y) = (xp as isize, yp as isize);
+        let bd_shift = i32::from(bit_depth) - 8;
+        let bit_depth = i32::from(bit_depth);
+
+        let mut v = [_mm256_setzero_si256(); 16];
+        for k in -need..need {
+            let row = data.offset((y + k as isize) * stride + x);
+            v[vi(k)] = _mm256_cvtepu16_epi32(_mm_loadu_si128(row as *const __m128i));
+        }
+
+        let Some((out, n)) = dbl8_core(
+            &v, plane, filter_size, bd_shift, bit_depth, limit, blimit, thresh,
+        ) else {
+            return;
+        };
+        // 写回（横边）：`out[i]` = 行 `y-n+i` 的 8 个 u16。两行一次打包。
+        let yn = y - n as isize;
+        let mut i = 0usize;
+        while i < 2 * n {
+            let p = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi32(out[i], out[i + 1]));
+            let row = data.offset((yn + i as isize) * stride + x);
+            _mm_storeu_si128(row as *mut __m128i, _mm256_castsi256_si128(p));
+            _mm_storeu_si128(
+                row.offset(stride) as *mut __m128i,
+                _mm256_extracti128_si256::<1>(p),
+            );
+            i += 2;
         }
     }
 
@@ -2051,6 +3563,10 @@ mod x86 {
         let n0 = 1usize << n;
         // 暂存**不清零**：只写 `[..n0]`、只读 `[..n0]`（`n0` 最小只有 4，
         // 给整个 2KB 数组清零在小块上是纯浪费）。
+        //
+        // ⚠️ 2026-10-24 试过"原地交换"（位反转是对合 ⇒ `i < brev(i)` 时 swap）：
+        // **+3.5%（3/10 轮）** —— 逐元素的分支 + 变址 `swap` 输给下面这两段
+        // 直写、无分支、可展开的拷贝。已回退，别再试。
         let mut copy: [MaybeUninit<__m256i>; 64] = [const { MaybeUninit::uninit() }; 64];
         for (i, slot) in copy[..n0].iter_mut().enumerate() {
             slot.write(v[i]);
@@ -2443,6 +3959,10 @@ unsafe fn vt_adst_output_permute<const I32: bool>(v: &mut [__m256i], n: u32) {
     }
 
     /// 1D 变换的通道版入口（与标量的 `forward_1d` 同一张分派表）。
+    ///
+    /// ⚠️ 2026-10-24 试过给这里加 `#[inline]`（想让"三层 match 的分派器"消失）：
+    /// **+4.9%（2/10 轮）** —— 三个变换体被展开进每个调用点，代码膨胀反而伤
+    /// I-cache。**保持不内联。**
     #[target_feature(enable = "avx2")]
     unsafe fn vt_forward_1d<const I32: bool>(kind: u32, v: &mut [__m256i], n: u32, r: u32) {
         match kind {
@@ -3060,6 +4580,262 @@ unsafe fn vt_adst_output_permute<const I32: bool>(v: &mut [__m256i], n: u32) {
         }
     }
 
+    /// `SMOOTH_PRED` / `SMOOTH_V_PRED` / `SMOOTH_H_PRED` 的**一行**（8 像素）。
+    ///
+    /// 规范式（`smooth` 的标量版）每像素 4 次乘加；这里把 `j` 方向铺成 8 个 i32 通道：
+    /// `v = wy·A[j] + (256−wy)·Llast + wx[j]·L[i] + (256−wx[j])·Alast`
+    /// （V/H 两档各去掉一项）。值域：8/12bit 下 `A,L ≤ 4095`、权重 ≤ 256 ⇒ 和 ≤ 2^22，
+    /// i32 装得下；与标量式**逐位相同**（乘加顺序不影响整数结果，取整只做一次）。
+    ///
+    /// `mode`：0 = 双线性、1 = 竖直、2 = 水平（调用方按预测模式传）。
+    ///
+    /// # Safety
+    /// 已确认 AVX2；`above` 可读 8 个 i32、`wx` 可读 8 个 i32、`out` 可写 8 个 u16。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn intra_smooth_row(
+        above: *const i32,
+        wx: *const i32,
+        wy: i32,
+        l_i: i32,
+        a_last: i32,
+        l_last: i32,
+        mode: u32,
+        shift: u32,
+        out: *mut u16,
+    ) {
+        use std::arch::x86_64::*;
+        // `above` 是 i32 边数组（样本值 0..2^bd-1），直接 8 通道装载
+        let av = _mm256_loadu_si256(above as *const __m256i);
+        let wvv = _mm256_loadu_si256(wx as *const __m256i);
+        let r#const = _mm256_set1_epi32(256);
+        let wyv = _mm256_set1_epi32(wy);
+        let li = _mm256_set1_epi32(l_i);
+        let alast = _mm256_set1_epi32(a_last);
+        let llast = _mm256_set1_epi32(l_last);
+        let v = match mode {
+            1 => _mm256_add_epi32(
+                _mm256_mullo_epi32(wyv, av),
+                _mm256_mullo_epi32(_mm256_sub_epi32(r#const, wyv), llast),
+            ),
+            2 => _mm256_add_epi32(
+                _mm256_mullo_epi32(wvv, li),
+                _mm256_mullo_epi32(_mm256_sub_epi32(r#const, wvv), alast),
+            ),
+            _ => {
+                let t1 = _mm256_mullo_epi32(wyv, av);
+                let t2 = _mm256_mullo_epi32(_mm256_sub_epi32(r#const, wyv), llast);
+                let t3 = _mm256_mullo_epi32(wvv, li);
+                let t4 = _mm256_mullo_epi32(_mm256_sub_epi32(r#const, wvv), alast);
+                _mm256_add_epi32(_mm256_add_epi32(t1, t2), _mm256_add_epi32(t3, t4))
+            }
+        };
+        // `(v + (1 << (shift-1))) >> shift`（v >= 0 ⇒ 算术/逻辑右移同值）
+        let rb = _mm256_set1_epi32(1 << (shift - 1));
+        let cnt = _mm_cvtsi32_si128(shift as i32);
+        let r = _mm256_srl_epi32(_mm256_add_epi32(v, rb), cnt);
+        // 收窄到 u16：低 8 个 i32 → 8 个 u16
+        let p = _mm256_packus_epi32(r, r);
+        let q = _mm_unpacklo_epi64(
+            _mm256_castsi256_si128(p),
+            _mm256_extracti128_si256::<1>(p),
+        );
+        _mm_storeu_si128(out as *mut __m128i, q);
+    }
+
+    /// `w×h` 的 u16 矩形拷贝（目标/源可以不同 stride），**整块一次调用**。
+    ///
+    /// ⚠️ 逐行调用 libc `memcpy` 时，每行 128 字节也要付一次真实调用；而
+    /// `#[target_feature]` 又不能内联进普通函数 ⇒ 行循环必须放在核心里。
+    ///
+    /// # Safety
+    /// 已确认 AVX2；`src` 可读 `h` 行的 `sstride` 个 u16（至少 `w` 个），
+    /// `dst` 可写 `h` 行的 `dstride` 个 u16（至少 `w` 个）。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn copy_rect_u16(
+        dst: *mut u16,
+        dstride: usize,
+        src: *const u16,
+        sstride: usize,
+        w: usize,
+        h: usize,
+    ) {
+        use std::arch::x86_64::*;
+        for i in 0..h {
+            let s = src.add(i * sstride);
+            let d = dst.add(i * dstride);
+            let mut c = 0usize;
+            while c + 32 <= w {
+                let a = _mm256_loadu_si256(s.add(c) as *const __m256i);
+                let b = _mm256_loadu_si256(s.add(c + 16) as *const __m256i);
+                _mm256_storeu_si256(d.add(c) as *mut __m256i, a);
+                _mm256_storeu_si256(d.add(c + 16) as *mut __m256i, b);
+                c += 32;
+            }
+            while c + 16 <= w {
+                let a = _mm256_loadu_si256(s.add(c) as *const __m256i);
+                _mm256_storeu_si256(d.add(c) as *mut __m256i, a);
+                c += 16;
+            }
+            while c + 8 <= w {
+                let a = _mm_loadu_si128(s.add(c) as *const __m128i);
+                _mm_storeu_si128(d.add(c) as *mut __m128i, a);
+                c += 8;
+            }
+            while c < w {
+                *d.add(c) = *s.add(c);
+                c += 1;
+            }
+        }
+    }
+
+    /// 往 u16 平面加**一个常量残差**：`dst = Clip1(dst + c)`（DC-only 快路径用）。
+    ///
+    /// DC-only 的 2-D 反变换是恒定平面（有单测钉住），所以整块只要一次
+    /// "逐像素加常量 + 钳位"，不必跑蝶形。
+    ///
+    /// # Safety
+    /// 已确认 AVX2；`dst` 可写 `h` 行、每行 `stride` 个 u16（至少 `w` 个）。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn add_const_plane(
+        dst: *mut u16,
+        stride: usize,
+        w: usize,
+        h: usize,
+        c: i32,
+        max: i32,
+    ) {
+        use std::arch::x86_64::*;
+        // ⚠️ 8bit 的 i16 路径要求 `p + c` 不越出 i16：`p <= 255` ⇒ 只要求 `c <= 32512`
+        // （第一版漏了这条：`c = 32767` 时 `255 + c` 回绕成负数，整帧哈希就变了）。
+        if max <= 255 && c <= 32512 {
+            // 8bit：**16 通道 i16 + `packus`**（`p <= 255`、`c` 在界内 ⇒ 和不会溢出 i16，
+            // `packus` 的饱和正好就是 `Clip1`）。
+            // ⚠️ 平面是 **u16 存储**：16 个样本要写回 32 字节（不是"打包成 u8"）。
+            // 钳位用 i16 的 min/max（`p + c` 已在 i16 范围内，255 < 32767）。
+            let cv = _mm256_set1_epi16(c as i16);
+            let zero16 = _mm256_setzero_si256();
+            let max16 = _mm256_set1_epi16(max as i16);
+            for y in 0..h {
+                let row = dst.add(y * stride);
+                let mut x = 0usize;
+                while x + 16 <= w {
+                    let p = _mm256_loadu_si256(row.add(x) as *const __m256i);
+                    let v = _mm256_min_epi16(
+                        _mm256_max_epi16(_mm256_add_epi16(p, cv), zero16),
+                        max16,
+                    );
+                    _mm256_storeu_si256(row.add(x) as *mut __m256i, v);
+                    x += 16;
+                }
+                while x < w {
+                    *row.add(x) = ((*row.add(x) as i32 + c).clamp(0, max)) as u16;
+                    x += 1;
+                }
+            }
+            return;
+        }
+        let cv = _mm256_set1_epi32(c);
+        let zero = _mm256_setzero_si256();
+        let maxv = _mm256_set1_epi32(max);
+        for y in 0..h {
+            let row = dst.add(y * stride);
+            let mut x = 0usize;
+            while x + 8 <= w {
+                let p = _mm256_cvtepu16_epi32(_mm_loadu_si128(row.add(x) as *const __m128i));
+                let v = _mm256_min_epi32(_mm256_max_epi32(_mm256_add_epi32(p, cv), zero), maxv);
+                let q = _mm256_packus_epi32(v, v);
+                let q = _mm_unpacklo_epi64(
+                    _mm256_castsi256_si128(q),
+                    _mm256_extracti128_si256::<1>(q),
+                );
+                _mm_storeu_si128(row.add(x) as *mut __m128i, q);
+                x += 8;
+            }
+            while x < w {
+                *row.add(x) = ((*row.add(x) as i32 + c).clamp(0, max)) as u16;
+                x += 1;
+            }
+        }
+    }
+
+
+    /// **SGR 收尾投影的一行**（8 像素）：`out = Clip1(Round2(w1·u + w0·f0 + w2·f1, shift))`。
+    ///
+    /// `u` 是 `CdefFrame` 的样本（左移 `SGRPROJ_RST_BITS = 4` 后参与），`f0`/`f1` 是两档
+    /// box filter 的结果（i32）。`F0`/`F1` = 该档 `r == 0`（此时没有 f，用 `u` 代替）——
+    /// 编译期常量，4 个两种布尔组合各一份实例，循环里没有分支。
+    ///
+    /// # Safety
+    /// 已确认 AVX2；`u` 可读 `n` 个 u16、`f0`/`f1` 在需要时可读 `n` 个 i32、
+    /// `out` 可写 `n` 个 i16（值域 `[0, max]`，与 u16 位型相同）。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn sgr_proj_row8<const F0: bool, const F1: bool>(
+        u: *const u16,
+        f0: *const i32,
+        f1: *const i32,
+        out: *mut i16,
+        n: usize,
+        w0: i32,
+        w1: i32,
+        w2: i32,
+        shift: u32,
+        max: i32,
+    ) {
+        use std::arch::x86_64::*;
+        let vw0 = _mm256_set1_epi32(w0);
+        let vw1 = _mm256_set1_epi32(w1);
+        let vw2 = _mm256_set1_epi32(w2);
+        let rnd = _mm256_set1_epi32(1 << (shift - 1));
+        let cnt = _mm_cvtsi32_si128(shift as i32);
+        let zero = _mm256_setzero_si256();
+        let vmax = _mm256_set1_epi32(max);
+        let mut j = 0usize;
+        while j + 8 <= n {
+            let uv = _mm256_slli_epi32::<4>(
+                _mm256_cvtepu16_epi32(_mm_loadu_si128(u.add(j) as *const __m128i)),
+            );
+            let a = if F0 {
+                _mm256_loadu_si256(f0.add(j) as *const __m256i)
+            } else {
+                uv
+            };
+            let b = if F1 {
+                _mm256_loadu_si256(f1.add(j) as *const __m256i)
+            } else {
+                uv
+            };
+            let v = _mm256_add_epi32(
+                _mm256_add_epi32(
+                    _mm256_mullo_epi32(vw1, uv),
+                    _mm256_mullo_epi32(vw0, a),
+                ),
+                _mm256_mullo_epi32(vw2, b),
+            );
+            // `round2(x, n) = (x + (1<<(n-1))) >> n`（**算术**右移，与标量一致）
+            let s = _mm256_sra_epi32(_mm256_add_epi32(v, rnd), cnt);
+            let s = _mm256_min_epi32(_mm256_max_epi32(s, zero), vmax);
+            let q = _mm256_packus_epi32(s, s);
+            let q = _mm_unpacklo_epi64(
+                _mm256_castsi256_si128(q),
+                _mm256_extracti128_si256::<1>(q),
+            );
+            _mm_storeu_si128(out.add(j) as *mut __m128i, q);
+            j += 8;
+        }
+        while j < n {
+            let uv = i32::from(*u.add(j)) << 4;
+            let a = if F0 { *f0.add(j) } else { uv };
+            let b = if F1 { *f1.add(j) } else { uv };
+            let v = w1 * uv + w0 * a + w2 * b;
+            *out.add(j) = ((v + (1 << (shift - 1))) >> shift).clamp(0, max) as i16;
+            j += 1;
+        }
+    }
+
+
 }
 
 // 这份重导出是**给单测/微基准留的入口**：`inter.rs` 的 `block_inter_prediction`
@@ -3070,13 +4846,16 @@ unsafe fn vt_adst_output_permute<const I32: bool>(v: &mut [__m256i], n: u32) {
 #[allow(unused_imports)]
 pub(crate) use x86::{
     diffwtd_mask8,
-    cdef_pair16, cdef_quad8, deblock_edge4, inv_txfm_cols, inv_txfm_cols_i32, inv_txfm_rows,
+    cdef_direction_avx2, cdef_pair16, cdef_pair16x4, cdef_quad8, deblock_edge4, inv_txfm_cols, inv_txfm_cols_i32, inv_txfm_rows,
     inv_txfm_rows_i32,
     blend_avg8, blend_dist8, blend_masked8, blend_masked_u16in8, mc_delta8, mc_horiz8,
     mc_horiz16_8bpc, mc_horiz16_u8, mc_horiz_rows_8bpc, mc_shift8, mc_shift_row,
     mc_shift_rows, mc_vert8,
-    mc_vert_rows_8bpc,
-    sgr_ab_8, sgr_cols_update8, sgr_final_8, store_row_clamped, wiener_horiz_rows, wiener_vert_row,
+    mc_vert_rows_8bpc, mc_vert_rows_u16, comp_avg_rows, mc_vert2_avg_u16, add_residual_u16,
+    deblock_edge8_h, add_residual_u16_rev, dequantize_8,
+    sgr_ab_8, sgr_cols_update8, sgr_final_8, sgr_final_8_pat, store_row_clamped, wiener_horiz_rows,
+    wiener_vert_row,
+    intra_smooth_row, cdef_direction_avx2_x2, copy_rect_u16, add_const_plane, sgr_proj_row8,
 };
 
 /// 非 x86_64：没有 AVX2 内核，`avx2_available()` 恒为 false ⇒ 这两个入口
@@ -3146,6 +4925,18 @@ pub(crate) unsafe fn mc_shift_rows(
     0
 }
 
+/// 非 x86_64 的方向搜索桩（`avx2_available()` 恒假 ⇒ 调用方走标量）。
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn cdef_direction_avx2(
+    _data: &[u16],
+    _stride: usize,
+    _x0: usize,
+    _y0: usize,
+    _sh: u32,
+) -> (usize, i32) {
+    (0, 0)
+}
+
 /// 非 x86_64 的 CDEF 桩（`avx2_available()` 恒假 ⇒ 调用方走标量）。
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
@@ -3175,6 +4966,27 @@ pub(crate) unsafe fn cdef_quad8(
     _stride: isize,
     _x0: isize,
     _y0: isize,
+    _offs: &[isize; CDEF_CANDS],
+    _taps: &[i32; CDEF_CANDS],
+    _pri_thr: i32,
+    _pri_adj: u32,
+    _sec_thr: i32,
+    _sec_adj: u32,
+    _dst: *mut u16,
+    _dst_stride: isize,
+) {
+}
+
+/// 非 x86_64 的 CDEF 四行桩（见 [`cdef_pair16`] 的同名桩）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cdef_pair16x4(
+    _data: &[u16],
+    _stride: isize,
+    _x0: isize,
+    _y0: isize,
+    _h: usize,
+    _wu: usize,
     _offs: &[isize; CDEF_CANDS],
     _taps: &[i32; CDEF_CANDS],
     _pri_thr: i32,
@@ -3266,6 +5078,97 @@ pub(crate) unsafe fn mc_horiz_rows_8bpc(
 ) {
 }
 
+
+/// 非 x86_64：没有 AVX2 内核（`avx2_available()` 恒假 ⇒ 调用方不会走到这里）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn comp_avg_rows(
+    _a: *const u16,
+    _a_stride: usize,
+    _ax: usize,
+    _ay: usize,
+    _b: *const u16,
+    _b_stride: usize,
+    _bx: usize,
+    _by: usize,
+    _dst: *mut u16,
+    _dst_stride: usize,
+    _dx: usize,
+    _dy: usize,
+    _w: usize,
+    _h: usize,
+) {
+}
+
+
+/// 非 x86_64：没有 AVX2 内核（`avx2_available()` 恒假 ⇒ 调用方不会走到这里）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn mc_vert2_avg_u16(
+    _a: &[i16],
+    _b: &[i16],
+    _wu: usize,
+    _h: usize,
+    _fya: &[i16; 8],
+    _fyb: &[i16; 8],
+    _round: u32,
+    _blend_shift: u32,
+    _max: i32,
+    _dst: *mut u16,
+    _dst_stride: isize,
+) {
+}
+
+
+
+/// 非 x86_64：没有 AVX2 内核（`avx2_available()` 恒假 ⇒ 调用方不会走到这里）。
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn add_residual_u16(_dst: *mut u16, _res: *const i32, _n: usize, _max: i32) {}
+
+
+/// 非 x86_64：8 路横边内核桩。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn deblock_edge8_h(
+    _data: *mut u16,
+    _stride: isize,
+    _bit_depth: u8,
+    _xp: i32,
+    _yp: i32,
+    _plane: u8,
+    _filter_size: i32,
+    _need: i32,
+    _limit: i32,
+    _blimit: i32,
+    _thresh: i32,
+) {
+}
+
+
+
+
+
+/// 非 x86_64：翻转残差桩。
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn add_residual_u16_rev(_dst: *mut u16, _res: *const i32, _n: usize, _max: i32) {}
+
+
+/// 非 x86_64：反量化桩。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn dequantize_8(
+    _levels: *const i32,
+    _t: *mut i32,
+    _n: usize,
+    _q_dc: i32,
+    _q_ac: i32,
+    _denom_shift: u32,
+    _lo: i32,
+    _hi: i32,
+) {
+}
+
+
 /// 非 x86_64 的整块纵向桩，见 [`mc_horiz_rows_8bpc`]。
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
@@ -3276,6 +5179,22 @@ pub(crate) unsafe fn mc_vert_rows_8bpc(
     _coef: &[i16; 8],
     _round: u32,
     _out: *mut i32,
+) {
+}
+
+
+/// 非 x86_64：没有 AVX2 内核（`avx2_available()` 恒假 ⇒ 调用方不会走到这里）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn mc_vert_rows_u16(
+    _inter: &[i16],
+    _wu: usize,
+    _h: usize,
+    _coef: &[i16; 8],
+    _round: u32,
+    _max: i32,
+    _dst: *mut u16,
+    _dst_stride: isize,
 ) {
 }
 
@@ -3291,6 +5210,8 @@ pub(crate) unsafe fn blend_avg8(
     _max: i32,
 ) {
 }
+
+
 
 /// 非 x86_64 的混合桩，见 [`blend_masked8`]。
 #[cfg(not(target_arch = "x86_64"))]
@@ -3388,6 +5309,80 @@ pub(crate) unsafe fn deblock_edge4(
 ) {
 }
 
+/// 非 x86_64 的 SGR 收尾投影桩（`avx2_available()` 恒假 ⇒ 走标量）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn sgr_proj_row8<const F0: bool, const F1: bool>(
+    _u: *const u16,
+    _f0: *const i32,
+    _f1: *const i32,
+    _out: *mut i16,
+    _n: usize,
+    _w0: i32,
+    _w1: i32,
+    _w2: i32,
+    _shift: u32,
+    _max: i32,
+) {
+}
+
+/// 非 x86_64 的常量残差桩（`avx2_available()` 恒假 ⇒ 调用方走完整反变换）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn add_const_plane(
+    _dst: *mut u16,
+    _stride: usize,
+    _w: usize,
+    _h: usize,
+    _c: i32,
+    _max: i32,
+) {
+}
+
+/// 非 x86_64 的矩形拷贝桩（`avx2_available()` 恒假 ⇒ 调用方走逐行）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn copy_rect_u16(
+    _dst: *mut u16,
+    _dstride: usize,
+    _src: *const u16,
+    _sstride: usize,
+    _w: usize,
+    _h: usize,
+) {
+}
+
+/// 非 x86_64 的两块方向搜索桩（`avx2_available()` 恒假 ⇒ 走标量）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cdef_direction_avx2_x2(
+    _data: &[u16],
+    _stride: usize,
+    _x0a: usize,
+    _y0a: usize,
+    _x0b: usize,
+    _y0b: usize,
+    _sh: u32,
+) -> ((usize, i32), (usize, i32)) {
+    ((0, 0), (0, 0))
+}
+
+/// 非 x86_64 的帧内 smooth 桩（`avx2_available()` 恒假 ⇒ 走标量）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn intra_smooth_row(
+    _above: *const i32,
+    _wx: *const i32,
+    _wy: i32,
+    _l_i: i32,
+    _a_last: i32,
+    _l_last: i32,
+    _mode: u32,
+    _shift: u32,
+    _out: *mut u16,
+) {
+}
+
 /// 非 x86_64 的 SGR 列累加桩（`avx2_available()` 恒假 ⇒ 逐列标量累加）。
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
@@ -3432,6 +5427,18 @@ pub(crate) unsafe fn sgr_final_8(
     _wts: &[[i32; 3]; 3],
     _u: *const u16,
     _shift: u32,
+    _out: &mut [i32],
+) {
+}
+
+/// 非 x86_64 的 [`sgr_final_8_pat`] 桩（`avx2_available()` 恒假 ⇒ 走标量 3×3）。
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn sgr_final_8_pat<const PAT: u8, const SHIFT: i32>(
+    _a_buf: &[i32],
+    _b_buf: &[i32],
+    _aw: usize,
+    _base: usize,
+    _u: *const u16,
     _out: &mut [i32],
 ) {
 }
@@ -4223,6 +6230,7 @@ mod tests {
         // 目标缓冲与源同 stride（内核按 `(y0+r)*dst_stride + x0` 写，`x0 = 8`）
         let mut out_i16 = vec![0u16; stride * rows];
         let mut best_new = f64::MAX;
+        let mut best_x4 = f64::MAX;
         let mut best_old = f64::MAX;
         for _ in 0..3 {
             // 两个内核交替跑，机器负载对两者的影响才可比。
@@ -4253,6 +6261,30 @@ mod tests {
             let t = std::time::Instant::now();
             for _ in 0..iters {
                 std::hint::black_box(unsafe {
+                    cdef_pair16x4(
+                        std::hint::black_box(&data),
+                        stride as isize,
+                        x0,
+                        y0,
+                        8,
+                        8,
+                        &offs,
+                        &taps,
+                        pri_thr,
+                        adj,
+                        sec_thr,
+                        adj,
+                        out_i16.as_mut_ptr(),
+                        stride as isize,
+                    )
+                });
+            }
+            let ns = t.elapsed().as_secs_f64() * 1e9 / iters as f64;
+            best_x4 = best_x4.min(ns);
+
+            let t = std::time::Instant::now();
+            for _ in 0..iters {
+                std::hint::black_box(unsafe {
                     cdef_block8_ref(
                         std::hint::black_box(&data),
                         stride as isize,
@@ -4273,9 +6305,9 @@ mod tests {
             best_old = best_old.min(ns);
         }
         eprintln!(
-            "CDEF 8×8 块（亮度）：新 i16 两行 {best_new:7.1} ns/块、旧 i32 一行 {best_old:7.1} ns/块 \
-             ⇒ {:.2}x",
-            best_old / best_new
+            "CDEF 8×8 块（亮度）：i16 两行 {best_new:7.1} ns/块、i16 四行 {best_x4:7.1} ns/块、\
+             旧 i32 一行 {best_old:7.1} ns/块 ⇒ 四行/两行 {:.2}x",
+            best_new / best_x4
         );
     }
 
@@ -4387,6 +6419,138 @@ mod tests {
                             "r={r} c={c} h={h} wu={wu} pri={pri_str} sec={sec_str}"
                         );
                     }
+                }
+            }
+        }
+    }
+
+    /// [`cdef_pair16x4`]（四行一组）必须与 [`cdef_pair16`]（两行一组）**逐位相同**。
+    ///
+    /// 两条路的像素式完全相同、只是向量打包方式不同；这里对 8 个方向、
+    /// 两种宽度、三组强度逐字节对拍两块目标缓冲。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    /// **融合的"纵向两路 + AVERAGE"必须与"两路纵向 + 平均"逐位一致**
+    /// （`mc_vert2_avg_u16` vs `mc_vert_rows_8bpc` ×2 + 标量混合）。
+    #[test]
+    fn mc_vert2_avg_u16_matches_vert_then_average() {
+        if !avx2_available() {
+            return;
+        }
+        let fya: [i16; 8] = [1, -3, 7, 23, 23, 7, -3, 1];
+        let fyb: [i16; 8] = [-2, 5, 11, 18, 18, 11, 5, -2];
+        let round = 7u32;
+        let blend_shift = 5u32;
+        for (wu, h) in [(4usize, 4usize), (5, 3), (8, 6), (16, 8), (24, 12), (36, 9)] {
+            let rows = h + 7;
+            let a: Vec<i16> = (0..rows * wu)
+                .map(|i| (((i * 37) % 8001) as i16) - 4000)
+                .collect();
+            let b: Vec<i16> = (0..rows * wu)
+                .map(|i| (((i * 91 + 17) % 8001) as i16) - 4000)
+                .collect();
+            let mut pa = vec![0i32; wu * h];
+            let mut pb = vec![0i32; wu * h];
+            // SAFETY: 已判 AVX2；两路中间量都有 `(h+7)·wu` 项。
+            unsafe {
+                mc_vert_rows_8bpc(&a, wu, h, &fya, round, pa.as_mut_ptr());
+                mc_vert_rows_8bpc(&b, wu, h, &fyb, round, pb.as_mut_ptr());
+            }
+            let want: Vec<u16> = (0..wu * h)
+                .map(|i| {
+                    let s = pa[i] + pb[i] + (1i32 << (blend_shift - 1));
+                    (s >> blend_shift).clamp(0, 255) as u16
+                })
+                .collect();
+            let mut got = vec![0u16; wu * h];
+            // SAFETY: 同上；目标按 `wu` 步长连续存放。
+            unsafe {
+                mc_vert2_avg_u16(
+                    &a, &b, wu, h, &fya, &fyb, round, blend_shift, 255,
+                    got.as_mut_ptr(), wu as isize,
+                );
+            }
+            assert_eq!(got, want, "wu={wu} h={h}");
+        }
+    }
+
+    fn cdef_pair16x4_matches_pair16_bit_for_bit() {
+        if !avx2_available() {
+            return;
+        }
+        let stride = 40usize;
+        let rows = 32usize;
+        let mut data: Vec<u16> = (0..stride * rows)
+            .map(|i| (((i * 53) % 251) as u16) + 3)
+            .collect();
+        for y in 0..rows {
+            for x in 0..stride {
+                if (x / 8 + y / 8) % 2 == 0 {
+                    data[y * stride + x] = (data[y * stride + x] / 2).max(1);
+                }
+            }
+        }
+        const DIRS: [[[i32; 2]; 2]; 8] = [
+            [[-1, 1], [-2, 2]],
+            [[0, 1], [-1, 2]],
+            [[0, 1], [0, 2]],
+            [[0, 1], [1, 2]],
+            [[1, 1], [2, 2]],
+            [[1, 0], [2, 1]],
+            [[1, 0], [2, 0]],
+            [[1, 0], [2, -1]],
+        ];
+        const PRI_TAPS: [[i32; 2]; 2] = [[4, 2], [3, 3]];
+        const SEC_TAPS: [[i32; 2]; 2] = [[2, 1], [2, 1]];
+        let (x0, y0) = (8isize, 8isize);
+        for dir in 0..8usize {
+            for (h, wu) in [(8usize, 8usize), (4, 4), (8, 4)] {
+                for (pri_str, sec_str, pri_adj, sec_adj, tap_sel) in [
+                    (32i32, 8i32, 0u32, 1u32, 0usize),
+                    (7, 3, 2, 3, 1),
+                    (240, 240, 0, 0, 0),
+                ] {
+                    let mut offs = [0isize; CDEF_CANDS];
+                    let mut taps = [0i32; CDEF_CANDS];
+                    let mut n = 0usize;
+                    for k in 0..2usize {
+                        for sign in [-1i32, 1] {
+                            let [dy, dx] = DIRS[dir][k];
+                            offs[n] =
+                                (sign * dy) as isize * stride as isize + (sign * dx) as isize;
+                            taps[n] = PRI_TAPS[tap_sel][k];
+                            n += 1;
+                        }
+                    }
+                    for k in 0..2usize {
+                        for dir_off in [-2i32, 2] {
+                            let d = ((dir as i32 + dir_off) & 7) as usize;
+                            let [dy, dx] = DIRS[d][k];
+                            for sign in [-1i32, 1] {
+                                offs[n] = (sign * dy) as isize * stride as isize
+                                    + (sign * dx) as isize;
+                                taps[n] = SEC_TAPS[tap_sel][k];
+                                n += 1;
+                            }
+                        }
+                    }
+                    let mut a = vec![0u16; stride * rows];
+                    let mut b = vec![0u16; stride * rows];
+                    // SAFETY: 已判 AVX2；(x0,y0)=(8,8)、h≤8、候选 ±2 ⇒ 读取在 40×32 内。
+                    unsafe {
+                        cdef_pair16(
+                            &data, stride as isize, x0, y0, h, wu, &offs, &taps, pri_str,
+                            pri_adj, sec_str, sec_adj, a.as_mut_ptr(), stride as isize,
+                        );
+                        cdef_pair16x4(
+                            &data, stride as isize, x0, y0, h, wu, &offs, &taps, pri_str,
+                            pri_adj, sec_str, sec_adj, b.as_mut_ptr(), stride as isize,
+                        );
+                    }
+                    assert_eq!(
+                        a, b,
+                        "dir={dir} h={h} wu={wu} pri={pri_str} sec={sec_str}"
+                    );
                 }
             }
         }

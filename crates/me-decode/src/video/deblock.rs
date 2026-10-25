@@ -176,9 +176,7 @@ fn run_pass(
     if jobs.len() <= 1 {
         // 串行：一个视图覆盖整平面（`ME_THREADS=1` 走这条，用来对拍）
         let view = mk(Band::Whole);
-        for &o in &outer {
-            run_line(&view, pass, o, mi_rows, mi_cols, fh, seq, grid, mi_grid)?;
-        }
+        run_outer(&view, pass, &outer, mi_rows, mi_cols, fh, seq, grid, mi_grid)?;
         return Ok(());
     }
 
@@ -201,10 +199,7 @@ fn run_pass(
             .map(|(view, &(a, b, _, _))| {
                 let outer = &outer;
                 scope.spawn(move || -> Result<()> {
-                    for &o in &outer[a..b] {
-                        run_line(view, pass, o, mi_rows, mi_cols, fh, seq, grid, mi_grid)?;
-                    }
-                    Ok(())
+                    run_outer(view, pass, &outer[a..b], mi_rows, mi_cols, fh, seq, grid, mi_grid)
                 })
             })
             .collect();
@@ -445,7 +440,24 @@ fn lf_gate(
     }
 }
 
+/// 一条边（4 像素段）算出来的**全部滤波参数** —— 供 [`apply_edge`] 使用，
+/// 也供"两段合并成 8 像素"的 [`run_line_pair`] 比对。
+struct EdgeJob {
+    dx: i32,
+    dy: i32,
+    xp: i32,
+    yp: i32,
+    plane: u8,
+    filter_size: i32,
+    need: i32,
+    limit: i32,
+    blimit: i32,
+    thresh: i32,
+    simd_in_bounds: bool,
+}
+
 #[allow(clippy::too_many_arguments)]
+#[inline(always)]
 fn loop_filter_edge(
     view: &PlaneView,
     pass: u8,
@@ -457,21 +469,37 @@ fn loop_filter_edge(
     grid: &BlockGrid,
     mi_grid: &MiGrid,
 ) -> Result<()> {
+    match edge_params(view, pass, row_in, col_in, tx_sz, fh, seq, grid, mi_grid)? {
+        Some(job) => apply_edge(view, &job),
+        None => Ok(()),
+    }
+}
+
+/// 算参数、不落笔。
+///
+/// `#[inline(always)]`（2026-10-24）：这是每条变换块边界一次的热函数，内联进
+/// [`run_line`] 的循环后，`sub_x/sub_y/cols/plane_idx` 与 `lf_tx_sizes` 的基址
+/// 才能被 LLVM 提到循环外（采样里它独占 3.6%，其中一大半是每次重算这些不变量）。
+#[allow(clippy::too_many_arguments)]
+#[inline(always)]
+fn edge_params(
+    view: &PlaneView,
+    pass: u8,
+    row_in: i32,
+    col_in: i32,
+    tx_sz: u8,
+    fh: &FrameHeader,
+    seq: &SequenceHeader,
+    grid: &BlockGrid,
+    mi_grid: &MiGrid,
+) -> Result<Option<EdgeJob>> {
     let plane = view.plane;
     let sub_x = if plane == 0 { 0 } else { u8::from(seq.color.subsampling_x) };
     let sub_y = if plane == 0 { 0 } else { u8::from(seq.color.subsampling_y) };
     let (dx, dy) = if pass == 0 { (1i32, 0i32) } else { (0i32, 1i32) };
 
-    // ── 入口判定抽到 [`lf_gate`]（2026-10-04）─────────────────────────────
-    //
-    // 原先这段（onScreen + 非首行列 + `isTxEdge`）直接写在本函数里。它是**唯一**
-    // 的退出闸门，而 92% 的调用在这里就返回 —— 于是"进来再出去"的调用开销
-    // （序言 + 8 个参数）比那 8% 的真滤波还贵。
-    //
-    // 现在由 [`run_line`] 的**热循环先内联判一次**；这里再判一次是为了让本函数
-    // "单独调用也自洽"（判定已在 `lf_gate` 内联，重复的成本可忽略）。
     if !lf_gate(pass, row_in, col_in, fh, i32::from(sub_x), i32::from(sub_y), tx_sz) {
-        return Ok(());
+        return Ok(None);
     }
 
     let x = col_in * MI_SIZE;
@@ -500,7 +528,6 @@ fn loop_filter_edge(
     let prev_tx_sz = grid.lf_tx_sizes[plane_idx]
         [((prev_row >> sub_y) as usize) * cols as usize + ((prev_col >> sub_x) as usize)];
 
-    // isBlockEdge（§7.14.2）；`isTxEdge` 已在上面判过（为真才走到这里）
     let is_block_edge = if pass == 0 {
         aligned(xp, block_width(plane_size))
     } else {
@@ -508,10 +535,9 @@ fn loop_filter_edge(
     };
     let apply_filter = is_block_edge || !skip || is_intra;
     if !apply_filter {
-        return Ok(());
+        return Ok(None);
     }
 
-    // 滤波尺寸（§7.14.3）
     let base_size = if pass == 0 {
         TX_WIDTH[prev_tx_sz as usize].min(TX_WIDTH[tx_sz as usize]) as i32
     } else {
@@ -519,7 +545,6 @@ fn loop_filter_edge(
     };
     let filter_size = if plane == 0 { 16.min(base_size) } else { 8.min(base_size) };
 
-    // 强度（§7.14.4/§7.14.5）：本侧为 0 时改用另一侧
     let (mut lvl, mut limit, mut blimit, mut thresh) =
         filter_strength(grid, fh, row, col, plane, pass);
     if lvl == 0 {
@@ -530,7 +555,7 @@ fn loop_filter_edge(
         thresh = t2;
     }
     if lvl <= 0 {
-        return Ok(());
+        return Ok(None);
     }
 
     if flags::trace_dbl() && plane == 0 {
@@ -539,11 +564,6 @@ fn loop_filter_edge(
         );
     }
 
-    // ── SIMD 快路径（2026-10-02）：一条边的 4 条平行线一次滤完 ──────────────
-    //
-    // 只吃**内点**：窗口（含竖边转置加载的整段 8/16 列）完全落在帧内才走，
-    // 边界一律回落标量 —— 标量路径已被逐样本对拍验过，两条路合起来仍逐位一致。
-    // `trace_dbl2` 的逐样本打印只存在于标量路径，开启时绕开 SIMD 保住诊断。
     let need = window_need(plane, filter_size);
     let load_pad = if need >= 7 {
         8
@@ -557,34 +577,176 @@ fn loop_filter_edge(
     } else {
         xp >= 0 && xp + MI_SIZE < view.w && yp - need >= 0 && yp + need - 1 < view.h
     };
-    if simd_in_bounds && super::simd::avx2_available() && !flags::trace_dbl2() {
-        // SAFETY: 已判 AVX2；上面的 `simd_in_bounds` 就是 `deblock_edge4` 的安全前提
-        // （读写全部在帧内、不越出所在行；转置加载多读的列也在这个界内）。
+    Ok(Some(EdgeJob {
+        dx,
+        dy,
+        xp,
+        yp,
+        plane,
+        filter_size,
+        need,
+        limit,
+        blimit,
+        thresh,
+        simd_in_bounds,
+    }))
+}
+
+/// 落笔：内点走 4 路 SIMD，否则逐样本标量。
+#[inline(always)]
+fn apply_edge(view: &PlaneView, job: &EdgeJob) -> Result<()> {
+    if job.simd_in_bounds && super::simd::avx2_available() && !flags::trace_dbl2() {
         unsafe {
             super::simd::deblock_edge4(
                 view.ptr,
                 view.stride as isize,
                 view.bit_depth,
-                xp,
-                yp,
-                dx,
-                dy,
-                plane,
-                filter_size,
-                need,
-                limit,
-                blimit,
-                thresh,
+                job.xp,
+                job.yp,
+                job.dx,
+                job.dy,
+                job.plane,
+                job.filter_size,
+                job.need,
+                job.limit,
+                job.blimit,
+                job.thresh,
             );
         }
         return Ok(());
     }
     for i in 0..MI_SIZE {
-        // ⚠️ 这一行就是 `run_pass` 里"按行带/列带切"的**唯一依据**：
-        // `sample_filter` 的读窗口只沿 `(dx, dy)` 铺开，所以 pass 0 只碰行、pass 1 只碰列。
-        sample_filter(view, xp + dy * i, yp + dx * i, limit, blimit, thresh, dx, dy, filter_size)?;
+        sample_filter(
+            view,
+            job.xp + job.dy * i,
+            job.yp + job.dx * i,
+            job.limit,
+            job.blimit,
+            job.thresh,
+            job.dx,
+            job.dy,
+            job.filter_size,
+        )?;
     }
     Ok(())
+}
+
+/// 扫完一条线上的所有外层下标：**横边（pass 1）相邻两条线能合并成 8 像素**。
+#[allow(clippy::too_many_arguments)]
+fn run_outer(
+    view: &PlaneView,
+    pass: u8,
+    entries: &[i32],
+    mi_rows: i32,
+    mi_cols: i32,
+    fh: &FrameHeader,
+    seq: &SequenceHeader,
+    grid: &BlockGrid,
+    mi_grid: &MiGrid,
+) -> Result<()> {
+    let wide = pass == 1 && !flags::no_wide_deblock();
+    let mut i = 0usize;
+    while i < entries.len() {
+        if wide && i + 1 < entries.len() {
+            if run_line_pair(
+                view, pass, entries[i], entries[i + 1], mi_rows, mi_cols, fh, seq, grid, mi_grid,
+            )? {
+                i += 2;
+                continue;
+            }
+        }
+        run_line(view, pass, entries[i], mi_rows, mi_cols, fh, seq, grid, mi_grid)?;
+        i += 1;
+    }
+    Ok(())
+}
+
+/// 横边（pass 1）把相邻两条 4 像素线一次滤完（8 路内核）。
+///
+/// 竖边同理也能合并，但写回要 8×8 转置 —— 实测反而更慢（转置的开销超过省下的
+/// 一半指令），所以只对横边开。
+///
+/// 返回 `false` = 这条线上的变换块序列对不齐，调用方需要按原样逐条跑。
+#[allow(clippy::too_many_arguments)]
+fn run_line_pair(
+    view: &PlaneView,
+    pass: u8,
+    o0: i32,
+    o1: i32,
+    mi_rows: i32,
+    _mi_cols: i32,
+    fh: &FrameHeader,
+    seq: &SequenceHeader,
+    grid: &BlockGrid,
+    mi_grid: &MiGrid,
+) -> Result<bool> {
+    debug_assert_eq!(pass, 1);
+    let sub_x = if view.plane == 0 { 0 } else { i32::from(seq.color.subsampling_x) };
+    let sub_y = if view.plane == 0 { 0 } else { i32::from(seq.color.subsampling_y) };
+    let cols = grid.cols();
+    let table = &grid.lf_tx_sizes[view.plane as usize];
+    let col0 = (o0 | sub_x) >> sub_x;
+    let col1 = (o1 | sub_x) >> sub_x;
+    let mut row = 0i32;
+    while row < mi_rows {
+        let r = ((row | sub_y) >> sub_y) as usize;
+        if table[r * cols + col0 as usize] != table[r * cols + col1 as usize] {
+            return Ok(false);
+        }
+        let tx = table[r * cols + col0 as usize];
+        row += ((TX_HEIGHT[tx as usize] as i32) >> 2) << sub_y;
+    }
+    let mut row = 0i32;
+    while row < mi_rows {
+        let r = ((row | sub_y) >> sub_y) as usize;
+        let tx = table[r * cols + col0 as usize];
+        let j0 = edge_params(view, pass, row, o0, tx, fh, seq, grid, mi_grid)?;
+        let j1 = edge_params(view, pass, row, o1, tx, fh, seq, grid, mi_grid)?;
+        let mut done = false;
+        if let (Some(a), Some(b)) = (&j0, &j1) {
+            if a.filter_size == b.filter_size
+                && a.need == b.need
+                && a.limit == b.limit
+                && a.blimit == b.blimit
+                && a.thresh == b.thresh
+                && a.plane == b.plane
+                && b.xp == a.xp + 4
+                && a.simd_in_bounds
+                && b.simd_in_bounds
+                && a.xp + 8 <= view.w
+                && !flags::trace_dbl2()
+                && super::simd::avx2_available()
+            {
+                // SAFETY: 已判 AVX2；两段各自内点，合并后 8 列仍在帧内。
+                unsafe {
+                    super::simd::deblock_edge8_h(
+                        view.ptr,
+                        view.stride as isize,
+                        view.bit_depth,
+                        a.xp,
+                        a.yp,
+                        a.plane,
+                        a.filter_size,
+                        a.need,
+                        a.limit,
+                        a.blimit,
+                        a.thresh,
+                    );
+                }
+                done = true;
+            }
+        }
+        if !done {
+            if let Some(j) = j0 {
+                apply_edge(view, &j)?;
+            }
+            if let Some(j) = j1 {
+                apply_edge(view, &j)?;
+            }
+        }
+        row += ((TX_HEIGHT[tx as usize] as i32) >> 2) << sub_y;
+    }
+    Ok(true)
 }
 
 /// 自适应滤波强度（§7.14.4 + §7.14.5）：返回 `(lvl, limit, blimit, thresh)`。
@@ -1400,4 +1562,101 @@ mod tests {
         // 防"全是空转"：至少有一部分组合真的滤了像素
         assert!(changed > 100, "对拍样本大多没被滤（changed={changed}），测试形同虚设");
     }
+    /// **8 路横边内核必须与两次 4 路内核逐字节相同**（同一份输入、`xp` 与 `xp+4`）。
+    #[test]
+    fn deblock_edge8_h_matches_two_edge4_calls() {
+        use crate::video::intra::Plane;
+        if !super::super::simd::avx2_available() {
+            return;
+        }
+        let mut seed = 0x9e37_79b9u32;
+        let mut rnd = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            (seed >> 16) as u16
+        };
+        for &(plane, filter_size, need, bd) in &[
+            (0u8, 4i32, 2i32, 8u8),
+            (0, 8, 4, 8),
+            (0, 16, 7, 8),
+            (1, 4, 2, 8),
+            (1, 8, 3, 8),
+            (0, 8, 4, 10),
+            (0, 16, 7, 12),
+        ] {
+            let max = (1u16 << bd) - 1;
+            let mut a = Plane::new(64, 64, bd);
+            let st = a.stride;
+            {
+                let d = a.px16_mut();
+                for v in d.iter_mut() {
+                    *v = rnd() & max;
+                }
+                for y in 8..56usize {
+                    for x in 8..56usize {
+                        if (x / 8 + y / 8) % 3 == 0 {
+                            d[y * st + x] = (rnd() & 3) << 2;
+                        }
+                    }
+                }
+            }
+            let orig = a.px16().to_vec();
+            let mut b = Plane::new(64, 64, bd);
+            b.px16_mut().copy_from_slice(&orig);
+            let (xp, yp) = (16i32, 20i32);
+            let (limit, blimit, thresh) = (24i32, 40i32, 4i32);
+            let (sa, sb) = (a.stride as isize, b.stride as isize);
+            // SAFETY: 已判 AVX2；位置是内点（64×64 平面、xp+8 ≤ 64、yp±need 在帧内）。
+            unsafe {
+                super::super::simd::deblock_edge8_h(
+                    a.px16_mut().as_mut_ptr(),
+                    sa,
+                    bd,
+                    xp,
+                    yp,
+                    plane,
+                    filter_size,
+                    need,
+                    limit,
+                    blimit,
+                    thresh,
+                );
+                super::super::simd::deblock_edge4(
+                    b.px16_mut().as_mut_ptr(),
+                    sb,
+                    bd,
+                    xp,
+                    yp,
+                    0,
+                    1,
+                    plane,
+                    filter_size,
+                    need,
+                    limit,
+                    blimit,
+                    thresh,
+                );
+                super::super::simd::deblock_edge4(
+                    b.px16_mut().as_mut_ptr(),
+                    sb,
+                    bd,
+                    xp + 4,
+                    yp,
+                    0,
+                    1,
+                    plane,
+                    filter_size,
+                    need,
+                    limit,
+                    blimit,
+                    thresh,
+                );
+            }
+            assert_eq!(
+                a.px16(),
+                b.px16(),
+                "plane={plane} fs={filter_size} need={need} bd={bd}"
+            );
+        }
+    }
+
 }

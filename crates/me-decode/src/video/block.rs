@@ -596,6 +596,25 @@ fn ensure_len<T: Clone>(v: &mut Vec<T>, n: usize, val: T) {
     }
 }
 
+
+/// 短行 `fill`：长度 ≤ 16 时展开成写循环，避开 `slice::fill` → `memset` 的调用开销。
+///
+/// [`BlockGrid::stamp`] 每个块每行要写 7~13 个数组，而绝大多数块的行宽只有 1~4 格
+/// （4×4/8×8 块）—— libc 调用本身比写 4 个字节还贵。debuginfo 采样的调用图确认
+/// `stamp` 里的 `bzero` 占忙时约 1.4%（2026-10-24）。
+#[inline(always)]
+pub(crate) fn fill_span<T: Copy>(s: &mut [T], v: T) {
+    if s.len() <= 16 && !flags::no_fast_fill() {
+        for x in s.iter_mut() {
+            *x = v;
+        }
+    } else {
+        s.fill(v);
+    }
+}
+
+
+
 impl BlockGrid {
     /// 空壳（所有 `Vec` 都没有容量）。配 [`BlockGrid::reset_all`] 用。
     fn empty() -> Self {
@@ -830,6 +849,17 @@ impl BlockGrid {
         }
         let w = NUM_4X4_BLOCKS_WIDE[bsize as usize] as i32;
         let h = NUM_4X4_BLOCKS_HIGH[bsize as usize] as i32;
+        // 2026-10-24：**整块在网格内**是绝对常态（只有贴帧右/下边的块要夹），
+        // 先走不夹取的快路径：省 4 次 min/max + 两次符号转换。
+        if r >= 0 && c >= 0 && r + h <= self.rows as i32 && c + w <= self.cols as i32 {
+            let cols = self.cols;
+            let (c0, c1) = (c as usize, (c + w) as usize);
+            for rr in r as usize..(r + h) as usize {
+                let base = rr * cols;
+                f(self, base + c0, base + c1);
+            }
+            return;
+        }
         let r0 = r.max(0);
         let c0 = c.max(0);
         let r1 = (r + h).min(self.rows as i32);
@@ -2308,6 +2338,13 @@ impl<'a> BlockCtx<'a> {
         }
 
         // 规范：`residual()` **之前**先把模式信息铺进网格
+        //
+        // 2026-10-24：**等于帧初值的数组跳过写**。允许跳过的前提是
+        //   ① 该数组在 `reset_all` 里用 `fill_set` 整张铺过初值（不是 `ensure_len`）；
+        //   ② 每个 4×4 格在本帧只属于一个叶子块 ⇒ 格子里不可能留着"本帧别的块
+        //      写过的另一个值"。
+        // `y_modes` / `ref_frames` / `skips` / `inter_tx_sizes` 等走 `ensure_len`
+        // （跨帧不重填）⇒ **绝不能跳**，它们保持无条件写。
         {
             let y = info.y_mode;
             let uv = info.uv_mode;
@@ -2322,24 +2359,43 @@ impl<'a> BlockCtx<'a> {
             let ifs = info.interp_filter;
             let mvs = info.mv;
             let iim = info.interintra_mode;
+            let keep = flags::no_stamp_skip();
             self.grid.stamp(r, c, bsize, move |g, lo, hi| {
-                g.y_modes[lo..hi].fill(y);
-                if refs[0] == mv::INTRA_FRAME && has_chroma {
-                    g.uv_modes[lo..hi].fill(uv);
+                fill_span(&mut g.y_modes[lo..hi], y);
+                if refs[0] == mv::INTRA_FRAME && has_chroma && (keep || uv != DC_PRED) {
+                    fill_span(&mut g.uv_modes[lo..hi], uv);
                 }
-                g.ref_frames[lo..hi].fill(refs);
+                fill_span(&mut g.ref_frames[lo..hi], refs);
                 if is_inter {
-                    g.comp_group_idxs[lo..hi].fill(cg);
-                    g.compound_idxs[lo..hi].fill(ci);
-                    g.compound_types[lo..hi].fill(ct);
-                    g.wedge_idxs[lo..hi].fill(wix);
-                    g.wedge_signs[lo..hi].fill(wsg);
-                    g.mask_types[lo..hi].fill(mty);
-                    g.interp_filters[lo..hi].fill(ifs);
-                    g.mvs[lo..hi].fill(mvs);
-                    g.interintra_modes[lo..hi].fill(iim);
+                    if keep || cg != 0 {
+                        fill_span(&mut g.comp_group_idxs[lo..hi], cg);
+                    }
+                    if keep || ci != 1 {
+                        fill_span(&mut g.compound_idxs[lo..hi], ci);
+                    }
+                    if keep || ct != COMPOUND_AVERAGE {
+                        fill_span(&mut g.compound_types[lo..hi], ct);
+                    }
+                    if keep || wix != 0 {
+                        fill_span(&mut g.wedge_idxs[lo..hi], wix);
+                    }
+                    if keep || wsg != 0 {
+                        fill_span(&mut g.wedge_signs[lo..hi], wsg);
+                    }
+                    if keep || mty != 0 {
+                        fill_span(&mut g.mask_types[lo..hi], mty);
+                    }
+                    if keep || ifs != [EIGHTTAP, EIGHTTAP] {
+                        fill_span(&mut g.interp_filters[lo..hi], ifs);
+                    }
+                    if keep || mvs != [[0, 0]; 2] {
+                        fill_span(&mut g.mvs[lo..hi], mvs);
+                    }
+                    if keep || iim != II_DC_PRED {
+                        fill_span(&mut g.interintra_modes[lo..hi], iim);
+                    }
                 }
-                g.written[lo..hi].fill(true);
+                fill_span(&mut g.written[lo..hi], true);
             });
         }
 
@@ -2365,11 +2421,15 @@ impl<'a> BlockCtx<'a> {
             // `interintra` 的帧内那一半要的可用性 / 边滤波上下文（§7.11.2 的
             // `AvailL`/`AvailU` 与 §7.11.2.8 的 `filterType`）。与 `residual()` 里那份
             // 同源，这里先算好，避免在 `&mut self.frame` 借用期间再借 `&self`。
+            // `filterType` 只有 **interintra** 用得到（帧内那一半的边滤波）。
+            // 普通帧间块（这份素材里 97%）不必为它各做两遍邻居网格查询。
+            let need_ft = !flags::no_lazy_ft()
+                && (info.interintra && !flags::no_interintra() || flags::no_lazy_ft());
             let intra_ctx = super::inter::IntraContext {
                 avail_u: self.is_inside(r - 1, c),
                 avail_l: self.is_inside(r, c - 1),
-                filter_type_y: self.filter_type_for(0, r, c, bsize),
-                filter_type_uv: self.filter_type_for(1, r, c, bsize),
+                filter_type_y: if need_ft { self.filter_type_for(0, r, c, bsize) } else { 0 },
+                filter_type_uv: if need_ft { self.filter_type_for(1, r, c, bsize) } else { 0 },
                 // row-mt 语法阶段：回放前由 `precompute_dec_flags` 回填；
                 // 就地重建（非 row-mt）时照旧读运行时网格
                 dec_flags: None,
@@ -2445,17 +2505,22 @@ impl<'a> BlockCtx<'a> {
             let has_palette = ps != [0, 0];
             // `DeltaLF` 的累积值也要按块铺进网格（§7.14.4 去块强度要逐 4×4 读它）
             let dlf = self.delta_lfs;
+            // `seg_ids` 是 `fill_set(0)` 铺过的 ⇒ 值等于 0（帧初值）时可以跳
+            // （前提同第一段：每格只归一个叶子块）。
+            let keep = flags::no_stamp_skip();
             self.grid.stamp(r, c, bsize, move |g, lo, hi| {
-                g.is_inters[lo..hi].fill(ii);
-                g.skip_modes[lo..hi].fill(sm);
-                g.skips[lo..hi].fill(sk);
-                g.inter_tx_sizes[lo..hi].fill(tx);
-                g.seg_ids[lo..hi].fill(seg);
-                g.palette_sizes[lo..hi].fill(ps);
-                if has_palette {
-                    g.palette_colors[lo..hi].fill(pc);
+                fill_span(&mut g.is_inters[lo..hi], ii);
+                fill_span(&mut g.skip_modes[lo..hi], sm);
+                fill_span(&mut g.skips[lo..hi], sk);
+                fill_span(&mut g.inter_tx_sizes[lo..hi], tx);
+                if keep || seg != 0 {
+                    fill_span(&mut g.seg_ids[lo..hi], seg);
                 }
-                g.delta_lfs[lo..hi].fill(dlf);
+                fill_span(&mut g.palette_sizes[lo..hi], ps);
+                if has_palette {
+                    fill_span(&mut g.palette_colors[lo..hi], pc);
+                }
+                fill_span(&mut g.delta_lfs[lo..hi], dlf);
             });
         }
 
@@ -4480,7 +4545,7 @@ impl<'a> BlockCtx<'a> {
             let allow_select = !info.skip || !info.is_inter;
             self.read_tx_size(dec, mi_grid, bsize, lossless, allow_select, info)?;
             let tx = info.tx_size;
-            self.grid.stamp(r, c, bsize, move |g, lo, hi| g.inter_tx_sizes[lo..hi].fill(tx));
+            self.grid.stamp(r, c, bsize, move |g, lo, hi| fill_span(&mut g.inter_tx_sizes[lo..hi], tx));
         }
         Ok(())
     }

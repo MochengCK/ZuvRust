@@ -546,17 +546,42 @@ impl Av1Decoder {
         let t_ref = std::time::Instant::now();
         // ② 参考帧更新（§7.19 运动场存储 + §7.20 像素/CDF/元数据）
         if pf.fh.refresh_frame_flags != 0 {
-            let (saved_rf, saved_mvs) =
-                motion_field_storage(&pf.block_grid, &pf.fh, &seq, &self.store);
+            // 2026-10-24：**最后一个刷新槽直接 move**（其余才 clone）。1080p 一份
+            // `SavedMvs` 是 0.5 MB + 1.0 MB —— 原来每个刷新槽都拷一遍，单槽刷新
+            // （这份素材里的常态）等于白拷 1.5 MB/帧。槽里的旧内容在本帧解码结束后
+            // 已经死了 ⇒ 顺手拿它当 `motion_field_storage` 的落点，省掉每帧 1.5 MB
+            // 的 `vec![]`（新页 + 首次写入缺页）。
+            let refresh = pf.fh.refresh_frame_flags;
+            let last_slot = (0..8usize).rev().find(|s| (refresh >> s) & 1 == 1);
+            let (scratch_rf, scratch_mvs) = match last_slot {
+                Some(s) => (
+                    std::mem::take(&mut self.mf_store.slots[s].ref_frames),
+                    std::mem::take(&mut self.mf_store.slots[s].mvs),
+                ),
+                None => (Vec::new(), Vec::new()),
+            };
+            let (mut saved_rf, mut saved_mvs) = super::mv::motion_field_storage_into(
+                &pf.block_grid,
+                &pf.fh,
+                &seq,
+                &self.store,
+                scratch_rf,
+                scratch_mvs,
+            );
             for slot in 0..8usize {
-                if (pf.fh.refresh_frame_flags >> slot) & 1 == 1 {
+                if refresh >> slot & 1 == 1 {
+                    let (rf, mvs) = if Some(slot) == last_slot {
+                        (std::mem::take(&mut saved_rf), std::mem::take(&mut saved_mvs))
+                    } else {
+                        (saved_rf.clone(), saved_mvs.clone())
+                    };
                     self.mf_store.save(
                         slot,
                         pf.fh.mi_rows as usize,
                         pf.fh.mi_cols as usize,
                         pf.fh.is_intra,
-                        saved_rf.clone(),
-                        saved_mvs.clone(),
+                        rf,
+                        mvs,
                         pf.fh.order_hints,
                     );
                 }
@@ -1016,9 +1041,68 @@ fn nv12_frame(frame: &CurrFrame, pts_us: i64) -> Result<VideoFrame> {
             "AV1 输出要求偶数尺寸（NV12），这一帧是 {w}×{h}"
         )));
     }
+    if flags::lr_stats() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let f = |a: &std::sync::atomic::AtomicU64| a.swap(0, Relaxed) as f64 / 1e6;
+        eprintln!(
+            "SGR calls={} box0={:.2}ms box1={:.2}ms final={:.2}ms",
+            super::lr::SGR_CALLS.swap(0, Relaxed),
+            f(&super::lr::SGR_BOX0_NS),
+            f(&super::lr::SGR_BOX1_NS),
+            f(&super::lr::SGR_FINAL_NS),
+        );
+    }
+    if flags::eob_stats() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let b = &super::coeff::EOB_BLKS;
+        let p = &super::coeff::EOB_PIX;
+        eprintln!(
+            "EOB blks[1]={} [<=4]={} [<=16]={} [<=64]={} [>64]={} | pix[1]={} [<=4]={} [<=16]={} [<=64]={} [>64]={}",
+            b[0].swap(0, Relaxed),
+            b[1].swap(0, Relaxed),
+            b[2].swap(0, Relaxed),
+            b[3].swap(0, Relaxed),
+            b[4].swap(0, Relaxed),
+            p[0].swap(0, Relaxed),
+            p[1].swap(0, Relaxed),
+            p[2].swap(0, Relaxed),
+            p[3].swap(0, Relaxed),
+            p[4].swap(0, Relaxed),
+        );
+        eprintln!(
+            "EOB dc_only hit={} miss_type={}",
+            super::coeff::DC_ONLY_HIT.swap(0, Relaxed),
+            super::coeff::DC_ONLY_MISS.swap(0, Relaxed),
+        );
+    }
+    if flags::mc_stats() {
+        use std::sync::atomic::Ordering::Relaxed;
+        let k = &super::inter::MC_PIX;
+        eprintln!(
+            "MC direct={}/{} cavg={} pix int={} sub={} avg={} dist={} wedge={} other={} obmc={} ii={}",
+            super::inter::DIRECT_SUBPEL_BLOCKS.swap(0, Relaxed),
+            super::inter::DIRECT_SUBPEL_PIXELS.swap(0, Relaxed),
+            super::inter::COMP_AVG_PIX.swap(0, Relaxed),
+            k[0].swap(0, Relaxed),
+            k[1].swap(0, Relaxed),
+            k[2].swap(0, Relaxed),
+            k[3].swap(0, Relaxed),
+            k[4].swap(0, Relaxed),
+            k[5].swap(0, Relaxed),
+            k[6].swap(0, Relaxed),
+            k[7].swap(0, Relaxed),
+        );
+    }
     let bit_depth = frame.planes[0].bit_depth;
     let shift = u32::from(bit_depth.saturating_sub(8));
-    let mut nv12 = vec![0u8; w * h * 3 / 2];
+    let n = w * h * 3 / 2;
+    // 池化：缓冲**每个字节都会被下面写满**（亮度 w*h + 色度 w*h/2），不必清零。
+    let mut nv12 = if flags::no_nv12_pool() {
+        vec![0u8; n]
+    } else {
+        super::pool::take_u8(n).unwrap_or_else(|| vec![0u8; n])
+    };
+    debug_assert_eq!(nv12.len(), n);
     let cw = w / 2;
     let ch = h / 2;
     let cbase = w * h;
@@ -1085,8 +1169,12 @@ fn nv12_frame(frame: &CurrFrame, pts_us: i64) -> Result<VideoFrame> {
         return Ok(VideoFrame { width: w as u32, height: h as u32, pts_us, nv12 });
     }
     {
+        // ⚠️ 2026-10-24 第一版显式 AVX2 是**逐行**调用 target_feature 函数（无法内联）
+        // ⇒ 每帧上千次真实调用，测出来 +1.9%。现在整个平面一次调用（行循环在内核里）。
         let (luma_row, dst) = (frame.planes[0].stride, &mut nv12[..w * h]);
         let src = frame.planes[0].px16();
+        // ⚠️ 两次显式 AVX2（逐行 / 整平面一次调用）都更慢（+1.9% / +0.4%）——
+        // LLVM 的自动向量化已经够好，这一段的瓶颈是**内存带宽**（读 4.2 MB、写 3.1 MB）。
         for y in 0..h {
             let s = &src[y * luma_row..y * luma_row + w];
             let d = &mut dst[y * w..y * w + w];
@@ -1133,9 +1221,43 @@ fn nv12_frame(frame: &CurrFrame, pts_us: i64) -> Result<VideoFrame> {
                     d[2 * x + 1] = (sv >> shift) as u8;
                 }
             } else {
-                // 4:2:0：交错写入 UV
+                // 4:2:0：交错写入 UV。每 8 对样本一次 `packusw` + `punpcklbw`，
+                // 而不是 16 次单字节写（1080p 每帧约 52 万对）。
                 let ur = &udata[y * ustride..y * ustride + cw];
                 let vr = &vdata[y * vstride..y * vstride + cw];
+                #[cfg(target_arch = "x86_64")]
+                {
+                    use std::arch::x86_64::*;
+                    let mut x = 0usize;
+                    while x + 8 <= cw {
+                        // SAFETY: 读 `ur/vr[x..x+8]`（在 cw 内）、写 `d[2x..2x+16]`
+                        // （在 2*cw 内）；样本移位后 ≤ 255（10/12bit 的 2/4 位）。
+                        unsafe {
+                            let uu = _mm_loadu_si128(ur.as_ptr().add(x) as *const __m128i);
+                            let vv = _mm_loadu_si128(vr.as_ptr().add(x) as *const __m128i);
+                            let uu = match shift {
+                                0 => uu,
+                                2 => _mm_srli_epi16::<2>(uu),
+                                _ => _mm_srli_epi16::<4>(uu),
+                            };
+                            let vv = match shift {
+                                0 => vv,
+                                2 => _mm_srli_epi16::<2>(vv),
+                                _ => _mm_srli_epi16::<4>(vv),
+                            };
+                            let ub = _mm_packus_epi16(uu, uu);
+                            let vb = _mm_packus_epi16(vv, vv);
+                            let uv = _mm_unpacklo_epi8(ub, vb);
+                            _mm_storeu_si128(d.as_mut_ptr().add(2 * x) as *mut __m128i, uv);
+                        }
+                        x += 8;
+                    }
+                    for x in x..cw {
+                        d[2 * x] = (ur[x] >> shift) as u8;
+                        d[2 * x + 1] = (vr[x] >> shift) as u8;
+                    }
+                }
+                #[cfg(not(target_arch = "x86_64"))]
                 for x in 0..cw {
                     d[2 * x] = (ur[x] >> shift) as u8;
                     d[2 * x + 1] = (vr[x] >> shift) as u8;

@@ -82,10 +82,16 @@ fn read_bits_at(data: &[u8], pos: usize, n: u32) -> Result<u32> {
     let byte = pos >> 3;
     let off = (pos & 7) as u32;
     // 8 字节大端窗口：`w` 的最高位 == `data[byte]` 的最高位
+    //
+    // 2026-10-24：**一次非对齐读 + `bswap`**。原来 `copy_from_slice` 走 8 字节
+    // memcpy，而这是**每次重归一化**都要付的（真素材一帧 43 万符号，绝大多数都会
+    // 进这里）—— 一次 memcpy 调用比一条 `movq` + `bswap` 贵一个数量级。
     let w: u64 = if byte + 8 <= data.len() {
-        let mut buf = [0u8; 8];
-        buf.copy_from_slice(&data[byte..byte + 8]);
-        u64::from_be_bytes(buf)
+        // SAFETY: `byte + 8 <= data.len()` ⇒ 这 8 字节可读；`read_unaligned`
+        // 不要求对齐（瓦片数据没有对齐保证）。
+        u64::from_be(unsafe {
+            std::ptr::read_unaligned(data.as_ptr().add(byte) as *const u64)
+        })
     } else {
         // 末尾不足 8 字节：左对齐补零（缺的位本来就不在 `data` 里，
         // 而上面已经保证需要的位全在）
@@ -131,6 +137,13 @@ pub struct SymbolDecoder<'a> {
     /// 诊断：最近读过的若干符号（越界报错时倒出来）
     recent: [RecentSym; RECENT_SYMBOLS],
     recent_n: usize,
+    /// 诊断开关的**缓存**：`read_symbol_inner` 每帧要跑 43 万次，
+    /// 原来每符号两次 `OnceLock` acquire load（`trace_sym` / `record_recent`）
+    /// —— 构造时取一次，符号循环里只读一个字节。
+    trace_sym: bool,
+    record_recent: bool,
+    /// `SymbolMaxBits` 的下限（规范 -14，`AV1_SMB_LIMIT` 可覆盖）。
+    smb_lim: i64,
 }
 
 /// 环形缓冲的深度（越界报错时倒出这么多条）。16 条足够看出"哪一步跳了"。
@@ -217,6 +230,9 @@ impl<'a> SymbolDecoder<'a> {
             // SymbolMaxBits = 8 * sz - 15
             symbol_max_bits: (sz * 8) as i64 - CDF_PROB_BITS as i64,
             update_cdf,
+            trace_sym: Self::trace_sym(),
+            record_recent: Self::record_recent(),
+            smb_lim: smb_limit(),
             trace_n: 0,
             label: "?",
             tag: 0,
@@ -275,8 +291,9 @@ impl<'a> SymbolDecoder<'a> {
 
     /// `read_bool()`（规范 §8.2.4）：等概率的伪原始位。
     ///
-    /// 规范说这份临时 CDF 的自适应更新"可以省掉"（改完就不会再被用），
-    /// 所以这里传 `update = false`。
+    /// ⚠️ 2026-10-25 试过给它一条专用快路径（直接算两档 + 共用 `renormalize`）：
+    /// **语法阶段 +3.4%（1/10 轮）** —— 通用路径在 PGO 下已经够快，专用版多出的
+    /// 诊断开关判断与 `track_caller` 参数反而更贵。**保持走通用路径。**
     #[track_caller]
     pub fn read_bool(&mut self) -> Result<bool> {
         let mut cdf = EQUIPROBABLE_CDF;
@@ -344,10 +361,7 @@ impl<'a> SymbolDecoder<'a> {
         // 正确性：`trace_n` 只在开着 trace 时递增，trace 开着时它与原来**逐符号
         // 相同**（原式也是每符号 +1）；环形缓冲只在 `AV1_RECENT=1` 时记录，而它
         // 只在越界报错时被读（报错正文会提示加这个开关重跑）。
-        let trace_sym = Self::trace_sym();
-        let record_recent = Self::record_recent();
-
-        let trace = trace_sym
+        let trace = self.trace_sym
             && self.trace_n < Self::trace_sym_limit()
             && super::block::in_traced_frame();
         // 快照必须在下面改动 `symbol_range` / `symbol_value` **之前**取
@@ -360,7 +374,11 @@ impl<'a> SymbolDecoder<'a> {
             (0, 0, 0, "", 0)
         };
         // `smb_before` 只给环形缓冲用 ⇒ 同样门控掉（否则又是一次无条件读）。
-        let smb_before = if record_recent { self.symbol_max_bits } else { 0 };
+        let smb_before = if self.record_recent { self.symbol_max_bits } else { 0 };
+        // 这两条是**诊断**（CDF 是我们自己的表，不该坏）：每符号一次越界判断 +
+        // 一次尾部读。2026-10-24 实测把它们折成 `debug_assert` 只值 −0.5%（PGO、
+        // 4/8 轮），却把 `rejects_a_cdf_that_is_not_normalized` 的报错文案丢了
+        // ⇒ **保留**（诊断报错比 0.5% 更值钱）。
         if cdf.len() < 2 {
             return Err(MediaError::Bitstream("CDF 至少要有 2 项（1 个符号 + 计数器）".into()));
         }
@@ -378,20 +396,19 @@ impl<'a> SymbolDecoder<'a> {
         let mut symbol = 0usize;
         loop {
             prev = cur;
-            let f = CDF_PROB_TOP - cdf[symbol] as u32;
+            // SAFETY: `n = cdf.len() - 1`，且函数开头已经验过 `cdf[n-1] == 1<<15` ⇒
+            // 在 `symbol == n-1` 处 `f == 0`、`cur == 0`，而 `symbol_value >= 0` 恒成立
+            // ⇒ 循环**必然在 symbol ≤ n-1 时 break**，`cdf[symbol]` 恒在界内。
+            // （原来这里还有一条 `symbol >= n` 的错误返回 + 每项的边界检查：前者的
+            // 触发条件已被开头那道校验排除，后者是纯粹的每符号开销。）
+            let f = CDF_PROB_TOP - unsafe { *cdf.get_unchecked(symbol) } as u32;
             cur = ((self.symbol_range >> 8) * (f >> EC_PROB_SHIFT)) >> (7 - EC_PROB_SHIFT);
             cur += EC_MIN_PROB * (n - symbol - 1) as u32;
             if self.symbol_value >= cur {
                 break;
             }
             symbol += 1;
-            if symbol >= n {
-                // 只有 cdf 不合法才会到这里（最后一项不是 1<<15 时 cur 不为 0）
-                return Err(MediaError::Bitstream(format!(
-                    "算术解码找不到符号（SymbolValue {} 落在区间外）",
-                    self.symbol_value
-                )));
-            }
+            debug_assert!(symbol < n, "CDF 不合法：符号循环越过了最后一项");
         }
 
         // SymbolRange = prev - cur; SymbolValue -= cur
@@ -453,7 +470,7 @@ impl<'a> SymbolDecoder<'a> {
             // （`coeffs` 的 Exp-Golomb 长度码）会一直读到 0、永远等不到终止位 ⇒
             // 解码器**原地死转不报错**。（2026-09-30：真素材上就在那里挂了 18 分钟，
             // 栈上 84% 的采样在 `read_symbol_inner`。）
-            if self.symbol_max_bits < smb_limit() {
+            if self.symbol_max_bits < self.smb_lim {
                 let required = required_consumed_bits(self.data);
                 return Err(MediaError::Bitstream(format!(
                     "AV1 的算术流越过了瓦片末尾（帧 #{}，按“带瓦片的帧”计）：\
@@ -462,10 +479,9 @@ impl<'a> SymbolDecoder<'a> {
                      已解 {} 个变换块，其中 all_zero = {} 个\n\
                      瓦片 {} 字节 = {} 位；已消耗 {} 位；**这份瓦片应有消耗 {} 位**\
                      ⇒ 多读了 {} 位\n最近读过的符号：{}",
-                    super::block::TRACE_TILE_FRAME_NO
-                        .load(std::sync::atomic::Ordering::Relaxed),
+                    super::block::TRACE_TILE_FRAME_NO.load(std::sync::atomic::Ordering::Relaxed),
                     self.symbol_max_bits,
-                    smb_limit(),
+                    self.smb_lim,
                     self.label,
                     self.tag,
                     self.dbg_plane,
@@ -522,7 +538,7 @@ impl<'a> SymbolDecoder<'a> {
         // 诊断：把这次符号记进环形缓冲（越界时报错会倒出来）。
         // ⚠️ **默认关闭**（`AV1_RECENT=1` 才记）—— 这是每符号一次的 48 字节写入，
         // 一帧 43.4 万个符号下就是每帧几 MB 的纯诊断开销。详见 `record_recent`。
-        if record_recent {
+        if self.record_recent {
             self.recent[self.recent_n % RECENT_SYMBOLS] = RecentSym {
                 tag: self.tag,
                 label: self.label,

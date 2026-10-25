@@ -491,7 +491,7 @@ fn predict_intrabc(
         block_inter_prediction(
             out,
             &frame.planes[plane as usize], plane, start_x, start_y, step_x, step_y, w, h, BILINEAR,
-            ir0, ir1, Some(bounds), mc_scratch,
+            ir0, ir1, Some(bounds), None, mc_scratch,
         )?;
         let pred: &Vec<i32> = &preds[0];
         let dst = &mut frame.planes[plane as usize];
@@ -515,6 +515,120 @@ fn predict_intrabc(
         }
     }
     Ok(())
+}
+
+/// 整行 `u16` 拷贝：宽度是 2/4/8/16/32（块的像素宽度），用定长未对齐读写内联掉
+/// `copy_from_slice` 的 `memmove` 调用（直写平面每帧几十万行，行长只有 4~64 字节，
+/// 函数调用开销比拷贝本身还贵）。
+#[inline(always)]
+pub(crate) fn copy_row_u16(dst: &mut [u16], src: &[u16]) {
+    debug_assert_eq!(dst.len(), src.len());
+    let n = dst.len();
+    if flags::no_rowcopy() {
+        dst.copy_from_slice(src);
+        return;
+    }
+    let d = dst.as_mut_ptr();
+    let s = src.as_ptr();
+    // SAFETY: 两个切片等长（断言）、`n` 是块宽（2/4/8/16/32/…），读写都不越过切片。
+    unsafe {
+        match n {
+            2 => std::ptr::write_unaligned(d as *mut u32, std::ptr::read_unaligned(s as *const u32)),
+            4 => std::ptr::write_unaligned(d as *mut u64, std::ptr::read_unaligned(s as *const u64)),
+            8 => {
+                std::ptr::write_unaligned(d as *mut u128, std::ptr::read_unaligned(s as *const u128))
+            }
+            16 => {
+                std::ptr::write_unaligned(d as *mut u128, std::ptr::read_unaligned(s as *const u128));
+                std::ptr::write_unaligned(
+                    d.add(8) as *mut u128,
+                    std::ptr::read_unaligned(s.add(8) as *const u128),
+                );
+            }
+            32 => {
+                for k in [0usize, 8, 16, 24] {
+                    std::ptr::write_unaligned(
+                        d.add(k) as *mut u128,
+                        std::ptr::read_unaligned(s.add(k) as *const u128),
+                    );
+                }
+            }
+            // ⚠️ 2026-10-24 试过把 64/128 宽也内联成 16 字节块循环：同二进制 A/B
+            // **+1.0%（3/8）** —— 128/256 字节这一档 libc memcpy 更快（ERMS/宽载入），
+            // 已回退。保持"≤ 32 宽内联、更宽走 memcpy"。
+            _ => dst.copy_from_slice(src),
+        }
+    }
+}
+
+/// 整像素、单参考、非复合的预测就是"按 MV 取源样本"（两趟取整恰好还原），
+/// 而**非复合的 `post_round` 恒为 0** ⇒ 平面里要写的值就是源样本本身。
+///
+/// 所以这条路径可以**直接写帧平面**：省掉 `mc_shift_rows` 的 i32 中间缓冲
+/// （每像素 4 字节写 + 4 字节读）和后面的逐行 `store_row_clamped`。
+/// 行/列钳位与标量路径逐条相同（源坐标 `clip` 到 `[0, last]`）。
+fn store_integer_pred(
+    dst: &mut super::intra::Plane,
+    src_plane: &super::intra::Plane,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    start_x: i64,
+    start_y: i64,
+) {
+    let x0 = start_x >> SCALE_SUBPEL_BITS;
+    let y0 = start_y >> SCALE_SUBPEL_BITS;
+    let last_x = src_plane.w as i64 - 1;
+    let last_y = src_plane.h as i64 - 1;
+    let sstride = src_plane.stride;
+    let dstride = dst.stride;
+    let src = src_plane.px16();
+    let out_base = y as usize * dstride + x as usize;
+    let wu = w as usize;
+    let hu = h as usize;
+    let dst_px = dst.px16_mut();
+    if x0 >= 0 && x0 + w as i64 <= last_x + 1 {
+        // 2026-10-24：**整块一次 AVX2 矩形拷贝**（行循环在核心里）。逐行
+        // `copy_row_u16` 在 64 宽时会退化成 libc `memcpy`，每行 128 字节也要付一次
+        // 真实调用；这段在采样里占 `memmove` 的 3.1%。前提：y 方向不需要逐行钳位
+        // （否则源行会重复），且横向窗口完全在源平面内（上面已判）。
+        if y0 >= 0
+            && y0 + h as i64 <= last_y + 1
+            && super::simd::avx2_available()
+            && !flags::no_rect_copy()
+        {
+            // SAFETY: 已判 AVX2；源窗口 `[x0, x0+w) × [y0, y0+h)` 在源平面内，
+            // 目标窗口在帧平面内（块已按帧裁剪）。两块缓冲不重叠（不同帧）。
+            unsafe {
+                super::simd::copy_rect_u16(
+                    dst_px.as_mut_ptr().add(out_base),
+                    dstride,
+                    src.as_ptr().add(y0 as usize * sstride + x0 as usize),
+                    sstride,
+                    wu,
+                    hu,
+                );
+            }
+            return;
+        }
+        for i in 0..hu {
+            let sy = (y0 + i as i64).clamp(0, last_y) as usize;
+            let s = &src[sy * sstride + x0 as usize..][..wu];
+            let o = out_base + i * dstride;
+            copy_row_u16(&mut dst_px[o..o + wu], s);
+        }
+    } else {
+        for i in 0..hu {
+            let sy = (y0 + i as i64).clamp(0, last_y) as usize;
+            let srow = &src[sy * sstride..];
+            let o = out_base + i * dstride;
+            for c in 0..wu {
+                let sx = (x0 + c as i64).clamp(0, last_x) as usize;
+                dst_px[o + c] = srow[sx];
+            }
+        }
+    }
 }
 
 /// `predict_inter( plane, x, y, w, h, candRow, candCol )`（§7.11.3.1）。
@@ -549,11 +663,201 @@ fn predict_inter(
     let bit_depth = seq.color.bit_depth;
     let (inter_round0, inter_round1, inter_post_round) = rounding_vars(bit_depth, is_compound);
 
+    // ── 复合 AVERAGE + 双整像素：直接按行取平均（2026-10-24）────────────────
+    //
+    // 真素材里 compound 占九成以上，而 `COMPOUND_AVERAGE` 又占了其中七成。
+    // 规范式 `Clip1(Round2(p0 + p1, 1 + InterPostRound))` 在"两路都在整像素位置"
+    // 时（p = 16·src，shift = 5）恰好化简成 `(s0 + s1 + 1) >> 1` —— 一条 `pavgw`。
+    // 两路 MC（各自要写一整块 i32）与后面的混合全部省掉。
+    //
+    // 内点（两路参考的整个窗口都在各自平面内）才走；边缘块退回通用路径。
+    if is_compound
+        && !flags::no_direct_comp_avg()
+        && grid.compound_types[gi] == super::block::COMPOUND_AVERAGE
+        && bit_depth == 8
+        && !(plane == 0 && flags::trace_pred())
+        && !frame.planes[plane as usize].is_u8()
+        && super::simd::avx2_available()
+    {
+        let mut src: [(*const u16, usize, usize, usize); 2] =
+            [(std::ptr::null(), 0, 0, 0); 2];
+        let mut direct = true;
+        for list in 0..2 {
+            let ref_frame_type = grid.ref_frames[gi][list];
+            let ref_idx = ref_slot(fh, ref_frame_type)?;
+            let Some(ref_frame) = refs[ref_idx as usize].as_ref() else {
+                direct = false;
+                break;
+            };
+            let use_warp = if w < 8 || h < 8 || flags::no_warp() {
+                0
+            } else {
+                match warp.use_warp[list] {
+                    1 if flags::no_localwarp() => 0,
+                    2 if flags::no_gmwarp() => 0,
+                    other => other,
+                }
+            };
+            let ref_plane = &ref_frame.planes[plane as usize];
+            if use_warp != 0 || ref_plane.is_u8() {
+                direct = false;
+                break;
+            }
+            let mv = grid.mvs[gi][list];
+            let (start_x, start_y, step_x, step_y) = mv_scale(
+                ref_frame, fh, plane, x, y, mv, sub_x_of(plane, seq), sub_y_of(plane, seq),
+            )?;
+            if step_x != (1 << SCALE_SUBPEL_BITS)
+                || step_y != (1 << SCALE_SUBPEL_BITS)
+                || ((start_x >> 6) & i64::from(SUBPEL_MASK)) != 0
+                || ((start_y >> 6) & i64::from(SUBPEL_MASK)) != 0
+            {
+                direct = false;
+                break;
+            }
+            let x0 = start_x >> SCALE_SUBPEL_BITS;
+            let y0 = start_y >> SCALE_SUBPEL_BITS;
+            if x0 < 0
+                || y0 < 0
+                || x0 + i64::from(w) > ref_plane.w as i64
+                || y0 + i64::from(h) > ref_plane.h as i64
+            {
+                direct = false;
+                break;
+            }
+            src[list] = (ref_plane.px16().as_ptr(), ref_plane.stride, x0 as usize, y0 as usize);
+        }
+        if direct {
+            if plane == 0 && flags::mc_stats() {
+                COMP_AVG_PIX.fetch_add((w * h) as usize, std::sync::atomic::Ordering::Relaxed);
+            }
+            let dst = &mut frame.planes[plane as usize];
+            let (dptr, dstride) = (dst.px16_mut().as_mut_ptr(), dst.stride);
+            // SAFETY: 已判 AVX2；两路窗口都按 `ref_plane.w/h` 判过内点；
+            // 目标块落在当前平面（含 PLANE_PAD 的填充区）内。
+            unsafe {
+                super::simd::comp_avg_rows(
+                    src[0].0, src[0].1, src[0].2, src[0].3,
+                    src[1].0, src[1].1, src[1].2, src[1].3,
+                    dptr, dstride, x as usize, y as usize, w as usize, h as usize,
+                );
+            }
+            return Ok(());
+        }
+    }
+
+    // ── 复合 AVERAGE + 8bit + 不缩放：两路横向 + **融合纵向/平均**（2026-10-24）
+    //
+    // 上面那条只管"两路都在整像素位置"；剩下的 AVERAGE 块是亚像素，占复合像素的
+    // 另一半。它们的成本结构是"两路各写一块 i32 暂存 → 再读两路做平均"，每次
+    // 像素来回 16 字节。这里把**纵向趟与平均合成一次**：两路横向中间量（i16，本来
+    // 就要写）算完后，纵向内核直接在寄存器里混合并写出 u16，两路 d16 预测值
+    // **一次都不落内存**。
+    if is_compound
+        && !flags::no_direct_comp_avg()
+        && grid.compound_types[gi] == super::block::COMPOUND_AVERAGE
+        && bit_depth == 8
+        && !(plane == 0 && flags::trace_pred())
+        && !frame.planes[plane as usize].is_u8()
+        && super::simd::avx2_available()
+    {
+        let wu = w as usize;
+        let interp_h = h as usize + 7;
+        let mut start = [(0i64, 0i64); 2];
+        let mut ok = true;
+        for list in 0..2 {
+            let ref_frame_type = grid.ref_frames[gi][list];
+            let ref_idx = ref_slot(fh, ref_frame_type)?;
+            let Some(rf) = refs[ref_idx as usize].as_ref() else {
+                ok = false;
+                break;
+            };
+            let use_warp = if w < 8 || h < 8 || flags::no_warp() {
+                0
+            } else {
+                match warp.use_warp[list] {
+                    1 if flags::no_localwarp() => 0,
+                    2 if flags::no_gmwarp() => 0,
+                    other => other,
+                }
+            };
+            let rp = &rf.planes[plane as usize];
+            if use_warp != 0 || rp.is_u8() {
+                ok = false;
+                break;
+            }
+            let mv = grid.mvs[gi][list];
+            let (sx, sy, stx, sty) = mv_scale(
+                rf, fh, plane, x, y, mv, sub_x_of(plane, seq), sub_y_of(plane, seq),
+            )?;
+            if stx != (1 << SCALE_SUBPEL_BITS) || sty != (1 << SCALE_SUBPEL_BITS) {
+                ok = false;
+                break;
+            }
+            start[list] = (sx, sy);
+        }
+        if ok {
+            let PredScratch { mc: mc_a, mc2: mc_b, .. } = bufs;
+            let ia = scratch_of_i16(mc_a, interp_h * wu);
+            let ib = scratch_of_i16(mc_b, interp_h * wu);
+            let mut fy_pair: [&[i16; 8]; 2] = [&DELTA_FILTER, &DELTA_FILTER];
+            let mut ok2 = true;
+            for list in 0..2 {
+                let ref_frame_type = grid.ref_frames[gi][list];
+                let ref_idx = ref_slot(fh, ref_frame_type)?;
+                let rf = refs[ref_idx as usize].as_ref().expect("上面已判过参考存在");
+                let rp = &rf.planes[plane as usize];
+                let (sx, sy) = start[list];
+                let x0 = sx >> SCALE_SUBPEL_BITS;
+                let y0 = sy >> SCALE_SUBPEL_BITS;
+                let phase_x = ((sx >> 6) & i64::from(SUBPEL_MASK)) as usize;
+                let phase_y = ((sy >> 6) & i64::from(SUBPEL_MASK)) as usize;
+                let filter = grid.interp_filters[gi][list];
+                let filt_h = subpel_index(filter, w <= 4)?;
+                let filt_v = subpel_index(filter, h <= 4)?;
+                let fx = &SUBPEL_FILTERS[filt_h][phase_x];
+                fy_pair[list] = &SUBPEL_FILTERS[filt_v][phase_y];
+                let last_x = rp.w as i64 - 1;
+                let last_y = rp.h as i64 - 1;
+                let interior_x = x0 >= 3 && x0 + wu as i64 + 3 <= last_x;
+                let out: &mut [i16] = if list == 0 { &mut *ia } else { &mut *ib };
+                // SAFETY: 已判 AVX2；`out` 有 `interp_h * wu` 项，行下标由内核钳位。
+                unsafe {
+                    super::simd::mc_horiz_rows_8bpc(
+                        rp.px16(), rp.stride, y0, last_y, interp_h, x0 as isize, wu, fx,
+                        inter_round0, interior_x, last_x, out,
+                    );
+                }
+            }
+            if ok2 {
+                let dst = &mut frame.planes[plane as usize];
+                let dptr = dst.px16_mut().as_mut_ptr();
+                let dstride = dst.stride as isize;
+                let row = unsafe {
+                    dptr.offset(y as isize * dstride + x as isize)
+                };
+                // SAFETY: 已判 AVX2；两路中间量各有 `interp_h * wu` 项；目标块在
+                // 当前平面（含 PLANE_PAD）内；`inter_round1` = 7、混合位移 = 5。
+                unsafe {
+                    super::simd::mc_vert2_avg_u16(
+                        ia, ib, wu, h as usize, fy_pair[0], fy_pair[1], inter_round1,
+                        1 + inter_post_round, (1i32 << bit_depth) - 1, row, dstride,
+                    );
+                }
+                if plane == 0 && flags::mc_stats() {
+                    COMP_AVG_PIX.fetch_add((w * h) as usize, std::sync::atomic::Ordering::Relaxed);
+                }
+                return Ok(());
+            }
+            let _ = ok2;
+        }
+    }
+
     // 每个参考列表各做一遍块帧间预测（规范 §7.11.3.1 的步骤 5–13 重复两次）
     let lists = if is_compound { 2usize } else { 1usize };
     // 两路预测值落在**调用方给的复用缓冲**里（`compute_prediction` 持有、跨块复用）：
     // 每块一次 `vec![0i32; w*h]` 是 malloc + memset 两次开销，而 1080p 一帧几万块 × 1~2 路。
-    let PredScratch { preds, mc: mc_scratch, mask: dw_mask } = bufs;
+    let PredScratch { preds, mc: mc_scratch, mask: dw_mask, .. } = bufs;
     let preds: &mut [Vec<i32>] = &mut preds[..lists];
     for list in 0..lists {
         let ref_frame_type = grid.ref_frames[gi][list];
@@ -607,17 +911,99 @@ fn predict_inter(
         let (start_x, start_y, step_x, step_y) = mv_scale(
             ref_frame, fh, plane, x, y, mv, sub_x_of(plane, seq), sub_y_of(plane, seq),
         )?;
+        // **整像素单参考直写平面**（见 `store_integer_pred` 的推导）。
+        // 复合 / interintra / OBMC / 诊断打印 / u8 存储仍走通用路径。
+        let phase_zero = step_x == (1 << SCALE_SUBPEL_BITS)
+            && step_y == (1 << SCALE_SUBPEL_BITS)
+            && ((start_x >> 6) & i64::from(SUBPEL_MASK)) == 0
+            && ((start_y >> 6) & i64::from(SUBPEL_MASK)) == 0;
+        if plane == 0 && flags::mc_stats() {
+            use std::sync::atomic::Ordering::Relaxed;
+            let k = if info.interintra && !flags::no_interintra() {
+                7
+            } else if info.motion_mode == super::block::OBMC && !flags::no_obmc() {
+                6
+            } else if is_compound {
+                match grid.compound_types[gi] {
+                    super::block::COMPOUND_AVERAGE => 2,
+                    super::block::COMPOUND_DISTANCE => 3,
+                    super::block::COMPOUND_WEDGE => 4,
+                    _ => 5,
+                }
+            } else if phase_zero {
+                0
+            } else {
+                1
+            };
+            MC_PIX[k].fetch_add((w * h) as usize, Relaxed);
+        }
+        if phase_zero
+            && !is_compound
+            && !(info.interintra && !flags::no_interintra())
+            && !(info.motion_mode == super::block::OBMC && !flags::no_obmc())
+            && !(plane == 0 && flags::trace_pred())
+            && !flags::no_direct_pred()
+        {
+            let dst = &mut frame.planes[plane as usize];
+            if !dst.is_u8() {
+                store_integer_pred(
+                    dst,
+                    &ref_frame.planes[plane as usize],
+                    x,
+                    y,
+                    w,
+                    h,
+                    start_x,
+                    start_y,
+                );
+                return Ok(());
+            }
+        }
         if plane == 0 && flags::trace_pred() {
             eprintln!(
                 "PRED r={cand_row} c={cand_col} bs={bsize} mv=({},{}) ref0={} ref1={} filt={filter} w={w} h={h} start=({start_x},{start_y}) step=({step_x},{step_y})",
                 mv[0], mv[1], ref0, grid.ref_frames[gi][1]
             );
         }
+        // **单参考子像素直写平面**：没有复合 / OBMC / interintra 时，预测值不必
+        // 先进 i32 暂存再拷一遍 —— 纵向内核取整后直接钳位、打包成 u16 写进帧平面。
+        // 只开 8bit + 不缩放（内核收 `mc_vert_rows_u16`；缩放路径仍走原路）。
+        let direct_subpel = !is_compound
+            && !(info.interintra && !flags::no_interintra())
+            && !(info.motion_mode == super::block::OBMC && !flags::no_obmc())
+            && !(plane == 0 && flags::trace_pred())
+            && !phase_zero
+            && step_x == (1 << SCALE_SUBPEL_BITS)
+            && step_y == (1 << SCALE_SUBPEL_BITS)
+            && bit_depth == 8
+            && super::simd::avx2_available()
+            && !flags::no_direct_subpel()
+            && !frame.planes[plane as usize].is_u8();
+        if direct_subpel && flags::mc_stats() {
+            DIRECT_SUBPEL_BLOCKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            DIRECT_SUBPEL_PIXELS.fetch_add((w * h) as usize, std::sync::atomic::Ordering::Relaxed);
+        }
+        if direct_subpel {
+            let dst_plane = &mut frame.planes[plane as usize];
+            let po = PlaneOut {
+                base: dst_plane.px16_mut().as_mut_ptr(),
+                stride: dst_plane.stride as isize,
+                x: x as usize,
+                y: y as usize,
+                max: (1i32 << bit_depth) - 1,
+            };
+            block_inter_prediction(
+                &mut [],
+                &ref_frame.planes[plane as usize], plane, start_x, start_y, step_x, step_y, w, h,
+                filter, inter_round0, inter_round1, None, Some(po), mc_scratch,
+            )?;
+            return Ok(());
+        }
         let out = scratch_of(&mut preds[list], (w * h) as usize);
         block_inter_prediction(
             out,
             &ref_frame.planes[plane as usize], plane, start_x, start_y, step_x, step_y, w, h, filter,
-            inter_round0, inter_round1, None, mc_scratch,
+            inter_round0, inter_round1, None, None, mc_scratch,
         )?;
         if plane == 0 && flags::trace_pred() {
             eprintln!(
@@ -1043,7 +1429,7 @@ fn obmc_overlap_predict(
     block_inter_prediction(
         out,
         &ref_frame.planes[plane as usize], plane, start_x, start_y, step_x, step_y, pred_w, pred_h,
-        filter, inter_round0, inter_round1, None, mc_scratch,
+        filter, inter_round0, inter_round1, None, None, mc_scratch,
     )?;
     let obmc_pred: &Vec<i32> = neighbor_pred;
     if plane == 0 && flags::trace_pred() {
@@ -1547,6 +1933,30 @@ fn mv_scale(
     Ok((start_x, start_y, step_x, step_y))
 }
 
+/// 帧间预测的**直写平面**目标（8bit、单参考、非复合、非 OBMC/interintra）。
+///
+/// `base` 是平面基址（不是块起址），`(x, y)` 是块在平面里的像素坐标 ——
+/// 纵向内核按绝对行号写 `base + (y+r)·stride + x`。
+/// `ME_MC_STATS=1` 的计数（诊断）。
+pub(crate) static DIRECT_SUBPEL_BLOCKS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static DIRECT_SUBPEL_PIXELS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+/// `ME_MC_STATS=1`：亮度预测像素按类别累计
+/// （0 单参考整像素、1 单参考子像素、2 复合、3 OBMC、4 warp、5 interintra）。
+pub(crate) static COMP_AVG_PIX: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+pub(crate) static MC_PIX: [std::sync::atomic::AtomicUsize; 8] =
+    [const { std::sync::atomic::AtomicUsize::new(0) }; 8];
+
+pub(crate) struct PlaneOut {
+    pub base: *mut u16,
+    pub stride: isize,
+    pub x: usize,
+    pub y: usize,
+    pub max: i32,
+}
+
 /// 把一块**可复用**缓冲对齐到 `n` 个 `i32` 并交回切片。
 ///
 /// **长度没变时一次分配、一次填充都不做**（连续同尺寸的块是常态）；变长时才
@@ -1568,6 +1978,8 @@ pub struct PredScratch {
     pub preds: [Vec<i32>; 2],
     /// MC 的横向中间量（i16，见上面的说明）
     pub mc: Vec<i16>,
+    /// 复合 AVERAGE 融合路径的**第二路**横向中间量（见 `mc_vert2_avg_u16`）。
+    pub mc2: Vec<i16>,
     /// `COMPOUND_DIFFWTD` 的**亮度**掩码（§7.11.3.12）。
     ///
     /// 2026-10-04 从"每块一次 `vec![0i32; w*h]`"改成**跨块复用**：真素材每帧
@@ -1581,6 +1993,7 @@ impl Default for PredScratch {
         Self {
             preds: [Vec::new(), Vec::new()],
             mc: Vec::new(),
+            mc2: Vec::new(),
             mask: Vec::new(),
         }
     }
@@ -1674,6 +2087,8 @@ fn block_inter_prediction(
     inter_round0: u32,
     inter_round1: u32,
     bounds: Option<(i64, i64)>,
+    // 直写目标平面（只给"单参考、8bit、不缩放"的快路径；`Some` 时 `dst` 不参与）。
+    out_plane: Option<PlaneOut>,
     // 横向中间量的**复用**缓冲（由调用方持有，见 `scratch_of`）。
     // 原来这里是 `[0i32; 4096]` 的栈数组：**每次调用都 memset 16KB**，
     // 哪怕块只有 4 像素宽；超过 4096 项的大块还退化成逐块 `vec![]`。
@@ -1684,7 +2099,9 @@ fn block_inter_prediction(
     let stride = plane_data.stride;
     let data = plane_data.px16();
     let wu = w as usize;
-    debug_assert_eq!(dst.len(), wu * h as usize, "帧间预测的输出缓冲长度不对");
+    if out_plane.is_none() {
+        debug_assert_eq!(dst.len(), wu * h as usize, "帧间预测的输出缓冲长度不对");
+    }
 
     // ── 快路径 1：整数相位（两个方向都不缩放、相位都是 0）──────────────────
     //
@@ -1801,8 +2218,34 @@ fn block_inter_prediction(
                     intermediate,
                 )
             };
-            
-                        mc_vertical_pass(
+            if let Some(po) = out_plane {
+                // 直写平面：与 `mc_vertical_pass` 的算术逐位相同，只是把结果钳位、
+                // 打包成 u16 直接落在帧平面上（省掉整块 i32 暂存与之后的一趟拷贝）。
+                debug_assert!(no_scale && simd && plane_data.bit_depth == 8);
+                debug_assert!(h as usize + 7 <= interp_h, "直写路径的中间量行数不足");
+                // SAFETY: `po` 由调用方按同一平面、同一块的 `(x, y)` 构造；
+                // 块像素（含 `PLANE_PAD` 的帧外填充）都在缓冲内。
+                let row = unsafe {
+                    po.base.offset(po.y as isize * po.stride + po.x as isize)
+                };
+                // SAFETY: 已判 AVX2；`intermediate` 至少 `interp_h * wu` 项
+                //（`h + 7 <= interp_h`），目标行的 `[x, x+wu)` 在平面内（块不越出
+                // 平面 + PLANE_PAD 的填充区）。
+                unsafe {
+                    simd::mc_vert_rows_u16(
+                        intermediate,
+                        wu,
+                        h as usize,
+                        fy,
+                        inter_round1,
+                        po.max,
+                        row,
+                        po.stride,
+                    )
+                };
+                return Ok(());
+            }
+            mc_vertical_pass(
                             intermediate,
                             dst,
                             wu,
@@ -2314,6 +2757,7 @@ mod tests {
                     3,
                     7,
                     Some((w as i64 - 1, h as i64 - 1)),
+                    None,
                     &mut mc_scratch,
                 )
                 .unwrap();

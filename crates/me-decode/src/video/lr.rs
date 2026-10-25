@@ -609,6 +609,10 @@ const X_BY_XPLUS1: [i32; 256] = {
         t[z] = (((z as i32) << SGRPROJ_SGR_BITS) + (z as i32) / 2) / (z as i32 + 1);
         z += 1;
     }
+    // 2026-10-25：`t[255] = 256`。规范里 `z >= 255` 的特例给 256，而公式在 255 处给 255；
+    // 把末项改掉之后，**SIMD 侧的 gather** 可以统一用 `min(max(z,0),255)` 查表
+    // （负值仍走标量兜底）。标量路径的 `z >= 255 → 256` 分支保持不变、不读这一项。
+    t[255] = 256;
     t
 };
 /// `sgr_filter` 的 F 上限（`64 × 64`，见 [`LR_CHUNK`]）。
@@ -711,8 +715,11 @@ pub fn apply(
     }
     // 需要真滤波：两份源都得可读 ⇒ 从所有权降级成借用（`out` 是第三份）。
     // 没做 CDEF 时 `CdefFrame ≡ CurrFrame`，直接借用同一份（规范语义允许）。
-    let up_curr = &up_curr;
-    let up_cdef: &CurrFrame = up_cdef.as_ref().unwrap_or(up_curr);
+    // 两份源都要保留（LR 的滤波抽头同时读 `CurrFrame` 与 `CdefFrame`）；
+    // `RESTORE_NONE` 的平面随后把源平面**换**进 `out`（零拷贝），换出来的
+    // 新平面跟着源一起回池 —— 前提是那块平面不再被任何滤波路径读（它不滤波）。
+    let mut up_curr = up_curr;
+    let mut up_cdef = up_cdef;
     // `out` 的**每一个**像素都会被下面的恢复块写一遍 —— `RESTORE_NONE` 那一档
     // 也按块从 `CdefFrame` 把样本搬过来（见 `restore_block`）。所以**不需要**先
     // `up_cdef.clone()` 整份拷贝：1080p 一帧省掉 6 MB 的 memmove，而且
@@ -720,17 +727,21 @@ pub fn apply(
     // 缺页 + 内核清零便宜得多。
     // ⚠️ 前提是"覆盖满"：x/y 两个循环按 `MI_SIZE` 走满整帧，`w`/`h` 已按平面
     //    边界裁剪，三档（wiener / sgr / none）都写。改这段循环时务必保持这条。
-    let mut out = CurrFrame::new(
-        up_cdef.planes[0].w,
-        up_cdef.planes[0].h,
-        up_cdef.sub_x,
-        up_cdef.sub_y,
-        up_cdef.num_planes,
-        up_cdef.planes[0].bit_depth,
-    );
-    let upscaled_width = up_cdef.planes[0].w as i32;
-    let frame_height = up_cdef.planes[0].h as i32;
-    let num_planes = up_cdef.num_planes;
+    let (fw, fh_px, fsx, fsy, fnp, fbd) = {
+        let r: &CurrFrame = up_cdef.as_ref().unwrap_or(&up_curr);
+        (
+            r.planes[0].w,
+            r.planes[0].h,
+            r.sub_x,
+            r.sub_y,
+            r.num_planes,
+            r.planes[0].bit_depth,
+        )
+    };
+    let mut out = CurrFrame::new(fw, fh_px, fsx, fsy, fnp, fbd);
+    let upscaled_width = fw as i32;
+    let frame_height = fh_px as i32;
+    let num_planes = fnp;
 
     // `frame_restoration_type[plane] == RESTORE_NONE` 的平面**整帧都不滤波**：
     // 规范里它的输出就是 `CdefFrame` 的一份拷贝。这里按**平面**整块搬（连 padding
@@ -738,9 +749,19 @@ pub fn apply(
     // 而不是把整帧都拷一遍 —— 每个平面只需要一次连续 memcpy。
     for plane in 0..num_planes {
         if fh.params.lr.frame_restoration_type[plane] == RESTORE_NONE {
-            out.planes[plane].px16_mut().copy_from_slice(up_cdef.planes[plane].px16());
+            if flags::no_lr_swap() {
+                let src_ref: &CurrFrame = up_cdef.as_ref().unwrap_or(&up_curr);
+                out.planes[plane]
+                    .px16_mut()
+                    .copy_from_slice(src_ref.planes[plane].px16());
+            } else {
+                let src_frame: &mut CurrFrame = up_cdef.as_mut().unwrap_or(&mut up_curr);
+                std::mem::swap(&mut out.planes[plane], &mut src_frame.planes[plane]);
+            }
         }
     }
+    let up_curr = &up_curr;
+    let up_cdef: &CurrFrame = up_cdef.as_ref().unwrap_or(up_curr);
 
     // 每个平面的**恢复单元几何是常量**：`RestorationUnitSize ∈ {64,128,256}`（2 的幂
     // ⇒ 除法换移位）、`count_units_in_frame` 与两个除法原先在 `restore_block` 里
@@ -954,8 +975,36 @@ fn restore_block(
         let s = &up_cdef.planes[plane];
         let data = s.px16();
         let stride = s.stride;
-        // 按行搬：一次 `set_row` 写完一整行的 `w` 个样本（逐像素 `set` 要 4 倍
-        // 次数的函数调用 + 边界检查；CDEF 那条路早就这么做了）。
+        if !flags::no_lr_none_copy() {
+            // 2026-10-24：**直接按行拷 u16**。原来先读进 i32 行缓冲再 `set_row`
+            // （逐样本 `clamp` + 存回），等于每个样本两读两写；这里源和目标都是
+            // 同一宽度的 u16，一次 `copy_nonoverlapping` 就够（`RESTORE_NONE`
+            // 本来就是"原样搬过去"，没有任何值变换）。
+            let (dptr, dstride, _, _) = out.direct();
+            let wu = w as usize;
+            let dstride = dstride as usize;
+            for i in 0..h {
+                let off = (y + i) as usize * stride + x as usize;
+                let doff = (y + i) as usize * dstride + x as usize;
+                if wu <= 32 {
+                    // 短行（色度档 / 帧右边缘）走内联定长拷贝，避开 memmove 调用。
+                    let sp = &data[off..off + wu];
+                    // SAFETY: `RowsSink` 保证本行 `[0, stride)` 可写，且行属于本 worker；
+                    // 源与目标是两块不同的缓冲，不重叠。
+                    let dp = unsafe {
+                        std::slice::from_raw_parts_mut(dptr.add(doff), wu)
+                    };
+                    super::inter::copy_row_u16(dp, sp);
+                } else {
+                    // SAFETY: 同上；更宽的行（64/128）libc memcpy 更快。
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(data.as_ptr().add(off), dptr.add(doff), wu);
+                    }
+                }
+            }
+            return Ok(());
+        }
+        // 按行搬：一次 `set_row` 写完一整行的 `w` 个样本。
         let mut row = [0i32; LR_CHUNK as usize];
         for i in 0..h {
             let off = (y + i) as usize * stride + x as usize;
@@ -1179,6 +1228,10 @@ fn sgr_filter(
     // `66×66 = 4356` 项、F 上限 `64×64 = 4096` 项 —— 定长数组就够，既不用 `vec![]`
     // （一帧几十万次分配），也不用穿线程局部（TLS 访问本身在 1080p 上是可观开销，
     // 采样里一度占到 ~24%）。
+    // ⚠️ 2026-10-24 试过把下面四个栈数组挪进线程局部（TLS）复用、只清边界行：
+    // **+4.6%（1/10 轮）**。原因：`box_filter` 内联后 LLVM 能证明 `f0`/`f1` 被写满、
+    // 把整片初始化**删掉**；而 TLS 里的数组隔着 `RefCell` 借用，别名信息变差、死存储
+    // 消除也失效 ⇒ 反而更慢。**保持栈上定长数组。**
     let mut a = [0i32; SGR_AB_MAX];
     let mut b = [0i32; SGR_AB_MAX];
     let mut f0 = [0i32; SGR_F_MAX];
@@ -1189,10 +1242,54 @@ fn sgr_filter(
     // `f0` / `f1` **不需要预清零**：`box_filter` 三条出口（`r == 0` 时自己
     // `fill(0)`、否则末段按行写满 `w × h`）都会覆盖 `need_f` 全部。
     let (f0s, f1s) = (&mut f0[..need_f], &mut f1[..need_f]);
+    let ts = std::time::Instant::now();
     box_filter(src, set, 0, x, y, w, h, seq, f0s, &mut a[..need_ab], &mut b[..need_ab])?;
+    let box0 = ts.elapsed();
+    let ts1 = std::time::Instant::now();
     box_filter(src, set, 1, x, y, w, h, seq, f1s, &mut a[..need_ab], &mut b[..need_ab])?;
-    let mut row = [0i32; LR_CHUNK as usize];
+    let box1 = ts1.elapsed();
+    let ts2 = std::time::Instant::now();
+    // 2026-10-25：**收尾投影向量化**（8 路 i32）。原来逐像素 3 次乘 + 取整 + 钳位 +
+    // 存 i32，再整行 `set_row` 转 u16；现在一次算完直接落 u16（`set_row_i16`）。
+    // `r0`/`r1` 是否为 0 是本次调用的常量 ⇒ 用 const 泛型消掉循环里的分支。
+    let plane_ref = &src.up_cdef.planes[plane];
+    let ustride = plane_ref.stride;
+    let max = (1i32 << seq.color.bit_depth) - 1;
+    let proj_shift = SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS;
+    let simd = super::simd::avx2_available() && !flags::no_sgr_proj() && !plane_ref.is_u8();
+    let mut row16 = [0i16; LR_CHUNK as usize];
     for i in 0..h {
+        if simd {
+            let uoff = (y + i) as usize * ustride + x as usize;
+            let foff = i as usize * w as usize;
+            // SAFETY: 已判 AVX2 且非 u8；`u` 指向本行 `w` 个样本（块在平面内）；
+            // `f0`/`f1` 至少 `need_f = w*h` 项、`foff + w <= need_f`；`row16` 有 `w` 项。
+            unsafe {
+                let up = plane_ref.px16().as_ptr().add(uoff);
+                let f0p = f0.as_ptr().add(foff);
+                let f1p = f1.as_ptr().add(foff);
+                match (r0 != 0, r1 != 0) {
+                    (true, true) => super::simd::sgr_proj_row8::<true, true>(
+                        up, f0p, f1p, row16.as_mut_ptr(), w as usize, w0, w1, w2,
+                        proj_shift, max,
+                    ),
+                    (true, false) => super::simd::sgr_proj_row8::<true, false>(
+                        up, f0p, f1p, row16.as_mut_ptr(), w as usize, w0, w1, w2,
+                        proj_shift, max,
+                    ),
+                    (false, true) => super::simd::sgr_proj_row8::<false, true>(
+                        up, f0p, f1p, row16.as_mut_ptr(), w as usize, w0, w1, w2,
+                        proj_shift, max,
+                    ),
+                    (false, false) => super::simd::sgr_proj_row8::<false, false>(
+                        up, f0p, f1p, row16.as_mut_ptr(), w as usize, w0, w1, w2,
+                        proj_shift, max,
+                    ),
+                }
+            }
+            out.set_row_i16(x as usize, (y + i) as usize, &row16[..w as usize]);
+            continue;
+        }
         for j in 0..w {
             let u = i32::from(
                 src.up_cdef.planes[plane].get((x + j) as usize, (y + i) as usize),
@@ -1202,12 +1299,25 @@ fn sgr_filter(
             v += if r0 != 0 { w0 * f0[idx] } else { w0 * u };
             v += if r1 != 0 { w2 * f1[idx] } else { w2 * u };
             let s = round2(v, SGRPROJ_RST_BITS + SGRPROJ_PRJ_BITS);
-            row[j as usize] = i32::from(super::intra::clip1(s, seq.color.bit_depth));
+            row16[j as usize] = super::intra::clip1(s, seq.color.bit_depth) as i16;
         }
-        out.set_row(x as usize, (y + i) as usize, &row[..w as usize]);
+        out.set_row_i16(x as usize, (y + i) as usize, &row16[..w as usize]);
+    }
+    if flags::lr_stats() {
+        use std::sync::atomic::Ordering::Relaxed;
+        SGR_BOX0_NS.fetch_add(box0.as_nanos() as u64, Relaxed);
+        SGR_BOX1_NS.fetch_add(box1.as_nanos() as u64, Relaxed);
+        SGR_FINAL_NS.fetch_add(ts2.elapsed().as_nanos() as u64, Relaxed);
+        SGR_CALLS.fetch_add(1, Relaxed);
     }
     Ok(())
 }
+
+/// SGR 三段耗时（`ME_LR_STATS=1`），单位 ns。
+pub(crate) static SGR_BOX0_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SGR_BOX1_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SGR_FINAL_NS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static SGR_CALLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// `Box filter process`（规范 §7.17.3）：`pass` 为 0 / 1。
 ///
@@ -1480,23 +1590,53 @@ fn box_filter(
         let frow = &mut f[i as usize * w as usize..][..w as usize];
         let mut j = 0i32;
         if avx2 {
-            while j + 8 <= w {
-                // SAFETY: 已判 AVX2；`j + 8 <= w` ⇒ 这一批 8 列的
-                // `a_buf[base + dyi*aw + dxi .. +8]` 全部落在 `a_buf[..need_ab]` 内
-                // （行内偏移最多到 `w + 1 < aw`），`u` 的 8 个 `u16` 也都在 `cdef` 行内。
-                unsafe {
-                    super::simd::sgr_final_8(
-                        &a_buf[..ab_len],
-                        &b_buf[..ab_len],
-                        aw,
-                        i as usize * aw + j as usize,
-                        &wt,
-                        cdef.px16().as_ptr().add(cdef_off + j as usize),
-                        sgr_shift,
-                        &mut frow[j as usize..j as usize + 8],
-                    );
+            // 权重图案只有三种 ⇒ 按图案单态化（`vpmulld` → 求和后移位/加减）。
+            // `ME_NO_SGR_FINAL_PAT=1` 退回按权重表逐项乘的通用版（逐字节相同）。
+            macro_rules! run_pat {
+                ($pat:expr, $shift:expr) => {{
+                    while j + 8 <= w {
+                        // SAFETY: 已判 AVX2；`j + 8 <= w` ⇒ 这一批 8 列的
+                        // `a_buf[base + dyi*aw + dxi .. +8]` 全部落在 `a_buf[..need_ab]` 内
+                        // （行内偏移最多到 `w + 1 < aw`），`u` 的 8 个 `u16` 也都在 `cdef` 行内。
+                        unsafe {
+                            super::simd::sgr_final_8_pat::<$pat, $shift>(
+                                &a_buf[..ab_len],
+                                &b_buf[..ab_len],
+                                aw,
+                                i as usize * aw + j as usize,
+                                cdef.px16().as_ptr().add(cdef_off + j as usize),
+                                &mut frow[j as usize..j as usize + 8],
+                            );
+                        }
+                        j += 8;
+                    }
+                }};
+            }
+            if flags::no_sgr_final_pat() {
+                while j + 8 <= w {
+                    // SAFETY: 同上。
+                    unsafe {
+                        super::simd::sgr_final_8(
+                            &a_buf[..ab_len],
+                            &b_buf[..ab_len],
+                            aw,
+                            i as usize * aw + j as usize,
+                            &wt,
+                            cdef.px16().as_ptr().add(cdef_off + j as usize),
+                            sgr_shift,
+                            &mut frow[j as usize..j as usize + 8],
+                        );
+                    }
+                    j += 8;
                 }
-                j += 8;
+            } else if pass == 0 {
+                if i & 1 != 0 {
+                    run_pat!(1u8, 8i32);
+                } else {
+                    run_pat!(0u8, 9i32);
+                }
+            } else {
+                run_pat!(2u8, 9i32);
             }
         }
         while j < w {

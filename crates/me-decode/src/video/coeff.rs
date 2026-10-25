@@ -875,6 +875,16 @@ impl<'a> GridAccess<'a> {
 /// * `t`：`dequantize` 写满系数格 `min(32,w)×min(32,h)`，而反变换**只读**这一片；
 /// * `residual`：行趟把 `w·h` 全部写满；
 /// * `pred`：每次整块从平面重填。
+/// `eob` 分布（`ME_EOB_STATS=1`）：`[eob==1, eob<=4, eob<=16, eob<=64, eob>64]`
+/// 的**块数**与**像素数**，用来校准"稀疏反变换"值不值得做。
+pub(crate) static EOB_BLKS: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+/// DC-only 快路径的命中/未命中（`tx_type` 不是 DCT_DCT）（`ME_EOB_STATS=1`）。
+pub(crate) static DC_ONLY_HIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static DC_ONLY_MISS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub(crate) static EOB_PIX: [std::sync::atomic::AtomicU64; 5] =
+    [const { std::sync::atomic::AtomicU64::new(0) }; 5];
+
 #[derive(Default)]
 pub struct TxScratch {
     levels: Vec<i32>,
@@ -1207,12 +1217,29 @@ impl ResidualCtx<'_> {
                 )?
             };
             if reconstructing && eob > 0 {
+                if flags::eob_stats() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    let k = if eob <= 1 {
+                        0
+                    } else if eob <= 4 {
+                        1
+                    } else if eob <= 16 {
+                        2
+                    } else if eob <= 64 {
+                        3
+                    } else {
+                        4
+                    };
+                    EOB_BLKS[k].fetch_add(1, Relaxed);
+                    EOB_PIX[k].fetch_add((w * h) as u64, Relaxed);
+                }
                 let TxScratch { levels, t, pred, residual, residual32, .. } = scratch;
                 self.add_residual(
                     plane,
                     start_x,
                     start_y,
                     tx_sz,
+                    eob,
                     &levels[..(w * h).min(MAX_TXB_COEFFS)],
                     t,
                     pred,
@@ -1272,7 +1299,7 @@ impl ResidualCtx<'_> {
             if tj.has_residual {
                 let lv = &levels[tj.levels_at..tj.levels_at + tj.levels_len];
                 let TxScratch { t, pred, residual, residual32, .. } = scratch;
-                self.add_residual(tj.plane, tj.start_x, tj.start_y, tj.tx_sz, lv, t, pred, residual, residual32)?;
+                self.add_residual(tj.plane, tj.start_x, tj.start_y, tj.tx_sz, 0, lv, t, pred, residual, residual32)?;
             }
             // 诊断（`ME_TRACE_RACE=1`）：**逐变换块**盖章，而且必须等**残差也加完**才算"写完" ——
             // 早先在 `reconstruct_block` 之后就盖，读者会看到"已写但缺残差"的像素，
@@ -1297,6 +1324,9 @@ impl ResidualCtx<'_> {
         start_x: i32,
         start_y: i32,
         tx_sz: u8,
+        // `eob`（扫描序里最后一个非零的位置数）：`1` = 只有 DC 非零 ⇒ 走恒定平面快路径。
+        // row-mt 回放没有存 eob，传 0（永不匹配，走完整路径）。
+        eob: u32,
         // 系数（系数格 `tw*th`）：普通路径是 `scratch.levels`，row-mt 回放是 arena 里那份
         src_levels: &[i32],
         t: &mut Vec<i32>,
@@ -1317,6 +1347,71 @@ impl ResidualCtx<'_> {
 
         let lossless = self.cfg.lossless;
         let frame = self.frame.as_mut().expect("调用前已判过 Some");
+        let (stride, bit_depth, plane_is_u8) = {
+            let p = frame.plane(plane);
+            (p.stride, p.bit_depth, p.is_u8())
+        };
+        // **就地写回**：预测值本来就在帧平面里，反变换的加法直接读它 ——
+        // 不必先拷进 `pred` 再读一遍（1080p 一帧几万个变换块）。
+        // 诊断（要打印 pred）与 u8 存储仍走旧的"先拷后加"路径。
+        let want_pred =
+            flags::trace_tx1() && start_y < 6 && start_x < 6 && plane == 0;
+        if !want_pred && !plane_is_u8 && !flags::no_tx_inplace() {
+            // ── DC-only 快路径（2026-10-25）────────────────────────────────────
+            //
+            // 真素材（425 kbps 1080p）里 **60% 的变换块 eob == 1、占 39% 的变换像素**，
+            // 而且这些块普遍是 32×32/64×64 的大块。DCT_DCT 的 DC-only 反变换是
+            // **恒定平面**（单测 `dc_only_dct_dct_is_constant_plane` 钉住）⇒ 整块
+            // 只需"算一个常量 + 逐像素加常量"，不必跑完整蝶形。
+            if eob == 1
+                && !self.cfg.lossless
+                && !flags::no_dc_only()
+                && !flags::trace_tx1()
+                && super::simd::avx2_available()
+            {
+                let hit = super::transform::dc_only_constant(t[0], tx_sz, tx_type, bit_depth);
+                if flags::eob_stats() {
+                    use std::sync::atomic::Ordering::Relaxed;
+                    if hit.is_some() {
+                        DC_ONLY_HIT.fetch_add(1, Relaxed);
+                    } else {
+                        DC_ONLY_MISS.fetch_add(1, Relaxed);
+                    }
+                }
+                if let Some(c) = hit
+                {
+                    let max = (1i32 << bit_depth) - 1;
+                    let base = start_y as usize * stride + start_x as usize;
+                    let dst = frame.planes[plane as usize].px16_mut();
+                    // SAFETY: 已判 AVX2；`base..base + (h-1)*stride + w` 在平面缓冲内
+                    // （块连同 padding 都在 `PLANE_PAD` 覆盖的范围内，与完整路径同一前提）。
+                    unsafe {
+                        super::simd::add_const_plane(
+                            dst.as_mut_ptr().add(base),
+                            stride,
+                            w,
+                            h,
+                            c as i32,
+                            max,
+                        );
+                    }
+                    return Ok(());
+                }
+            }
+            let base = start_y as usize * stride + start_x as usize;
+            let dst = &mut frame.planes[plane as usize].px16_mut()[base..];
+            return super::transform::inverse_transform_add_in_place(
+                &t,
+                tx_sz,
+                tx_type,
+                dst,
+                stride,
+                bit_depth,
+                lossless,
+                residual,
+                residual32,
+            );
+        }
         let pred = scratch_len(pred, w * h);
         {
             // 逐像素 `Plane::get` 每次都要在 u8/u16 两种存储之间分支 + 做边界断言；
@@ -1341,8 +1436,6 @@ impl ResidualCtx<'_> {
                 }
             }
         }
-        let stride = frame.plane(plane).stride;
-        let bit_depth = frame.plane(plane).bit_depth;
         if flags::trace_tx1() && start_y < 6 && start_x < 6 && plane == 0 {
             let _ = &frame;
             println!(

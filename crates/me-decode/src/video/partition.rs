@@ -281,19 +281,38 @@ impl MiGrid {
         }
         let w = NUM_4X4_BLOCKS_WIDE[bsize as usize] as i32;
         let h = NUM_4X4_BLOCKS_HIGH[bsize as usize] as i32;
-        for y in 0..h {
-            for x in 0..w {
-                let (rr, cc) = (r + y, c + x);
-                if rr < 0 || cc < 0 || rr as usize >= self.rows || cc as usize >= self.cols {
-                    continue;
+        if super::flags::no_part_fill() {
+            for y in 0..h {
+                for x in 0..w {
+                    let (rr, cc) = (r + y, c + x);
+                    if rr < 0 || cc < 0 || rr as usize >= self.rows || cc as usize >= self.cols {
+                        continue;
+                    }
+                    let i = rr as usize * self.cols + cc as usize;
+                    if self.filled[i] {
+                        self.overlaps += 1;
+                    }
+                    self.sizes[i] = bsize;
+                    self.filled[i] = true;
                 }
-                let i = rr as usize * self.cols + cc as usize;
-                if self.filled[i] {
-                    self.overlaps += 1;
-                }
-                self.sizes[i] = bsize;
-                self.filled[i] = true;
             }
+            return;
+        }
+        // 按**行**写（越界判断每行一次、`fill` 一次铺满一行）。重叠计数逐格照旧，
+        // 顺序无所谓（只累加）。1080p 一帧几万个块 × 每块几十格。
+        let r0 = r.max(0) as usize;
+        let c0 = c.max(0) as usize;
+        let r1 = ((r + h).min(self.rows as i32)).max(0) as usize;
+        let c1 = ((c + w).min(self.cols as i32)).max(0) as usize;
+        if r0 >= r1 || c0 >= c1 {
+            return;
+        }
+        for rr in r0..r1 {
+            let lo = rr * self.cols + c0;
+            let hi = rr * self.cols + c1;
+            self.overlaps += self.filled[lo..hi].iter().filter(|b| **b).count();
+            super::block::fill_span(&mut self.sizes[lo..hi], bsize);
+            super::block::fill_span(&mut self.filled[lo..hi], true);
         }
     }
 }

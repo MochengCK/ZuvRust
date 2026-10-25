@@ -70,6 +70,15 @@ pub struct VideoFrame {
     pub nv12: Vec<u8>,
 }
 
+impl Drop for VideoFrame {
+    fn drop(&mut self) {
+        // 紧凑 NV12 是每帧 3 MB 的大缓冲，解码器每条路径都会**写满**它 ⇒
+        // 还给 `video::pool` 复用，省掉下一帧的分配 + 清零（`vec![0u8; n]`）。
+        let v = std::mem::take(&mut self.nv12);
+        crate::video::pool::give_u8(v);
+    }
+}
+
 impl VideoFrame {
     /// 紧凑布局下 NV12 应有的字节数（诊断/校验用）。
     pub fn expected_len(width: u32, height: u32) -> usize {

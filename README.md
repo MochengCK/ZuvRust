@@ -60,7 +60,7 @@ H.264、H.265、AV1、VP9、VP8、AAC、MP3、Opus、FLAC、AC-3、E-AC-3
 | H.264 | **三个平台都走系统硬解**：macOS 用 VideoToolbox、Windows 用 Media Foundation（硬件 MFT + D3D11）、Linux 用 VA-API |
 | Opus / AAC / FLAC / MP3 | **自研软解** |
 
-⚠️ **AV1 软解目前还不是实时性能**：1080p 单线程约 60 ms/帧（约 17 fps），
+⚠️ **AV1 软解目前还不是实时性能**：1080p 单线程约 50~55 ms/帧（约 18~20 fps，随机器温度/负载浮动），
 目标是 33 ms（30 fps）。在 Apple Silicon 上它会自动走硬解，所以那道坎主要影响 Intel 机器。
 具体数据与后续计划见 [DEVELOPMENT.md](DEVELOPMENT.md) 的性能段。
 

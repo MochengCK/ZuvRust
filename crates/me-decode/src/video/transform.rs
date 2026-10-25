@@ -436,6 +436,24 @@ pub fn dequantize(
     let clamp_lo = -(1i64 << (7 + bd));
     let clamp_hi = (1i64 << (7 + bd)) - 1;
 
+    // 平坦布局（`w == tw && h == th`，即边长 ≤ 32）⇒ 8 路 SIMD。
+    if w == tw && h == th && tw * th >= 8 && super::simd::avx2_available() && !flags::no_deq_simd() {
+        // SAFETY: 已判 AVX2；`levels` 有 `tw·th` 项、`t` 至少 `w·h = tw·th` 项。
+        unsafe {
+            super::simd::dequantize_8(
+                levels.as_ptr(),
+                t.as_mut_ptr(),
+                tw * th,
+                q_dc as i32,
+                q_ac as i32,
+                denom_shift,
+                clamp_lo as i32,
+                clamp_hi as i32,
+            )
+        };
+        return Ok(());
+    }
+
     for i in 0..th {
         for j in 0..tw {
             let lv = levels[i * tw + j];
@@ -1047,6 +1065,43 @@ fn kind_code(kind: Transform1d) -> u32 {
 ///
 /// `residual` 由调用方提供（**复用**：逐块 `vec![]` 是这个热路径上最大的一笔浪费，
 /// 缓冲的生命周期应该跟 `BlockCtx` 的瓦片一样长）。长度不足时会重新开。
+/// **只有 DC 的 2-D 反变换的常量值**（DCT_DCT；其余 tx_type 返回 `None`）。
+///
+/// 已用 `dc_only_dct_dct_is_constant_plane` 钉住：DCT_DCT 的 DC-only 反变换
+/// 是**恒定平面**（15 种尺寸 × 5 个 DC 值）。于是只需跑两趟一维标量变换
+/// （行趟取第 0 个输出、列趟再取第 0 个），就能得到整块的值，
+/// 不必做完整的二维变换 + 反量化后的整块蝶形。
+///
+/// 与完整路径**逐位相同**（同一套 `forward_1d` / `round2` / 钳位；
+/// `dc_only_constant_matches_the_full_transform` 逐元素对拍）。
+pub(crate) fn dc_only_constant(dc: i32, tx_sz: u8, tx_type: u8, bit_depth: u8) -> Option<i64> {
+    if row_1d(tx_type) != Transform1d::Dct || col_1d(tx_type) != Transform1d::Dct {
+        return None;
+    }
+    let idx = tx_sz as usize;
+    let w = TX_WIDTH[idx] as usize;
+    let h = TX_HEIGHT[idx] as usize;
+    let log2_w = TX_WIDTH_LOG2[idx] as u32;
+    let log2_h = TX_HEIGHT_LOG2[idx] as u32;
+    let row_shift = TRANSFORM_ROW_SHIFT[idx];
+    let col_shift: u32 = 4;
+    let row_clamp = bit_depth as u32 + 8;
+    let col_clamp = (bit_depth as u32 + 6).max(16);
+    let mut line = [0i64; 64];
+    line[0] = i64::from(dc);
+    if log2_w.abs_diff(log2_h) == 1 {
+        line[0] = round2(line[0] * 2896, 12);
+    }
+    forward_1d(Transform1d::Dct, &mut line[..w], log2_w, row_clamp);
+    let lo = -(1i64 << (col_clamp - 1));
+    let hi = (1i64 << (col_clamp - 1)) - 1;
+    let c1 = round2(line[0], row_shift).clamp(lo, hi);
+    let mut colv = [0i64; 64];
+    colv[0] = c1;
+    forward_1d(Transform1d::Dct, &mut colv[..h], log2_h, col_clamp);
+    Some(round2(colv[0], col_shift))
+}
+
 fn inverse_transform_2d_into(
     t: &[i32],
     tx_sz: u8,
@@ -1061,7 +1116,6 @@ fn inverse_transform_2d_into(
     let h = TX_HEIGHT[idx] as usize;
     let log2_w = TX_WIDTH_LOG2[idx] as u32;
     let log2_h = TX_HEIGHT_LOG2[idx] as u32;
-
     if lossless {
         // §5.11.33：`txSz = Lossless ? TX_4X4 : ...`，逆 WHT 也只在 4 点上定义。
         if w != 4 || h != 4 {
@@ -1142,7 +1196,6 @@ fn inverse_transform_2d_into(
         }
         // 形状不满足（理论上不会发生）⇒ 不猜，落回 i64 路径重算。
     }
-
     // 复用缓冲：**只增不减**（2026-10-05）。
     //
     // 原来写的是 `if residual.len() != w * h { residual.clear(); residual.resize(w * h, 0) }`
@@ -1409,6 +1462,144 @@ pub fn inverse_transform_add(
     Ok(())
 }
 
+
+/// [`inverse_transform_add`] 的**就地版**：预测值直接从帧平面（`dst`）读，
+/// 调用方不必先把预测拷进一个 `pred` 缓冲。
+///
+/// 语义与旧版逐条相同：读的坐标、`Clip1`、翻转映射都一样；每个像素都是
+/// "先读后写同一个地址"，翻转时读写的也是同一个 `(yy, xx)`，块内不会串。
+/// 1080p 一帧几万个变换块，省掉的是"平面→pred"的一次读+写与一次回读。
+#[allow(clippy::too_many_arguments)]
+pub fn inverse_transform_add_in_place(
+    t: &[i32],
+    tx_sz: u8,
+    tx_type: u8,
+    dst: &mut [u16],
+    stride: usize,
+    bit_depth: u8,
+    lossless: bool,
+    residual: &mut Vec<i64>,
+    residual32: &mut Vec<i32>,
+) -> Result<()> {
+    let idx = tx_sz as usize;
+    if idx >= TX_SIZES_ALL {
+        return Err(MediaError::Bitstream(format!(
+            "AV1 反变换：tx_sz = {tx_sz} 越界（TX_SIZES_ALL = {TX_SIZES_ALL}）"
+        )));
+    }
+    if tx_type as usize >= TX_TYPES {
+        return Err(MediaError::Bitstream(format!(
+            "AV1 反变换：tx_type = {tx_type} 越界（TX_TYPES = {TX_TYPES}）"
+        )));
+    }
+    let w = TX_WIDTH[idx] as usize;
+    let h = TX_HEIGHT[idx] as usize;
+    if t.len() < w * h {
+        return Err(MediaError::Bitstream(format!(
+            "AV1 反变换：t 太短（{} < {}）",
+            t.len(),
+            w * h
+        )));
+    }
+    if dst.len() < (h - 1) * stride + w {
+        return Err(MediaError::Bitstream(format!(
+            "AV1 反变换：dst 太短（{} < {}）",
+            dst.len(),
+            (h - 1) * stride + w
+        )));
+    }
+    // 诊断开关："只写预测"在就地路径上等于什么都不做。
+    if flags::no_residual() {
+        return Ok(());
+    }
+    let used32 = inverse_transform_2d_into(
+        t,
+        tx_sz,
+        tx_type,
+        bit_depth,
+        lossless,
+        residual,
+        residual32,
+    )?;
+    let (flip_ud, flip_lr) = flips(tx_type);
+    if used32 {
+        let res = &residual32[..w * h];
+        if !flip_ud && !flip_lr {
+            let max = (1i32 << bit_depth) - 1;
+            let simd = super::simd::avx2_available() && !flags::no_simd_resadd();
+            if simd {
+                for i in 0..h {
+                    // SAFETY: 已判 AVX2；本行 `[0, w)` 可读写、`res` 有 `w·h` 项。
+                    unsafe {
+                        super::simd::add_residual_u16(
+                            dst.as_mut_ptr().add(i * stride),
+                            res.as_ptr().add(i * w),
+                            w,
+                            max,
+                        )
+                    };
+                }
+            } else {
+                for i in 0..h {
+                    let r = &res[i * w..i * w + w];
+                    let d = &mut dst[i * stride..i * stride + w];
+                    for j in 0..w {
+                        d[j] = clip1(d[j] as i32 + r[j], bit_depth);
+                    }
+                }
+            }
+        } else {
+            let max = (1i32 << bit_depth) - 1;
+            let simd = super::simd::avx2_available()
+                && !flags::no_simd_resadd()
+                && !flags::no_flip_resadd();
+            for i in 0..h {
+                let yy = if flip_ud { h - 1 - i } else { i };
+                if simd {
+                    // SAFETY: 已判 AVX2；本行 `(yy, 0..w)` 可读写、`res` 有 `w·h` 项。
+                    unsafe {
+                        let d = dst.as_mut_ptr().add(yy * stride);
+                        let r = res.as_ptr().add(i * w);
+                        if flip_lr {
+                            super::simd::add_residual_u16_rev(d, r, w, max);
+                        } else {
+                            super::simd::add_residual_u16(d, r, w, max);
+                        }
+                    };
+                } else {
+                    for j in 0..w {
+                        let xx = if flip_lr { w - 1 - j } else { j };
+                        let off = yy * stride + xx;
+                        dst[off] = clip1(dst[off] as i32 + res[i * w + j], bit_depth);
+                    }
+                }
+            }
+        }
+        return Ok(());
+    }
+    let residual = &residual[..w * h];
+    if lossless {
+        let limit = 1i64 << bit_depth;
+        if let Some(bad) = residual.iter().find(|v| **v < -limit || **v > limit - 1) {
+            return Err(MediaError::Bitstream(format!(
+                "AV1 无损反变换：残差 {bad} 超出 {}-位有符号范围（tx_sz={tx_sz} tx_type={tx_type} t={:?} residual={:?}）",
+                bit_depth + 1,
+                &t[..t.len().min(16)],
+                &residual[..residual.len().min(16)],
+            )));
+        }
+    }
+    for i in 0..h {
+        let yy = if flip_ud { h - 1 - i } else { i };
+        for j in 0..w {
+            let xx = if flip_lr { w - 1 - j } else { j };
+            let off = yy * stride + xx;
+            dst[off] = clip1(dst[off] as i32 + residual[i * w + j] as i32, bit_depth);
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1439,6 +1630,65 @@ mod tests {
         )
         .unwrap();
         dst.iter().map(|v| *v as i64).collect()
+    }
+
+    #[test]
+    fn dc_only_constant_matches_the_full_transform() {
+        use crate::video::block::{
+            TX_16X16, TX_16X32, TX_16X64, TX_16X8, TX_32X16, TX_32X32, TX_32X64, TX_4X4, TX_4X8,
+            TX_64X16, TX_64X32, TX_64X64, TX_8X16, TX_8X4, TX_8X8,
+        };
+        let sizes = [
+            TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64, TX_4X8, TX_8X4, TX_8X16, TX_16X8,
+            TX_16X32, TX_32X16, TX_32X64, TX_64X32, TX_16X64, TX_64X16,
+        ];
+        for &tx in &sizes {
+            let w = TX_WIDTH[tx as usize] as usize;
+            let h = TX_HEIGHT[tx as usize] as usize;
+            for &dc in &[1i32, -1, 17, 500, -500, 4096, -4096, 32767] {
+                let mut t = vec![0i32; w * h];
+                t[0] = dc;
+                let mut residual = Vec::new();
+                let mut residual32 = Vec::new();
+                let used32 =
+                    inverse_transform_2d_into(&t, tx, DCT_DCT, 8, false, &mut residual, &mut residual32)
+                        .unwrap();
+                let full0 = if used32 { i64::from(residual32[0]) } else { residual[0] };
+                let got = dc_only_constant(dc, tx, DCT_DCT, 8).unwrap();
+                assert_eq!(got, full0, "tx={tx} dc={dc}（快路径 vs 完整路径）");
+                // 整块都等于这个常量
+                for k in 0..w * h {
+                    let v = if used32 { i64::from(residual32[k]) } else { residual[k] };
+                    assert_eq!(v, got, "tx={tx} dc={dc} k={k}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dc_only_dct_dct_is_constant_plane() {
+        // 只有 DC 的 2-D 反变换（DCT_DCT）是不是恒定平面？—— 决定"稀疏反变换"能省多少。
+        use crate::video::block::{
+            TX_16X16, TX_16X32, TX_16X64, TX_16X8, TX_32X16, TX_32X32, TX_32X64, TX_4X4, TX_4X8,
+            TX_64X16, TX_64X32, TX_64X64, TX_8X16, TX_8X4, TX_8X8,
+        };
+        let sizes = [
+            TX_4X4, TX_8X8, TX_16X16, TX_32X32, TX_64X64, TX_4X8, TX_8X4, TX_8X16, TX_16X8,
+            TX_16X32, TX_32X16, TX_32X64, TX_64X32, TX_16X64, TX_64X16,
+        ];
+        for &tx in &sizes {
+            for &dc in &[1i32, 17, 500, -500, 4096] {
+                let r = inv(tx, DCT_DCT, &[(0, dc)]);
+                let first = r[0];
+                for (i, v) in r.iter().enumerate() {
+                    assert_eq!(
+                        *v, first,
+                        "tx={tx} dc={dc} 第 {i} 个像素不等于第 0 个（{} vs {}）",
+                        v, first
+                    );
+                }
+            }
+        }
     }
 
     /// **SIMD 快路径与标量逐位一致**：全 (tx_sz, tx_type) × 3 种位深 × 多组系数
@@ -1499,6 +1749,50 @@ mod tests {
             // 表会掩到 6 位：下标大于 2^num_bits 时结果只看低位
             for x in 0..64usize {
                 assert_eq!(brev(num_bits, x), bitwise(num_bits, x & ((1 << num_bits) - 1)));
+            }
+        }
+    }
+
+    /// **SIMD 反量化必须与标量式逐位相同**（含负系数、DC/AC 不同步长、三种 dqDenom）。
+    #[test]
+    fn dequantize_8_matches_the_scalar_formula() {
+        if !crate::video::simd::avx2_available() {
+            return;
+        }
+        let mut seed = 0xdead_beefu32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            seed
+        };
+        for &(n, q_dc, q_ac, shift, bd) in &[
+            (8usize, 4i32, 4i32, 0u32, 8u8),
+            (16, 2896, 2896, 1, 8),
+            (24, 12000, 2896, 2, 10),
+            (32, 30000, 12000, 0, 12),
+            (40, 7, 3, 1, 12),
+            (64, 1 << 19, (1 << 19) - 1, 2, 12),
+        ] {
+            let levels: Vec<i32> = (0..n)
+                .map(|_| {
+                    let v = (next() % (1 << 21)) as i32 - (1 << 20);
+                    if next() % 4 == 0 { 0 } else { v }
+                })
+                .collect();
+            let lo = -(1i64 << (7 + bd));
+            let hi = (1i64 << (7 + bd)) - 1;
+            let mut got = vec![0i32; n];
+            unsafe {
+                crate::video::simd::dequantize_8(
+                    levels.as_ptr(), got.as_mut_ptr(), n, q_dc, q_ac, shift, lo as i32, hi as i32,
+                );
+            }
+            for i in 0..n {
+                let q = if i == 0 { q_dc } else { q_ac };
+                let dq = levels[i] as i64 * q as i64;
+                let mag = ((dq.abs() & 0xFF_FFFF) >> shift) as i32;
+                let v = if dq < 0 { -mag } else { mag };
+                let want = v.clamp(lo as i32, hi as i32);
+                assert_eq!(got[i], want, "n={n} q=({q_dc},{q_ac}) shift={shift} bd={bd} i={i}");
             }
         }
     }

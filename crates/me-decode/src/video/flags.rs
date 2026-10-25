@@ -127,6 +127,129 @@ bool_flag! {
     /// `ME_NO_CDEF_EDGE=1`（**诊断**）：CDEF 的右/下边界块退回整块标量（旧行为）。
     /// 两条路**逐字节相同**，用于同二进制 A/B 边界 SIMD 的收益。
     no_cdef_edge = "ME_NO_CDEF_EDGE";
+    /// `ME_NO_CDEF_GROUP=1`（**诊断**）：CDEF 退回逐 8×8 块的老路径
+    /// （不按 64×64 组批处理）。两条路**逐字节相同**。
+    no_cdef_group = "ME_NO_CDEF_GROUP";
+    /// `ME_NO_CDEF_DIR_SIMD=1`（**诊断**）：CDEF 方向搜索退回标量累加。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_cdef_dir_simd = "ME_NO_CDEF_DIR_SIMD";
+    /// `ME_NO_TX_INPLACE=1`（**诊断**）：残差写回退回"先拷预测再相加"。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_tx_inplace = "ME_NO_TX_INPLACE";
+    /// `ME_NO_DIRECT_PRED=1`（**诊断**）：整像素单参考预测退回"i32 缓冲 + store"。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_direct_pred = "ME_NO_DIRECT_PRED";
+    /// `ME_NO_ROWCOPY=1`（**诊断**）：直写路径的整行拷贝退回 `copy_from_slice`。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_rowcopy = "ME_NO_ROWCOPY";
+    /// `ME_NO_MV0=1`（**诊断**）：运动场投影的零 MV 快路径退回逐目标帧计算。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_mv0_fast = "ME_NO_MV0";
+    /// `ME_NO_CDEF_SHIFT=1`（**诊断**）：CDEF 左/上边界块退回整块标量。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_cdef_shift = "ME_NO_CDEF_SHIFT";
+    /// `ME_NO_LR_SWAP=1`（**诊断**）：LR 的 RESTORE_NONE 平面退回整块拷贝。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_lr_swap = "ME_NO_LR_SWAP";
+    /// `ME_NO_NV12_POOL=1`（**诊断**）：NV12 输出缓冲不用池、每帧新分配。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_nv12_pool = "ME_NO_NV12_POOL";
+    /// `ME_NO_DECODED_POOL=1`（**诊断**）：`CurrFrame` 的 `decoded` 网格不用池。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_decoded_pool = "ME_NO_DECODED_POOL";
+    /// `ME_CDEF_STATS=1`（**诊断**）：每帧打印 CDEF 的克隆/总耗时与组跳过率。
+    cdef_stats = "ME_CDEF_STATS";
+    /// `ME_MC_STATS=1`（**诊断**）：每帧打印单参考子像素直写平面的块/像素数。
+    mc_stats = "ME_MC_STATS";
+    /// `ME_NO_DIRECT_SUBPEL=1`（**诊断**）：子像素预测退回"i32 暂存 + 拷贝"。
+    /// 两条路**逐字节相同**，用于同二进制 A/B。
+    no_direct_subpel = "ME_NO_DIRECT_SUBPEL";
+    /// `ME_NO_DIRECT_COMP_AVG=1`（**诊断**）：复合 AVERAGE 的双整像素直写退回
+    /// "两路 MC + 混合"。两条路**逐字节相同**。
+    no_direct_comp_avg = "ME_NO_DIRECT_COMP_AVG";
+    /// `ME_NO_MF_TABLE=1`（**诊断**）：运动场存储退回逐格 `get_relative_dist`。
+    /// 两条路**逐字节相同**。
+    no_mf_table = "ME_NO_MF_TABLE";
+    /// `ME_NO_FAST_FILL=1`（**诊断**）：`BlockGrid::stamp` 的短行写退回 `slice::fill`。
+    /// 两条路**逐字节相同**。
+    no_fast_fill = "ME_NO_FAST_FILL";
+    /// `ME_NO_RECT_COPY=1`（**诊断**）：整像素预测的整块矩形拷贝退回逐行 `copy_row_u16`。
+    /// 两条路**逐字节相同**。
+    no_rect_copy = "ME_NO_RECT_COPY";
+    /// `ME_NO_INTRA_SMOOTH_SIMD=1`（**诊断**）：帧内 smooth 预测退回逐像素标量。
+    /// 两条路**逐字节相同**。
+    no_intra_smooth_simd = "ME_NO_INTRA_SMOOTH_SIMD";
+    /// `ME_NO_LR_NONE_COPY=1`（**诊断**）：LR 的 `RESTORE_NONE` 档退回 i32 行缓冲 + `set_row`。
+    /// 两条路**逐字节相同**。
+    no_lr_none_copy = "ME_NO_LR_NONE_COPY";
+    /// `ME_NO_DC_ONLY=1`（**诊断**）：DC-only 的反变换快路径退回完整二维变换。
+    /// 两条路**逐字节相同**。
+    no_dc_only = "ME_NO_DC_ONLY";
+    /// `ME_NO_SGR_GATHER=1`（**诊断**）：SGR 的 `a2` 查表退回逐通道标量。
+    /// 两条路**逐字节相同**。
+    no_sgr_gather = "ME_NO_SGR_GATHER";
+    /// `ME_NO_SGR_PROJ=1`（**诊断**）：SGR 收尾投影退回逐像素标量。
+    /// 两条路**逐字节相同**。
+    no_sgr_proj = "ME_NO_SGR_PROJ";
+    /// `ME_NO_SGR_FINAL_PAT=1`（**诊断**）：SGR 末段 3×3 退回按权重表逐项 `mullo`。
+    /// 两条路**逐字节相同**。
+    no_sgr_final_pat = "ME_NO_SGR_FINAL_PAT";
+    /// `ME_LR_STATS=1`（**诊断**）：打印 SGR 三段（box0 / box1 / 收尾）的累计耗时。
+    lr_stats = "ME_LR_STATS";
+    /// `ME_EOB_STATS=1`（**诊断**）：每帧打印 `eob` 分布（块数 / 像素数）。
+    eob_stats = "ME_EOB_STATS";
+    /// `ME_NO_CDEF_4ROW=1`（**诊断**）：CDEF 亮度滤波退回"两行一组"的 `cdef_pair16`。
+    /// 两条路**逐字节相同**（有位对拍单测）。
+    no_cdef_4row = "ME_NO_CDEF_4ROW";
+    /// `ME_NO_CDEF_DIR2=1`（**诊断**）：CDEF 方向搜索退回逐块（不用两块并行的 YMM 版）。
+    /// 两条路**逐字节相同**。
+    no_cdef_dir2 = "ME_NO_CDEF_DIR2";
+    /// `ME_NO_CDEF_CAND_CACHE=1`（**诊断**）：CDEF 候选偏移/抽头不跨块缓存。
+    /// 两条路**逐字节相同**。
+    no_cdef_cand_cache = "ME_NO_CDEF_CAND_CACHE";
+    /// `ME_NO_STAMP_SKIP=1`（**诊断**）：`stamp` 不再跳过"等于帧初值"的数组写。
+    /// 两条路**逐字节相同** —— 被跳过的数组都由 `reset_all` 的 `fill_set` 铺过初值，
+    /// 且每个 4×4 格在本帧只属于一个叶子块（不会留着别的块写过的值）。
+    no_stamp_skip = "ME_NO_STAMP_SKIP";
+    /// `ME_NO_MARK_ROWS=1`（**诊断**）：`mark_decoded` 退回逐格写。
+    /// 两条路**逐字节相同**。
+    no_mark_rows = "ME_NO_MARK_ROWS";
+    /// `ME_NO_INTRA_ROWCOPY=1`（**诊断**）：帧内预测写回退回逐像素 `Plane::set`。
+    /// 两条路**逐字节相同**。
+    no_intra_rowcopy = "ME_NO_INTRA_ROWCOPY";
+    /// `ME_NO_INTRA_POOL=1`（**诊断**）：帧内边/预测缓冲退回每次新分配。
+    /// 两条路**逐字节相同**。
+    no_intra_pool = "ME_NO_INTRA_POOL";
+    /// `ME_NO_PART_FILL=1`（**诊断**）：分区网格铺块退回逐 4×4 格写。
+    /// 两条路**逐字节相同**。
+    no_part_fill = "ME_NO_PART_FILL";
+    /// `ME_NO_LAZY_FT=1`（**诊断**）：帧间块的边滤波类型恢复无条件计算。
+    /// 两条路**逐字节相同**。
+    no_lazy_ft = "ME_NO_LAZY_FT";
+    /// `ME_NO_SIMD_RESADD=1`（**诊断**）：残差加回退回逐像素标量。
+    /// 两条路**逐字节相同**。
+    no_simd_resadd = "ME_NO_SIMD_RESADD";
+    /// `ME_NO_CDEF_DIRGATE=1`（**诊断**）：CDEF 方向搜索恢复无条件计算。
+    /// 两条路**逐字节相同**。
+    no_cdef_dirgate = "ME_NO_CDEF_DIRGATE";
+    /// `ME_NO_WIDE_DEBLOCK=1`（**诊断**）：横边不合并成 8 路，退回逐 4 像素。
+    /// 两条路**逐字节相同**。
+    no_wide_deblock = "ME_NO_WIDE_DEBLOCK";
+    /// `ME_NO_CDEF_DIRTAB=1`（**诊断**）：CDEF 候选方向表退回逐块现算。
+    /// 两条路**逐字节相同**。
+    no_cdef_dirtab = "ME_NO_CDEF_DIRTAB";
+    /// `ME_NO_FLIP_RESADD=1`（**诊断**）：翻转残差加回退回逐像素标量。
+    /// 两条路**逐字节相同**。
+    no_flip_resadd = "ME_NO_FLIP_RESADD";
+    /// `ME_NO_DEQ_SIMD=1`（**诊断**）：反量化退回逐系数标量。
+    /// 两条路**逐字节相同**。
+    no_deq_simd = "ME_NO_DEQ_SIMD";
+    /// `ME_NO_HORIZ_EDGE_SIMD=1`（**诊断**）：MC 横向的边界块退回逐样本钳位标量。
+    /// 两条路**逐字节相同**。
+    no_horiz_edge_simd = "ME_NO_HORIZ_EDGE_SIMD";
+    /// `ME_NO_CDEF_VISIBLE_CLONE=1`（**诊断**）：CDEF 的整帧克隆也拷帧外 padding。
+    /// 两条路**逐字节相同**（padding 不进输出，`ME_PAD_POISON` 验过）。
+    no_cdef_visible_clone = "ME_NO_CDEF_VISIBLE_CLONE";
 }
 
 // ── 轨迹开关（打日志；逐块/逐变换块级别的判定必须走本层）──

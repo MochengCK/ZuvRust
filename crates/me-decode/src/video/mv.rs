@@ -20,6 +20,7 @@
 //! 时，在 `tile_info()` **之前**）—— 它用的是**参考帧**的运动矢量，不是本帧的。
 //! 顺序错了不会报错，只会让 temporal scan 的候选莫名其妙。
 
+use super::flags;
 use super::block::{
     block_height, block_width, has_newmv, BLOCK_SIZES, NUM_4X4_BLOCKS_HIGH, NUM_4X4_BLOCKS_WIDE,
 };
@@ -495,6 +496,28 @@ fn project_frame(
                 continue;
             }
             let mv = slot.mvs[row * slot.mi_cols + col];
+            // **零 MV 快路径**：`project_k(0, k) = 0` 对任何 `k` 都成立 ⇒ 7 个
+            // 目标帧的投影全是 `(0,0)`、落点也全一样。静止内容里这种格子很多，
+            // 省掉 16 次 i64 乘法与 8 次取整/钳位。
+            if mv[0] == 0 && mv[1] == 0 && !flags::no_mv0_fast() {
+                let Some((py, px)) = block_position(
+                    x8 as i32,
+                    y8 as i32,
+                    dst_sign,
+                    [0, 0],
+                    fh.mi_rows as i32,
+                    fh.mi_cols as i32,
+                ) else {
+                    continue;
+                };
+                let (py, px) = (py as usize, px as usize);
+                if py >= h8 || px >= w8 {
+                    continue;
+                }
+                let base = (py * w8 + px) * MF_SRC_SLOTS;
+                field.mvs[base..base + MF_SRC_SLOTS].fill([0, 0]);
+                continue;
+            }
             let proj_mv = project_k(mv, k_cur[sr]);
             let Some((pos_y8, pos_x8)) = block_position(
                 x8 as i32,
@@ -534,24 +557,73 @@ pub fn motion_field_storage(
 ) -> (Vec<i8>, Vec<Mv>) {
     let rows = fh.mi_rows as usize;
     let cols = fh.mi_cols as usize;
-    let mut ref_frames = vec![NONE; rows * cols];
-    let mut mvs = vec![[0i32; 2]; rows * cols];
+    motion_field_storage_into(
+        grid,
+        fh,
+        seq,
+        store,
+        vec![NONE; rows * cols],
+        vec![[0i32; 2]; rows * cols],
+    )
+}
+
+/// 同 [`motion_field_storage`]，但**由调用方给缓冲**（跨帧复用容量：1080p 一帧
+/// 1.5 MB 的 `vec![]` 是"新页 + 首次写入缺页"，而槽里的旧内容在本帧解码结束后
+/// 已经死了 ⇒ 直接拿它当落点）。
+pub fn motion_field_storage_into(
+    grid: &super::block::BlockGrid,
+    fh: &FrameHeader,
+    seq: &SequenceHeader,
+    store: &RefFrameStore,
+    mut ref_frames: Vec<i8>,
+    mut mvs: Vec<Mv>,
+) -> (Vec<i8>, Vec<Mv>) {
+    let rows = fh.mi_rows as usize;
+    let cols = fh.mi_cols as usize;
+    ref_frames.clear();
+    ref_frames.resize(rows * cols, NONE);
+    mvs.clear();
+    mvs.resize(rows * cols, [0, 0]);
     let hints = fh.order_hints;
+    // "这个参考帧是否在过去"只跟**参考帧类型**（LAST..ALTREF 七种）有关 ——
+    // 原来每格每列表都重算一次 `get_relative_dist`（1080p 一帧 6.5 万次）。
+    // 先做成 8 项表，格子里只剩一次查表。（`r` 即参考帧类型，`usable` 直接按它索引。）
+    let mut usable = [false; NUM_REF_FRAMES];
+    for rf in LAST_FRAME..=ALTREF_FRAME {
+        let ref_idx =
+            (fh.ref_frame_idx[(rf - LAST_FRAME) as usize] as usize).min(NUM_REF_FRAMES - 1);
+        usable[rf as usize] =
+            get_relative_dist(seq, store.order_hint[ref_idx], fh.order_hint) < 0;
+    }
+    // 按**行切片**走（2026-10-24）：原来每格每列表都要 `row*cols+col` 的乘法 +
+    // 4 次 `Vec` 越界判断（1080p 一帧 13 万格 × 2 列表）。
+    let names = &grid.ref_frames;
+    let all_mvs = &grid.mvs;
     for row in 0..rows {
+        let base = row * cols;
+        let rf = &names[base..base + cols];
+        let mvs_in = &all_mvs[base..base + cols];
+        let out_rf = &mut ref_frames[base..base + cols];
+        let out_mv = &mut mvs[base..base + cols];
         for col in 0..cols {
-            let i = row * cols + col;
             for list in 0..2 {
-                let r = grid.ref_frames[i][list];
-                if r > INTRA_FRAME {
-                    let ref_idx =
-                        (fh.ref_frame_idx[(r - LAST_FRAME) as usize] as usize).min(NUM_REF_FRAMES - 1);
-                    let dist = get_relative_dist(seq, store.order_hint[ref_idx], fh.order_hint);
-                    if dist < 0 {
-                        let mv = grid.mvs[i][list];
-                        if mv[0].abs() <= REFMVS_LIMIT && mv[1].abs() <= REFMVS_LIMIT {
-                            ref_frames[i] = r;
-                            mvs[i] = mv;
-                        }
+                let r = rf[col][list];
+                let ok = if flags::no_mf_table() {
+                    if r > INTRA_FRAME {
+                        let ref_idx = (fh.ref_frame_idx[(r - LAST_FRAME) as usize] as usize)
+                            .min(NUM_REF_FRAMES - 1);
+                        get_relative_dist(seq, store.order_hint[ref_idx], fh.order_hint) < 0
+                    } else {
+                        false
+                    }
+                } else {
+                    r > INTRA_FRAME && usable[r as usize]
+                };
+                if ok {
+                    let mv = mvs_in[col][list];
+                    if mv[0].abs() <= REFMVS_LIMIT && mv[1].abs() <= REFMVS_LIMIT {
+                        out_rf[col] = r;
+                        out_mv[col] = mv;
                     }
                 }
             }

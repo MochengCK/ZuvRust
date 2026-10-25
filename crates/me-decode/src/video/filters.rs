@@ -42,6 +42,8 @@ pub fn decode_frame_wrapup(
     if let Some(d) = &dump_dir {
         super::lr::lr_dump(&frame, d, "predb", dump_n);
     }
+    let phase_t = flags::phase_timing();
+    let t_lf = std::time::Instant::now();
     // §7.14 去块（原地修改 CurrFrame）
     let lf = &fh.params.loop_filter;
     if (lf.level[0] != 0 || lf.level[1] != 0) && !flags::no_deblock() {
@@ -50,8 +52,11 @@ pub fn decode_frame_wrapup(
     if let Some(d) = &dump_dir {
         super::lr::lr_dump(&frame, d, "deb", dump_n);
     }
+    let lf_ms = t_lf.elapsed().as_secs_f64() * 1e3;
+    let t_cdef = std::time::Instant::now();
     // §7.15 CDEF（不改 CurrFrame；产出 CdefFrame）
     let cdef = super::cdef::apply(&frame, fh, seq, grid)?;
+    let cdef_ms = t_cdef.elapsed().as_secs_f64() * 1e3;
     // §7.16 上采样（超分）。**没开超分时它按规范就是恒等变换**
     // （`UpscaledWidth == FrameWidth`）—— 那就把两份帧**直接搬过去**，
     // 省掉两次整帧拷贝（1080p 一帧 3 个平面 ≈ 6 MB，两份就是 12 MB，
@@ -70,5 +75,16 @@ pub fn decode_frame_wrapup(
     // §7.17 环路恢复（参数来自块级语法读出的 `LrType` / `LrWiener` / `LrSgrXqd`）。
     // 按值传进去：不用超分时这里就是**零拷贝移动**，`lr::apply` 内部
     // "不滤波"那一档直接把 `CdefFrame` 当输出（见那边的注释）。
-    super::lr::apply(up_curr, up_cdef, fh, seq, lr)
+    let t_lr = std::time::Instant::now();
+    let out = super::lr::apply(up_curr, up_cdef, fh, seq, lr)?;
+    if phase_t {
+        eprintln!(
+            "FILTER frame={} lf={:.1}ms cdef={:.1}ms lr={:.1}ms",
+            dump_n,
+            lf_ms,
+            cdef_ms,
+            t_lr.elapsed().as_secs_f64() * 1e3
+        );
+    }
+    Ok(out)
 }

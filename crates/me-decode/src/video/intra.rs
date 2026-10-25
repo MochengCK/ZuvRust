@@ -299,6 +299,26 @@ impl Plane {
         }
     }
 
+    /// 只拷**可见行**的克隆（见 [`CurrFrame::clone_visible`]）。
+    pub fn clone_visible(&self) -> Self {
+        let keep = self.stride * self.h;
+        let data = match &self.data {
+            PxBuf::U8(src) => {
+                let n = src.len();
+                let mut v = super::pool::take_u8(n).unwrap_or_else(|| vec![0u8; n]);
+                v[..keep].copy_from_slice(&src[..keep]);
+                PxBuf::U8(v)
+            }
+            PxBuf::U16(src) => {
+                let n = src.len();
+                let mut v = super::pool::take(n).unwrap_or_else(|| vec![0u16; n]);
+                v[..keep].copy_from_slice(&src[..keep]);
+                PxBuf::U16(v)
+            }
+        };
+        Self { data, stride: self.stride, w: self.w, h: self.h, bit_depth: self.bit_depth }
+    }
+
     /// 是不是 u8 存储（8bit 帧恒为真）。
     #[inline]
     pub fn is_u8(&self) -> bool {
@@ -476,6 +496,48 @@ const EDGE_OFF: usize = 2;
 /// `predict_intra( plane, x, y, haveLeft, haveAbove, haveAboveRight, haveBelowLeft, mode, log2W, log2H )`
 /// （规范 §7.11.2.1）。
 pub fn predict_intra(plane: &mut Plane, b: &IntraBlock) -> Result<()> {
+    // 三个边/预测缓冲**按线程复用**：原来每个帧内块 `vec![0; …]` 三次
+    // （malloc + 清零 + free），1080p 一帧上万个帧内块。复用后只保留容量，
+    // 内容仍按原来的范围清零（不改变语义：任何"没写到的位置读 0"）。
+    if flags::no_intra_pool() {
+        let (mut above, mut left, mut pred) = (Vec::new(), Vec::new(), Vec::new());
+        return predict_intra_buf(plane, b, &mut above, &mut left, &mut pred);
+    }
+    INTRA_SCRATCH.with(|cell| {
+        let mut s = cell.borrow_mut();
+        let s = &mut *s;
+        predict_intra_buf(plane, b, &mut s.above, &mut s.left, &mut s.pred)
+    })
+}
+
+/// 复用缓冲（线程局部）。`RefCell` 只在**每块一次**的入口借用，不在像素循环里。
+#[derive(Default)]
+struct IntraScratch {
+    above: Vec<i32>,
+    left: Vec<i32>,
+    pred: Vec<u16>,
+}
+
+thread_local! {
+    // ⚠️ **必须是 `const` 初始化器**：非 const 的 `thread_local!` 每次访问都要走
+    // 惰性注册（`__tls_get_addr` + 初始化检查），逐块调用时就是实打实的开销
+    // （debuginfo 采样里这一行占 0.9%）。`pool.rs` 里的两个 TLS 池一直是 const 的。
+    static INTRA_SCRATCH: std::cell::RefCell<IntraScratch> = const {
+        std::cell::RefCell::new(IntraScratch {
+            above: Vec::new(),
+            left: Vec::new(),
+            pred: Vec::new(),
+        })
+    };
+}
+
+fn predict_intra_buf(
+    plane: &mut Plane,
+    b: &IntraBlock,
+    above_buf: &mut Vec<i32>,
+    left_buf: &mut Vec<i32>,
+    pred_buf: &mut Vec<u16>,
+) -> Result<()> {
     let (w, h) = (b.w, b.h);
     if w == 0 || h == 0 || !w.is_power_of_two() || !h.is_power_of_two() {
         return Err(MediaError::Bitstream(format!(
@@ -517,23 +579,40 @@ pub fn predict_intra(plane: &mut Plane, b: &IntraBlock) -> Result<()> {
     // 边数组：`AboveRow[i]` 存 `above[i + EDGE_OFF]`。上采样会把索引推到
     // `2*numPx-2`（numPx ≤ w+h），所以按 2*(w+h) 开。
     let span = 2 * (w + h) + 8;
-    let mut above = vec![0i32; span + EDGE_OFF];
-    let mut left = vec![0i32; span + EDGE_OFF];
-    derive_edges(plane, None, b, &mut above, &mut left);
+    let need = span + EDGE_OFF;
+    if above_buf.len() < need {
+        above_buf.resize(need, 0);
+    }
+    if left_buf.len() < need {
+        left_buf.resize(need, 0);
+    }
+    above_buf[..need].fill(0);
+    left_buf[..need].fill(0);
+    let above = above_buf;
+    let left = left_buf;
+    derive_edges(plane, None, b, above.as_mut_slice(), left.as_mut_slice());
 
-    let mut pred = vec![0u16; w * h];
+    let n = w * h;
+    if pred_buf.len() < n {
+        pred_buf.resize(n, 0);
+    }
+    // 2026-10-24：**不再整块清零**。所有预测器都会写满 `w×h`（`dc` 是 `fill`、
+    // `smooth`/`basic`/`directional` 的双重循环、`recursive_intra` 按 4×2 铺满），
+    // 而且 `recursive_intra` 只读**同块内更早写过**的邻居 ⇒ 缓冲里的旧值不可见。
+    // 原来 32×32 的块每次要白写 4 KB。
+    let pred = &mut pred_buf[..n];
 
     if b.plane == 0 && b.use_filter_intra {
         // §7.11.2.3 递归帧内预测（filter intra）
-        recursive_intra(&above, &left, b.filter_intra_mode, w, h, b.bit_depth, &mut pred)?;
+        recursive_intra(above.as_slice(), left.as_slice(), b.filter_intra_mode, w, h, b.bit_depth, pred)?;
     } else if is_directional_mode(b.mode) {
-        directional(&mut above, &mut left, b, w, h, &mut pred);
+        directional(above.as_mut_slice(), left.as_mut_slice(), b, w, h, pred);
     } else if is_smooth_mode(b.mode) {
-        smooth(&above, &left, b.mode, w, h, &mut pred);
+        smooth(above.as_slice(), left.as_slice(), b.mode, w, h, pred);
     } else if b.mode == DC_PRED {
-        dc(&above, &left, b.have_left, b.have_above, w, h, b.bit_depth, &mut pred);
+        dc(above.as_slice(), left.as_slice(), b.have_left, b.have_above, w, h, b.bit_depth, pred);
     } else if b.mode == PAETH_PRED {
-        basic(&above, &left, w, h, &mut pred);
+        basic(above.as_slice(), left.as_slice(), w, h, pred);
     } else {
         return Err(MediaError::Bitstream(format!(
             "AV1 帧内预测不认识模式 {}（0..12 之外；色度 CFL=13 要在调用方换成 DC_PRED）",
@@ -546,9 +625,23 @@ pub fn predict_intra(plane: &mut Plane, b: &IntraBlock) -> Result<()> {
     // 自身的范围，规范原文不钳帧）把帧外的**重建亮度**累加进 `lumaAvg` —— 参考
     // 解码器（dav1d / libaom）都真的重建了那块像素。裁掉之后帧底色度块的
     // `lumaAvg` 会偏、把整个色度块（含可见行）拉偏 ±1（2026-10-03 定位）。
-    for y in b.y..b.y + h {
-        for x in b.x..b.x + w {
-            plane.set(x, y, pred[(y - b.y) * w + (x - b.x)]);
+    // 写回：u16 平面按**行**整段拷贝 —— 逐像素 `Plane::set` 每像素要一次
+    // `y*stride + x` 乘法 + 枚举分派（1080p 一帧几百万次）。
+    // u8 存储（`ME_PLANE_U8`）保持逐像素：`set` 里还有 `min(255)` 的语义。
+    if !plane.is_u8() && !flags::no_intra_rowcopy() {
+        let stride = plane.stride;
+        let dst = plane.px16_mut();
+        for yy in 0..h {
+            let off = (b.y + yy) * stride + b.x;
+            // 短行（4/8/16/32 样本）走内联定长拷贝：`copy_from_slice` 对运行期长度
+            // 会退化成 `memmove` 调用，而帧内块的写回是**每个变换块每一行**一次。
+            super::inter::copy_row_u16(&mut dst[off..off + w], &pred[yy * w..(yy + 1) * w]);
+        }
+    } else {
+        for y in b.y..b.y + h {
+            for x in b.x..b.x + w {
+                plane.set(x, y, pred[(y - b.y) * w + (x - b.x)]);
+            }
         }
     }
     Ok(())
@@ -789,6 +882,56 @@ fn dc(
 fn smooth(above: &[i32], left: &[i32], mode: u8, w: usize, h: usize, pred: &mut [u16]) {
     let wx = sm_weights(w);
     let wy = sm_weights(h);
+    let shift = if mode == SMOOTH_PRED { 9 } else { 8 };
+    // 2026-10-24：**8 像素一行一次算完**（`simd::intra_smooth_row`）。原来每像素
+    // 4 次乘加 + 4 次带偏移的数组取址；`smooth` 在真素材采样里占 1.6%。
+    if w >= 8 && super::simd::avx2_available() && !flags::no_intra_smooth_simd() {
+        let a_ptr = above[EDGE_OFF..].as_ptr();
+        let a_last = above[EDGE_OFF + w - 1];
+        let l_last = left[EDGE_OFF + h - 1];
+        let m = match mode {
+            SMOOTH_PRED => 0u32,
+            SMOOTH_V_PRED => 1,
+            _ => 2,
+        };
+        for i in 0..h {
+            let mut j = 0usize;
+            while j + 8 <= w {
+                // SAFETY: 已判 AVX2；`j + 8 <= w` ⇒ 读 `above[EDGE_OFF+j .. +8]`、
+                // `wx[j..j+8]` 都在界内；写 `pred[i*w+j .. +8]` 在行内。
+                unsafe {
+                    super::simd::intra_smooth_row(
+                        a_ptr.add(j),
+                        wx.as_ptr().add(j),
+                        wy[i],
+                        left[EDGE_OFF + i],
+                        a_last,
+                        l_last,
+                        m,
+                        shift,
+                        pred.as_mut_ptr().add(i * w + j),
+                    );
+                }
+                j += 8;
+            }
+            let start = j;
+            for (k, slot) in pred[i * w + start..i * w + w].iter_mut().enumerate() {
+                let jj = start + k;
+                let v = match m {
+                    1 => wy[i] * a(above, jj as i64) + (256 - wy[i]) * l_last,
+                    2 => wx[jj] * l(left, i as i64) + (256 - wx[jj]) * a_last,
+                    _ => {
+                        wy[i] * a(above, jj as i64)
+                            + (256 - wy[i]) * l_last
+                            + wx[jj] * l(left, i as i64)
+                            + (256 - wx[jj]) * a_last
+                    }
+                };
+                *slot = ((v + (1 << (shift - 1))) >> shift).clamp(0, 65535) as u16;
+            }
+        }
+        return;
+    }
     for i in 0..h {
         for j in 0..w {
             let v = match mode {
@@ -801,7 +944,6 @@ fn smooth(above: &[i32], left: &[i32], mode: u8, w: usize, h: usize, pred: &mut 
                 SMOOTH_V_PRED => wy[i] * a(above, j as i64) + (256 - wy[i]) * l(left, h as i64 - 1),
                 _ => wx[j] * l(left, i as i64) + (256 - wx[j]) * a(above, w as i64 - 1),
             };
-            let shift = if mode == SMOOTH_PRED { 9 } else { 8 };
             pred[i * w + j] = ((v + (1 << (shift - 1))) >> shift).clamp(0, 65535) as u16;
         }
     }
@@ -936,17 +1078,19 @@ fn directional(above: &mut [i32], left: &mut [i32], b: &IntraBlock, w: usize, h:
             }
         }
     } else if p_angle == 90 {
+        // 每一行都等于 `AboveRow[0..w]`：转成 u16 一次、按行整段拷
+        // （V_PRED 是最常见的角度模式之一，原来是每像素一次取址 + 窄化）。
+        let mut tmp = [0u16; 64];
+        for (j, slot) in tmp[..w].iter_mut().enumerate() {
+            *slot = a(above, j as i64) as u16;
+        }
         for i in 0..h {
-            for j in 0..w {
-                pred[i * w + j] = a(above, j as i64) as u16;
-            }
+            pred[i * w..i * w + w].copy_from_slice(&tmp[..w]);
         }
     } else {
-        // p_angle == 180
+        // p_angle == 180：每行是一个常数
         for i in 0..h {
-            for j in 0..w {
-                pred[i * w + j] = l(left, i as i64) as u16;
-            }
+            pred[i * w..i * w + w].fill(l(left, i as i64) as u16);
         }
     }
 }
@@ -1142,7 +1286,7 @@ fn recursive_intra(
 /// 一个 4×4 位置为 1 ⟺ 它**已经被本瓦片重建过**。
 /// 「上边一行/左边一列」在栅格序下天然就是已重建的，「右上方还在下一个超块里」
 /// 则天然是 0 —— 与规范那圈边框的初始化结果一致。
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct CurrFrame {
     pub planes: Vec<Plane>,
     /// 每个平面的 4×4 已重建标记（按**平面**分辨率）
@@ -1151,6 +1295,73 @@ pub struct CurrFrame {
     pub sub_x: bool,
     pub sub_y: bool,
     pub num_planes: usize,
+}
+
+impl Clone for CurrFrame {
+    fn clone(&self) -> Self {
+        let decoded = self
+            .decoded
+            .iter()
+            .map(|src| {
+                let mut v = if flags::no_decoded_pool() {
+                    vec![0u8; src.len()]
+                } else {
+                    super::pool::take_u8(src.len()).unwrap_or_else(|| vec![0u8; src.len()])
+                };
+                v.copy_from_slice(src);
+                v
+            })
+            .collect();
+        Self {
+            planes: self.planes.clone(),
+            decoded,
+            decoded_cols: self.decoded_cols.clone(),
+            sub_x: self.sub_x,
+            sub_y: self.sub_y,
+            num_planes: self.num_planes,
+        }
+    }
+}
+
+impl CurrFrame {
+    /// CDEF 用的克隆：只拷**可见行**（`stride * h`），帧外 padding 留池里的旧内容。
+    ///
+    /// 规范里 `CdefFrame = CurrFrame` 的拷贝，但 padding 从不进输出
+    /// （`ME_PAD_POISON` 把 padding 填 0xAA 后输出逐字节相同）⇒ 底部那
+    /// `PLANE_PAD` 行白拷了（1080p：亮度 6.25%、色度 11.8% 的拷贝量）。
+    pub fn clone_visible(&self) -> Self {
+        let planes = self.planes.iter().map(|p| p.clone_visible()).collect();
+        let decoded = self
+            .decoded
+            .iter()
+            .map(|src| {
+                let mut v = if flags::no_decoded_pool() {
+                    vec![0u8; src.len()]
+                } else {
+                    super::pool::take_u8(src.len()).unwrap_or_else(|| vec![0u8; src.len()])
+                };
+                v.copy_from_slice(src);
+                v
+            })
+            .collect();
+        Self {
+            planes,
+            decoded,
+            decoded_cols: self.decoded_cols.clone(),
+            sub_x: self.sub_x,
+            sub_y: self.sub_y,
+            num_planes: self.num_planes,
+        }
+    }
+}
+
+impl Drop for CurrFrame {
+    fn drop(&mut self) {
+        for v in &mut self.decoded {
+            let b = std::mem::take(v);
+            super::pool::give_u8(b);
+        }
+    }
 }
 
 impl CurrFrame {
@@ -1177,7 +1388,15 @@ impl CurrFrame {
             planes.push(Plane::new(pw, ph, bit_depth));
             let cols = pw.div_ceil(4);
             decoded_cols.push(cols);
-            decoded.push(vec![0u8; cols * ph.div_ceil(4)]);
+            let n = cols * ph.div_ceil(4);
+            // 池化：缓冲要重新清零（0 = 还没重建），但省掉每帧的分配/缺页。
+            let mut buf = if flags::no_decoded_pool() {
+                vec![0u8; n]
+            } else {
+                super::pool::take_u8(n).unwrap_or_else(|| vec![0u8; n])
+            };
+            buf.fill(0);
+            decoded.push(buf);
         }
         Self {
             planes,
@@ -1237,17 +1456,31 @@ impl CurrFrame {
     pub fn mark_decoded(&mut self, plane: u8, r: i64, c: i64, w4: i32, h4: i32) {
         let p = plane as usize;
         let cols = self.decoded_cols[p];
-        for i in 0..h4 {
-            for j in 0..w4 {
-                let (rr, cc) = (r + i as i64, c + j as i64);
-                if rr < 0 || cc < 0 {
-                    continue;
+        if cols == 0 {
+            return;
+        }
+        let cells = self.decoded[p].len();
+        let rows = cells / cols;
+        let r0 = r.max(0) as usize;
+        let c0 = c.max(0) as usize;
+        let r1 = ((r + i64::from(h4)).max(0) as usize).min(rows);
+        let c1 = ((c + i64::from(w4)).max(0) as usize).min(cols);
+        if r0 >= r1 || c0 >= c1 {
+            return;
+        }
+        // 2026-10-24：**按行填**而不是逐格「带两次边界判断的写」。
+        // 采样里 `mark_decoded` 占 1.3%（每个变换块 × 最多 3 个平面 × 每格 2 次比较）。
+        // 行区间先夹到网格内 ⇒ 内层是一次 `fill(1)`（长度 ≤ 16，LLVM 直接展开）。
+        let grid = &mut self.decoded[p];
+        if flags::no_mark_rows() {
+            for i in r0..r1 {
+                for j in c0..c1 {
+                    grid[i * cols + j] = 1;
                 }
-                let (rr, cc) = (rr as usize, cc as usize);
-                if cc >= cols || rr * cols + cc >= self.decoded[p].len() {
-                    continue;
-                }
-                self.decoded[p][rr * cols + cc] = 1;
+            }
+        } else {
+            for i in r0..r1 {
+                grid[i * cols + c0..i * cols + c1].fill(1);
             }
         }
     }
