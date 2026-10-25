@@ -480,6 +480,24 @@ pub fn dequantize(
     Ok(())
 }
 
+/// **只反量化 DC 一个系数**（与 [`dequantize`] 的 `i == 0 && j == 0` 分支逐位相同）。
+///
+/// DC-only 的变换块（真素材 60%）最终走"恒定平面"快路径，只用到 `t[0]`；
+/// 先把 DC 算出来试一下，命中就**整格反量化与 `t` 的写满都省掉**。
+pub fn dequantize_dc(level: i32, tx_sz: u8, plane: u8, quant: &Quant) -> i32 {
+    let q = quant.dc[plane as usize] as i64;
+    let d = dq_denom(tx_sz);
+    debug_assert!(d > 0 && d & (d - 1) == 0, "dqDenom 只允许 2 的幂");
+    let shift = d.trailing_zeros();
+    let bd = quant.bit_depth;
+    let lo = -(1i64 << (7 + bd));
+    let hi = (1i64 << (7 + bd)) - 1;
+    let dq = level as i64 * q;
+    let mag = (dq.abs() & 0xFF_FFFF) >> shift;
+    let dq2 = if dq < 0 { -mag } else { mag };
+    dq2.clamp(lo, hi) as i32
+}
+
 /// `Clip1( x )`（§7.13 用，等同于 §3 的 `Clip3( 0, ( 1 << BitDepth ) - 1, x )`）。
 #[inline]
 pub fn clip1(x: i32, bit_depth: u8) -> u16 {

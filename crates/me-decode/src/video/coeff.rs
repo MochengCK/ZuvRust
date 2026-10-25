@@ -1343,8 +1343,6 @@ impl ResidualCtx<'_> {
             bit_depth: self.cfg.quant_bit_depth,
         };
         let t = scratch_len(t, w * h);
-        super::transform::dequantize(src_levels, tx_sz, plane, &quant, self.cfg.lossless, t)?;
-
         let lossless = self.cfg.lossless;
         let frame = self.frame.as_mut().expect("调用前已判过 Some");
         let (stride, bit_depth, plane_is_u8) = {
@@ -1356,6 +1354,48 @@ impl ResidualCtx<'_> {
         // 诊断（要打印 pred）与 u8 存储仍走旧的"先拷后加"路径。
         let want_pred =
             flags::trace_tx1() && start_y < 6 && start_x < 6 && plane == 0;
+
+        // ── DC-only：**先只反量化 DC**，命中就完全不跑整格反量化（2026-10-25）──
+        //
+        // 恒定平面快路径只用 `t[0]`，而 `dequantize` 会把整格 `w·h` 个系数
+        // （32×32 = 1024 个）都算一遍、写满 `t`。这里先用同一个式子算 `t[0]`：
+        // 命中（97% 的 DC-only 块是 DCT_DCT）就直接加常量返回，整格反量化与
+        // `t` 的写满全省掉；没命中再走完整路径（与原来逐位相同）。
+        if eob == 1
+            && !lossless
+            && !flags::no_dc_only()
+            && !flags::no_dc_deq_skip()
+            && !flags::trace_tx1()
+            && !want_pred
+            && !plane_is_u8
+            && !flags::no_tx_inplace()
+            && super::simd::avx2_available()
+        {
+            let dc = super::transform::dequantize_dc(src_levels[0], tx_sz, plane, &quant);
+            if let Some(c) = super::transform::dc_only_constant(dc, tx_sz, tx_type, bit_depth) {
+                if flags::eob_stats() {
+                    DC_ONLY_HIT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+                let max = (1i32 << bit_depth) - 1;
+                let base = start_y as usize * stride + start_x as usize;
+                let dst = frame.planes[plane as usize].px16_mut();
+                // SAFETY: 已判 AVX2；`base..base + (h-1)*stride + w` 在平面缓冲内
+                // （与完整路径同一前提）。
+                unsafe {
+                    super::simd::add_const_plane(
+                        dst.as_mut_ptr().add(base),
+                        stride,
+                        w,
+                        h,
+                        c as i32,
+                        max,
+                    );
+                }
+                return Ok(());
+            }
+        }
+
+        super::transform::dequantize(src_levels, tx_sz, plane, &quant, lossless, t)?;
         if !want_pred && !plane_is_u8 && !flags::no_tx_inplace() {
             // ── DC-only 快路径（2026-10-25）────────────────────────────────────
             //

@@ -185,6 +185,9 @@ bool_flag! {
     /// `ME_NO_DC_ONLY=1`（**诊断**）：DC-only 的反变换快路径退回完整二维变换。
     /// 两条路**逐字节相同**。
     no_dc_only = "ME_NO_DC_ONLY";
+    /// `ME_NO_DC_DEQ_SKIP=1`（**诊断**）：DC-only 块仍走整格反量化（不提前只算 DC）。
+    /// 两条路**逐字节相同**。
+    no_dc_deq_skip = "ME_NO_DC_DEQ_SKIP";
     /// `ME_NO_TX_SPARSE_ROWS=1`（**诊断**）：反变换的行趟不跳过全零的 8 行组。
     /// 两条路**逐字节相同**。
     no_tx_sparse_rows = "ME_NO_TX_SPARSE_ROWS";
