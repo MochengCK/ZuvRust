@@ -233,7 +233,7 @@ jobs:
           "$VENV/bin/pip" install --quiet cargo-zigbuild
           export PATH="$VENV/bin:$PATH"
           ./scripts/build-modules.sh --release --modules="$ENGINE_MODULES" \
-            --target "${{ matrix.target }}" --zigbuild
+            --target="${{ matrix.target }}" --zigbuild
           file "target/${{ matrix.target }}/release/zuvrust"
 
       # ── 打包 ──────────────────────────────────────────────────────────────
