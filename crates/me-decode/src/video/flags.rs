@@ -185,6 +185,9 @@ bool_flag! {
     /// `ME_NO_DC_ONLY=1`（**诊断**）：DC-only 的反变换快路径退回完整二维变换。
     /// 两条路**逐字节相同**。
     no_dc_only = "ME_NO_DC_ONLY";
+    /// `ME_NO_TX_SPARSE_ROWS=1`（**诊断**）：反变换的行趟不跳过全零的 8 行组。
+    /// 两条路**逐字节相同**。
+    no_tx_sparse_rows = "ME_NO_TX_SPARSE_ROWS";
     /// `ME_NO_SGR_GATHER=1`（**诊断**）：SGR 的 `a2` 查表退回逐通道标量。
     /// 两条路**逐字节相同**。
     no_sgr_gather = "ME_NO_SGR_GATHER";

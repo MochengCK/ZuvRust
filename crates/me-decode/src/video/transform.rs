@@ -1153,13 +1153,39 @@ fn inverse_transform_2d_into(
             residual32.resize(w * h, 0);
         }
         let res32: &mut [i32] = &mut residual32[..w * h];
+        // ── 稀疏行组：只跑"最后一个非零系数行"以上的 8 行组（2026-10-25）──────────
+        //
+        // 行趟是**逐 8 行组**推进的，而真素材里 60% 的变换块 `eob == 1`（DC-only 已被
+        // 上面的常量平面快路径接走），剩下的小 EOB 块大多是 32×32/64×64 ⇒ 系数只落在
+        // 最上面一两行，底下的 8 行组**整组都是零**。行趟输入全零 ⇒ 输出也全零，
+        // 所以这些组可以整组跳过，只要把对应的 `res32` 行清零（列趟仍要读它们）。
+        //
+        // 扫描从**最后一行往上**做，遇到第一个非零行就停 —— 开销与"非零区高度"成正比。
+        // `h_eff` 取 8 的倍数（内核要求）；`h_eff == h` 时行为与旧路径完全一致。
+        let h_eff = if flags::no_tx_sparse_rows() || h <= 8 {
+            h
+        } else {
+            let mut last = None;
+            for r in (0..h.min(32)).rev() {
+                let row = &t[r * w..(r + 1) * w];
+                if row.iter().fold(0i32, |a, &x| a | x) != 0 {
+                    last = Some(r);
+                    break;
+                }
+            }
+            match last {
+                // 系数行 ≥32 恒为 0（规范），扫描只看前 32 行；若全是零 ⇒ 至少跑一组。
+                None => 8.min(h),
+                Some(r) => (((r + 1 + 7) & !7).max(8)).min(h),
+            }
+        };
         // SAFETY: 已判 AVX2；`t` 是 `w×h` 的系数格，`res32` 长度 = w·h。
         let rows_done = unsafe {
             super::simd::inv_txfm_rows_i32(
                 t,
                 res32,
                 w,
-                h,
+                h_eff,
                 kind_code(row_1d(tx_type)),
                 log2_w,
                 row_clamp,
@@ -1168,7 +1194,11 @@ fn inverse_transform_2d_into(
                 lossless,
             )
         };
-        if rows_done == h {
+        if rows_done == h_eff {
+            if h_eff < h {
+                // 被跳过的行组：行趟输出恒为 0，列趟仍要读 ⇒ 清零。
+                res32[h_eff * w..].fill(0);
+            }
             let lo = -(1i32 << (col_clamp - 1));
             let hi = (1i32 << (col_clamp - 1)) - 1;
             debug_assert!((col_clamp - 1) < 31, "i32 路径的列钳位必须在 31 位以内");
