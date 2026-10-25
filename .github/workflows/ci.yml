@@ -34,6 +34,7 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'sdk/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/**'          # CI 会调用这里的脚本
@@ -42,6 +43,7 @@ on:
     branches: [main]
     paths:
       - 'crates/**'
+      - 'sdk/**'
       - 'Cargo.toml'
       - 'Cargo.lock'
       - 'scripts/**'
@@ -249,9 +251,12 @@ jobs:
           fi
           mkdir -p "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}"
           cp "$BIN" "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}/zuvrust$EXT"
-          cp LICENSE README.md "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}/"
+          cp LICENSE README.md README-CN.md API.md API-CN.md NOTICE \
+            "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}/"
+          cp -R sdk "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}/"
           tar -C "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}" \
-            -czf "zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}.tar.gz" "zuvrust$EXT" LICENSE README.md
+            -czf "zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}.tar.gz" \
+            "zuvrust$EXT" LICENSE README.md README-CN.md API.md API-CN.md NOTICE sdk
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
@@ -307,6 +312,16 @@ jobs:
       - name: 产物同款组合跑测试
         shell: bash
         run: cargo test -p me-cli --no-default-features --features "$ENGINE_MODULES"
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: JS SDK 自测（对 mux 引擎）
+        shell: bash
+        run: |
+          cargo build -p me-cli --no-default-features --features mux --bin zuvrust
+          ZUVRUST_BIN=target/debug/zuvrust node sdk/js/test/run.mjs
 
   # ---------------------------------------------------------------------------
   # 产物验收：**下载打包好的产物**，用这个二进制本身再跑一遍。

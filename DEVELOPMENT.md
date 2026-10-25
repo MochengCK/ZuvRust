@@ -10,13 +10,16 @@
 一个用 Rust 从零写起的音视频引擎：**不依赖任何老牌媒体引擎**（没有 FFmpeg / libav / GStreamer），
 自己完成容器解封装、多轨合并、多协议取流与 BT 边下边播。
 
-它与宿主（Electron 桌面端 / Android）之间**只有一条通信层**：
+它与宿主（Electron 桌面端 / Android / 任何应用）之间**只走进程边界**：
 
 ```
-宿主  ──(命令行 + NDJSON)──▶  zuvrust 可执行文件
+宿主 ──(命令行 + NDJSON)──────────────▶  zuvrust probe/mux/remux/...
+     ──(JSON-RPC over stdio)──────────▶  zuvrust serve --stdio
 ```
 
-宿主**不链接引擎的任何代码**，不共享内存，不匹配 ABI。引擎升级 = 换一个可执行文件。
+两种形态都不链接引擎代码、不共享内存、不匹配 ABI。引擎升级 = 换一个可执行文件。
+**新应用优先用 `serve --stdio`**（请求 ID、取消、进度、二进制流都封装好了，
+官方 JS 客户端在 `sdk/js/`），协议见 `API.md`；一次性 CLI 留给脚本与排障。
 
 ---
 
@@ -244,7 +247,16 @@ cd ZuvRust
 ./scripts/build-modules.sh --release    # 默认三个模块全开
 cargo test  --workspace                 # 全部单测（无外部依赖，不需要网络/样例文件）
 cargo clippy --workspace
+
+# JSON-RPC 服务契约（起真进程、按帧读写、含 mux 与 fMP4 流）
+cargo test -p me-cli --test serve_contract
+# 官方 JS SDK（零依赖；先构建 mux 引擎）
+cargo build -p me-cli --no-default-features --features mux
+node sdk/js/test/run.mjs --bin target/debug/zuvrust
 ```
+
+`serve --stdio` 的协议与错误码以 `API.md` 为准；`API-CN.md` 是中文版。
+它只做协议/并发/生命周期，任务仍然起子进程，所以裁剪构建也能用 `serve`。
 
 ### 5.1 按模块构建
 
@@ -298,6 +310,24 @@ cargo test --workspace > /tmp/me.log 2>&1; echo "exit=$?"; grep -E "test result|
 ---
 
 ## 六、宿主集成
+
+### 6.0 推荐入口：`serve --stdio`
+
+常驻 JSON-RPC 2.0 服务，协议见 `API.md`，官方 Node 客户端见 `sdk/js/`。
+它把"起进程、拼参数、逐行解析 NDJSON、区分进度/结果/错误、取消"全部收进 SDK；
+任务仍然跑在子进程里，保留崩溃隔离。
+
+```js
+import { ZuvRust } from 'zuvrust-client'
+const engine = await ZuvRust.start({ bin: '/path/to/zuvrust' })
+const info = await engine.probe('movie.mkv')
+await engine.mux('out.mp4', ['video.mp4', 'audio.m4a'], { onProgress: console.log })
+await engine.close()
+```
+
+服务本身**不编任何媒体代码**：它只做协议、并发与生命周期管理，每个请求再起一个
+`zuvrust` 子进程。所以纯 `mux` 构建也能提供 `serve`；`decode` 这类未编模块的
+方法会返回 `1002 / unsupported`。
 
 ### 6.1 二进制放哪
 

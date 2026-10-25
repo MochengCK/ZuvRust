@@ -8,6 +8,8 @@
 *.m4s
 *.m4a
 !crates/**/tests/fixtures/*
+# 上面 *.ts 是给 MPEG-TS 样本用的；SDK 的 TypeScript 声明不能被它误伤。
+!sdk/**/*.ts
 
 # macOS
 .DS_Store

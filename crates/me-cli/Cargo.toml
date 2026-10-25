@@ -51,3 +51,7 @@ required-features = ["mux"]
 [[test]]
 name = "mux_scenarios"
 required-features = ["mux"]
+
+[[test]]
+name = "serve_contract"
+required-features = ["mux"]

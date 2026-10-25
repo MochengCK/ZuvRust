@@ -57,7 +57,7 @@ if [ -n "$EXPECT_ARCH" ]; then
 fi
 
 echo "── ③ 包内容"
-for f in LICENSE README.md; do
+for f in LICENSE NOTICE README.md README-CN.md API.md API-CN.md sdk/js/package.json; do
   [ -f "$WORK/$f" ] || { echo "!! 包里缺少 $f"; exit 1; }
 done
 

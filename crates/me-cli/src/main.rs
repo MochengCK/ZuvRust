@@ -29,6 +29,7 @@ mod modules;
 mod progress;
 #[cfg(any(feature = "audio", feature = "video", feature = "mux"))]
 mod source;
+mod serve;
 // `stream` 的两条路各有依赖：默认出 fMP4 要 mux，`--video=frames` 要 video。
 // 纯音频构建（decode --audio）不需要它，`pick_source` 已抽到 `source`。
 #[cfg(any(feature = "mux", feature = "video"))]
@@ -169,6 +170,7 @@ fn print_usage() {
     text.push_str(
         r#"  download <地址> [--out=路径]  下载（HTTP / HLS / DASH；磁力由下载引擎负责）
   play  <输入> [--seek=秒]      播放数据源（边下边播时给宿主喂采样）
+  serve --stdio                常驻 JSON-RPC 2.0 服务（供 SDK / 宿主集成，见 API.md）
 "#,
     );
     #[cfg(any(feature = "mux", feature = "video"))]

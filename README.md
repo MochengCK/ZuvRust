@@ -1,215 +1,207 @@
 # ZuvRust
 
-**完全自研的媒体引擎** —— 一个可执行文件，零第三方媒体库依赖。
+English | [简体中文](README-CN.md)
 
-它不链接 FFmpeg，也不链接任何别的媒体库：容器解析、容器层合并、AV1 软解、
-音频软解全部自己实现。调用方（播放器、下载器、任何程序）通过
-**命令行 + NDJSON** 与它通信，**不链接它的任何代码**。
+**A self-contained media engine for applications.** One executable, a stable
+JSON-RPC API, and zero third-party media libraries.
 
-> 想了解内部结构、硬约定、性能数据与改造记录，见 **[DEVELOPMENT.md](DEVELOPMENT.md)**。
+ZuvRust implements container parsing, remuxing, muxing, AV1 software decoding,
+H.264 hardware decoding and audio decoding itself. It does not link FFmpeg,
+GStreamer or any other media engine. Applications talk to it over a process
+boundary: start `zuvrust serve --stdio`, send JSON-RPC requests, receive progress
+notifications and binary media frames.
 
----
+- **Stable integration surface** — JSON-RPC 2.0, request IDs, cancellation,
+  progress and binary streaming. See [API.md](API.md).
+- **Official JavaScript client** — zero-dependency Node.js SDK in [sdk/js](sdk/js).
+- **Crash isolation** — every job runs in its own child process; a malformed file
+  cannot take down your application.
+- **Modular builds** — compile only what your application needs: `audio`,
+  `video`, `mux`, or any combination.
+- **Apache-2.0** — permissive licensing for commercial and open-source products.
 
-## 能做什么
+## What it does
 
-| 子命令 | 说明 |
+| Capability | Details |
 | --- | --- |
-| `probe <输入>` | 探测容器与轨道（编码、分辨率、时长、码率…） |
-| `mux <输出> <输入>...` | **合并**：把多个输入接成一个文件（角色由探测决定，详见下） |
-| `remux <输出> <输入>` | 换容器重新封装，**不重编码** |
-| `download <地址>` | 下载 HTTP 单文件 / HLS / DASH（含 AES-128 加密分片） |
-| `play <输入>` | 播放数据源，按采样喂给调用方 |
-| `stream <输入>` | 流式播放：一行元信息 + 分片 fMP4 字节（喂给 MSE 用） |
-| `decode <输入>` | 解码：视频轨出帧，音频轨出 WAV |
-| `version` | 打印版本与本机支持的能力 |
+| Probe | Container, tracks, codecs, resolution, duration, bitrate |
+| Mux | Merge audio/video inputs, concatenate segments, choose MP4 / MKV / WebM / TS / FLAC / ADTS |
+| Remux | Change container without re-encoding |
+| Download | HTTP(S), HLS (including AES-128), DASH |
+| Decode video | AV1 software decoder; H.264 via VideoToolbox / Media Foundation / VA-API |
+| Decode audio | AAC-LC, MP3, FLAC, Opus (self-implemented) |
+| Stream | Fragmented MP4 for MSE, or decoded NV12 / PCM packets for custom players |
+| Growing files | Play a file while another process is still downloading it |
 
-`mux` 的语义值得单独说：**角色由容器探测决定，与文件名无关**。含视频轨的输入进
-"画面序列"、含音频轨的进"声音序列"，第 j 段 = 画面序列[j] + 声音序列[j]，段内
-多轨交织、段末把时间轴推到各轨的最大值再进下一段。所以**调用方要保证"同角色输入的
-传入顺序 = 时间顺序"**。HLS 分片、下载器切出来的分段，都是这么拼成完整文件的。
+ZuvRust does **not** encode or transcode.
 
-它**不做编码/转码** —— 只做封装与解码。
+## Integration
 
----
-
-## 支持范围
-
-**容器**：MPEG-TS、ISO BMFF（mp4 / mov / m4s）、Matroska / WebM（mkv / webm）、Ogg、FLAC、ADTS、MPEG 音频
-
-**合并输出**（按扩展名选封装器，编码不被目标容器支持时**明确报错**，绝不产出坏文件）：
-
-| 扩展名 | 容器 | 装得下的编码 |
-| --- | --- | --- |
-| `.mp4` `.m4s` `.mov` `.m4a` | 分片 fMP4 | H.264 / H.265 / AV1 / VP9 + AAC / MP3 / FLAC / Opus / AC-3 |
-| `.mkv` `.mka` | Matroska | 上面全部 |
-| `.webm` | WebM（Matroska 子集） | **仅** VP8 / VP9 / AV1 + Opus |
-| `.ts` `.m2ts` | MPEG-TS | H.264 / H.265 + AAC / MP3 / AC-3 |
-| `.flac` | 裸 FLAC（只有声音） | 仅 FLAC，自动丢掉画面 |
-| `.aac` | 裸 ADTS（只有声音） | 仅 AAC，自动丢掉画面 |
-
-**协议**：HTTP(S)、HLS、DASH
-
-**编码标识**（容器里认得出，用于写 `stsd` / `PMT`）：
-H.264、H.265、AV1、VP9、VP8、AAC、MP3、Opus、FLAC、AC-3、E-AC-3
-
-**解码**（"认得出"不等于"解得开"，这里才是能解的）：
-
-| 编码 | 解码方式 |
-| --- | --- |
-| AV1 | **自研软解**（完整实现，逐像素与参考解码器对拍过）；Apple Silicon（M3 及以后）优先走 VideoToolbox **硬解** |
-| H.264 | **三个平台都走系统硬解**：macOS 用 VideoToolbox、Windows 用 Media Foundation（硬件 MFT + D3D11）、Linux 用 VA-API |
-| Opus / AAC / FLAC / MP3 | **自研软解** |
-
-⚠️ **AV1 软解目前还不是实时性能**：1080p 单线程约 50~55 ms/帧（约 18~20 fps，随机器温度/负载浮动），
-目标是 33 ms（30 fps）。在 Apple Silicon 上它会自动走硬解，所以那道坎主要影响 Intel 机器。
-具体数据与后续计划见 [DEVELOPMENT.md](DEVELOPMENT.md) 的性能段。
-
-**BT / 磁力不在本引擎内**：磁力由下载引擎（XferRust）负责，ZuvRust 只负责
-播放 / 合并它写出来的文件（见下面的"边下边播"）。
-
----
-
-## 用法
+### 1. Start the service
 
 ```sh
-# 探测
+zuvrust serve --stdio
+```
+
+All messages on stdin/stdout are length-prefixed frames. A request looks like
+this (after the 5-byte frame header):
+
+```json
+{"jsonrpc":"2.0","id":1,"method":"probe","params":{"input":"movie.mkv"}}
+```
+
+The response contains container and track information. Long jobs emit
+`progress` notifications; streams emit binary frames plus a `stream/end`
+notification. The complete protocol, method parameters, binary `MEV1` packet
+layout and error codes are in **[API.md](API.md)**.
+
+### 2. Use the JavaScript SDK
+
+```js
+import { ZuvRust } from 'zuvrust-client'
+
+const engine = await ZuvRust.start({ bin: '/opt/zuvrust/zuvrust' })
+
+const info = await engine.probe('movie.mkv')
+
+await engine.mux('out.mp4', ['video.mp4', 'audio.m4a'], {
+  fragmentMs: 2000,
+  onProgress: (data, type) => console.log(type, data.percent)
+})
+
+for await (const event of engine.stream('movie.mp4', { mode: 'frames', audioPcm: true })) {
+  if (event.type === 'video') render(event.data, event.width, event.height)
+  if (event.type === 'audio') play(event.data, event.sampleRate, event.channels)
+  if (event.type === 'end' && !event.ok) console.error(event.error)
+}
+
+await engine.close()
+```
+
+See [sdk/js/README.md](sdk/js/README.md) for the full client API.
+
+### 3. Or use the one-shot CLI
+
+```sh
 zuvrust probe movie.mkv --json
-
-# 把 HLS 下载下来的分片拼成一个 mp4
-zuvrust mux out.mp4 seg000.ts seg001.ts seg002.ts --json
-
-# 下载（HLS 会自动选码率；可用 --max-height 限高）
+zuvrust mux out.mp4 video.mp4 audio.m4a --json --progress
+zuvrust remux out.mkv in.ts --json
 zuvrust download "https://example.com/index.m3u8" --out movie.mp4 --progress
-
-# 换容器（不重编码）
-zuvrust remux out.mp4 in.ts --json
-
-# 解成帧（落盘）或解成 WAV
 zuvrust decode movie.mp4 --count 30 --out frames/
 zuvrust decode music.flac --audio --out music.wav
 ```
 
-**界面上的进度**来自 `--progress`：它会额外吐进度行，调用方按行解析即可。
+The CLI contract (exit codes, NDJSON shapes, stderr encoding) is documented in
+[DEVELOPMENT.md](DEVELOPMENT.md) and covered by process-level tests.
 
----
+## Supported formats
 
-## 调用方契约（重要）
+**Containers:** MPEG-TS, ISO BMFF (mp4 / mov / m4s), Matroska / WebM,
+Ogg, FLAC, ADTS, MPEG audio.
 
-宿主**只依赖三样东西**：退出码、stdout 的字节、stderr 的字节。
+**Mux output** (chosen by the output extension; unsupported codec combinations
+fail explicitly instead of writing a broken file):
 
-**输出**按 `--json` 分两种形态：
+| Extension | Container | Codecs |
+| --- | --- | --- |
+| `.mp4` `.m4s` `.mov` `.m4a` | fragmented MP4 | H.264 / H.265 / AV1 / VP9 + AAC / MP3 / FLAC / Opus / AC-3 |
+| `.mkv` `.mka` | Matroska | all of the above |
+| `.webm` | WebM subset | VP8 / VP9 / AV1 + Opus |
+| `.ts` `.m2ts` | MPEG-TS | H.264 / H.265 + AAC / MP3 / AC-3 |
+| `.flac` | raw FLAC | FLAC only |
+| `.aac` | raw ADTS | AAC only |
 
-- `--json`：**恰好一行** JSON —— 成功 `{"ok":true,"result":{…}}`，
-  进度 `{"ok":true,"type":"…","data":{…}}`，错误走 stderr
-  `{"ok":false,"error":{"kind":"…","message":"…","retryable":…}}`。
-  `kind` 是机器可读分类（`io` / `container` / `bitstream` / `protocol` /
-  `unsupported` / `need-more` / `cancelled`），`retryable` 表示重试有没有意义。
-- 不带 `--json`：**缩进过的多行** JSON（给人看的），没有 `ok` / `result` 包装。
+**Protocols:** HTTP(S), HLS, DASH.
 
-**退出码**是对外契约的一部分 —— 调用方靠它决定"要不要重试"：
+**Decoders**
 
-| 码 | 含义 |
+| Codec | Implementation |
 | --- | --- |
-| 0 | 成功 |
-| 2 | 用法错误（命令拼错了，重试无用） |
-| 3 | 输入不可用（打不开 / 容器认不出 / 码流非法，重试无用） |
-| 4 | 临时失败（网络超时、数据还没到，**可以重试**） |
-| 5 | 引擎内部错误 |
-| 6 | 被取消 |
+| AV1 | Self-implemented software decoder; VideoToolbox hardware decode on Apple Silicon M3+ |
+| H.264 | System hardware decode on macOS (VideoToolbox), Windows (Media Foundation + D3D11), Linux (VA-API) |
+| AAC-LC / MP3 / FLAC / Opus | Self-implemented software decoders |
 
-这条契约有测试守着：`crates/me-cli/tests/cli_contract.rs` 会**真的起一个进程**，
-逐条验证退出码、两种输出形态、stderr 的编码与上色、带空格与中文的路径等等。
+AV1 software decoding is correct but not yet real-time on older machines:
+roughly 50–55 ms per 1080p frame on a single Intel core (about 18–20 fps,
+depending on frequency and thermals). Apple Silicon uses hardware decoding.
+Details and the optimization log are in [DEVELOPMENT.md](DEVELOPMENT.md).
 
----
+**BT / magnet links are out of scope.** ZuvRust only plays or muxes files produced
+by a download engine. The handoff is [the availability map](API.md#stream): the
+downloader writes which byte ranges exist; ZuvRust waits for missing ranges
+instead of treating them as corrupt data, and reports its playhead back.
 
-## 边下边播
+## Module builds
 
-下载和播放是两个引擎，它们之间只有一条协作接口：**可用性图**。
+The engine is split into three independently compiled modules:
 
-下载器把"哪些字节已经真的下到了"写成一个 JSON 文件（片位图），通过
-`--avail=<文件>` 交给 ZuvRust。于是"还没下到的区间"是**等**而不是**损坏** ——
-没有这张图的话，空洞读出来是零字节，容器层会把它当成坏数据直接终止播放。
+| Feature | Includes | Typical application |
+| --- | --- | --- |
+| `audio` | AAC / MP3 / FLAC / Opus decoders, `decode --audio` | audio players, converters |
+| `video` | AV1 software decode + H.264 hardware decode, `decode`, `stream --video=frames` | video players |
+| `mux` | probe / mux / remux / fMP4 stream remuxing | downloaders, merging tools |
 
-播放位置也会反向上报（`playhead`），下载器据此优先下播放位置附近的数据。
+Any combination is valid. `probe`, `download`, `play` and `serve` are always
+included. `zuvrust version --json` reports the compiled modules in `modules`;
+calling a command whose module was not compiled returns exit code 2 with a clear
+message.
 
 ```sh
-zuvrust stream movie.mp4 --avail=/path/to/avail.json --wait-timeout=30000
+./scripts/build-modules.sh --release --modules=mux
+./scripts/build-modules.sh --release --modules=audio,video
+./scripts/build-modules.sh --release --modules=audio,video,mux
 ```
 
-`--wait-timeout` 是单次等待的上限（默认 30000 ms）：网络已经断了时，调用方可以
-调小它以便更快失败、提示用户。
+The default release artifacts are built with `mux` only for the Lerxu desktop
+application (its playback UI is temporarily disabled). For the full engine, build
+from source or run the CI workflow manually with `modules=audio,video,mux`.
 
----
+## Build from source
 
-## 平台与产物
+Requirements: Rust stable. Linux ARM64 cross builds additionally use
+`cargo-zigbuild`.
 
-每个平台的产物是一个 tar 包，里面是 `zuvrust`（Windows 为 `zuvrust.exe`）、
-`LICENSE` 与 `README.md`：
+```sh
+cargo build --release                 # all modules
+./scripts/build-modules.sh --release  # validated module build wrapper
+cargo test --workspace
+./scripts/check-arches.sh             # cross-architecture compile gate
+```
 
-| 平台 | 产物 |
+The binary is `target/release/zuvrust` (`zuvrust.exe` on Windows).
+
+## Platforms
+
+| Platform | Artifact |
 | --- | --- |
 | macOS Intel | `zuvrust-darwin-x86_64.tar.gz` |
 | macOS Apple Silicon | `zuvrust-darwin-arm64.tar.gz` |
 | Linux x86_64 | `zuvrust-linux-x86_64.tar.gz` |
-| Linux arm64 | `zuvrust-linux-arm64.tar.gz`（静态链接） |
+| Linux arm64 | `zuvrust-linux-arm64.tar.gz` (static) |
 | Windows x86_64 | `zuvrust-windows-x86_64.tar.gz` |
 
-产物由 CI 在每个平台上**原生构建 + 跑完测试**之后才打包，并且打包后会再下载
-**产物本身**验一遍（架构、包内容、模块、契约）。也就是说，从 Release 拿到的包是
-"跑过测试且被独立验证过"的那一个。
+Each artifact is built and tested natively in CI, then downloaded and verified as
+a binary (architecture, module list, startup and contract tests) before release.
+Archives include the binary, `LICENSE`, `NOTICE`, English and Chinese READMEs,
+the protocol reference, and the `sdk/js` client source.
 
----
+## Design notes
 
-## 构建与自测
+- Container parsing and muxing are byte-level operations; they never decode.
+- Decoding is a separate layer, optional at build time.
+- Timestamps use integer timebases and are converted to microseconds only when
+  comparing across tracks.
+- Output is either correct or an explicit error; the engine never silently writes
+  a broken file.
+- The JSON-RPC service supervises child jobs, preserving process isolation while
+  providing one integration endpoint.
 
-```sh
-# 默认：三个模块全开（音频解析 + 视频解析 + 音视频合并）
-./scripts/build-modules.sh --release
+More internal invariants, performance data and engineering notes:
+[DEVELOPMENT.md](DEVELOPMENT.md). AV1 conformance audit: [AV1-AUDIT.md](AV1-AUDIT.md).
 
-# 只构建应用真正用到的模块（可任意组合）
-./scripts/build-modules.sh --modules=mux --release
-./scripts/build-modules.sh --modules=audio,video --release
-./scripts/build-modules.sh --modules=audio            # 纯音频
+## License
 
-cargo test --workspace                   # 全量测试（模块全开的默认构建）
-./scripts/check-arches.sh                # 用非本机架构编译一遍（见下）
-./scripts/verify-artifact.sh <包> zuvrust "<期望架构>" "mux"   # 验收产物与模块
-```
+Apache License 2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
-模块就是 Cargo feature：
-
-| feature | 包含的能力 | 不含 |
-| --- | --- | --- |
-| `audio` | AAC / MP3 / FLAC / Opus 软解，`decode --audio` | 视频解码、合并 |
-| `video` | AV1 自研软解 + H.264 三平台硬解，`decode` / `stream --video=frames` | 音频解码、合并 |
-| `mux` | `probe` / `mux` / `remux` / `stream`（fMP4 转封装） | 任何解码器 |
-
-三个可以任意组合，默认全开。`probe`、`download`、`play` 属于基础层，始终保留。
-`zuvrust version --json` 的 `modules` 字段会如实报告这个二进制编了哪些模块；
-没编的命令会以退出码 2 明确报错，不会静默失败。
-
-**CI 按应用出产物**：桌面端（Lerxu）当前只用到合并（播放暂时停用），所以 Release
-里的五平台产物使用 `--modules=mux` 构建；需要完整能力时用 Actions 的
-"Run workflow" 手动选模块组合（非默认组合的产物名会带 `-audio-video-mux` 这类
-后缀，只上传 Actions artifact / 不进 Release）。
-
-**`check-arches.sh` 不是可选项**：引擎里大量 SIMD 实现按 `target_arch` 分叉，
-非 x86 的那一侧是**桩** —— 桩写错了在本机（Intel）永远浮现不出来，只有别的架构
-编译时才报错。这个脚本就是用"另一个架构 + `--all-targets`"把这类错误提前到本地。
-
----
-
-## 许可
-
-**GPL-3.0 或更高版本**（GNU General Public License v3.0 or later）。
-完整许可证文本见 [LICENSE](LICENSE)。
-
----
-
-## 深入
-
-- 分层架构、必须守住的硬约定、通信层契约、性能数据与逐刀记录 →
-  **[DEVELOPMENT.md](DEVELOPMENT.md)**
-- AV1 软解的全面检查报告（正确性 / 功能完整性 / 三平台 / 优化清单）→
-  [AV1-AUDIT.md](AV1-AUDIT.md)
-- 参考实现对拍工具 → [`tools/av1ref/`](tools/av1ref/)
+You can use ZuvRust in commercial and open-source applications under the terms of
+Apache-2.0. The engine contains no third-party media library code.

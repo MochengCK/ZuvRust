@@ -22,6 +22,8 @@ pub(crate) fn compiled_modules() -> Vec<&'static str> {
 ///
 /// 用 `Unsupported`（退出码 2 = 用法错误）而不是内部错误：这不是引擎坏了，
 /// 是这个二进制本来就没带这块能力，重试没有意义。
+/// 全量构建里没有调用点（所有命令都编进来了），所以显式放行 dead_code。
+#[allow(dead_code)]
 pub(crate) fn disabled(module: &str, feature: &str, command: &str) -> MediaError {
     MediaError::Unsupported(format!(
         "`{command}` 需要{module}模块，但当前构建未包含它（用 `--features {feature}` 重新构建）"

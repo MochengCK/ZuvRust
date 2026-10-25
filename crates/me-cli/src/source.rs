@@ -8,7 +8,9 @@ use std::sync::Arc;
 use me_core::ReadAt;
 use me_stream::OpenedSource;
 
-pub(crate) fn pick_source(opened: OpenedSource) -> me_core::Result<(Arc<dyn ReadAt>, Option<String>)> {
+pub(crate) fn pick_source(
+    opened: OpenedSource,
+) -> me_core::Result<(Arc<dyn ReadAt>, Option<String>)> {
     match opened {
         OpenedSource::Single(s) => Ok((s, None)),
         OpenedSource::Hls(h) => {
@@ -32,7 +34,10 @@ pub(crate) fn pick_source(opened: OpenedSource) -> me_core::Result<(Arc<dyn Read
                 if has_video { "视频" } else { "音频" }
             );
             // 有画面优先：画面没声音还能看，只有声音算怎么回事
-            let pick = list.iter().position(|t| t.content_type == "video").unwrap_or(0);
+            let pick = list
+                .iter()
+                .position(|t| t.content_type == "video")
+                .unwrap_or(0);
             let mut list = list;
             let t = list.swap_remove(pick);
             Ok((t.source, Some(note)))

@@ -20,6 +20,7 @@ pub fn dispatch(args: &[String]) -> Result<u8> {
     match cmd.as_str() {
         "version" => cmd_version(rest),
         "probe" => cmd_probe(rest),
+        "serve" => crate::serve::run(rest),
         #[cfg(feature = "mux")]
         "mux" => cmd_mux(rest),
         #[cfg(not(feature = "mux"))]
@@ -82,9 +83,15 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn cmd_version(args: &[String]) -> Result<u8> {
+    emit(args, &version_value());
+    Ok(exit_code::OK)
+}
+
+/// 引擎能力清单（`version --json` 的 `result`，也是 JSON-RPC `version` 的返回值）。
+pub(crate) fn version_value() -> serde_json::Value {
     // 能力清单必须与**这个二进制实际编进来的模块**一致：宿主据此决定哪些按钮
     // 可点。写死一份全量清单会让裁剪版在界面上"看起来支持"，点了才报错。
-    let mut features = vec!["probe"];
+    let mut features = vec!["probe", "serve"];
     #[cfg(feature = "mux")]
     {
         features.extend(["remux", "mux", "concat"]);
@@ -95,7 +102,7 @@ fn cmd_version(args: &[String]) -> Result<u8> {
     #[cfg(feature = "video")]
     features.push("decode-video");
 
-    let v = serde_json::json!({
+    serde_json::json!({
         "name": "ZuvRust",
         "version": env!("CARGO_PKG_VERSION"),
         // 这个构建编进来的模块（audio / video / mux 的子集）。
@@ -115,9 +122,7 @@ fn cmd_version(args: &[String]) -> Result<u8> {
             "downloadEngine": "external",
             "playheadHint": true
         }
-    });
-    emit(args, &v);
-    Ok(exit_code::OK)
+    })
 }
 
 fn cmd_probe(args: &[String]) -> Result<u8> {
