@@ -11,9 +11,10 @@ name: CI
 #
 # 所以流程是三层，逐层收紧（与 XferRust 的流程一致）：
 #
-#   build   每个平台**原生**跑全量测试 → 通过才构建 → 冒烟 → 打包 → 上传
-#   verify  下载**打包好的产物**，用产物本身再跑一遍验收（架构 / 契约 / 端到端）
-#   release 只有上面全部绿了才动 Release（草稿）
+#   build         每个平台**原生**跑全量测试 → 通过才构建 → 冒烟 → 打包 → 上传
+#   modules-check 所有模块组合的编译门禁（不产生产物，防止 feature 开关腐烂）
+#   verify        下载**打包好的产物**，用产物本身再跑一遍验收（架构 / 模块 / 契约）
+#   release       只有上面全部绿了才动 Release（草稿；只收桌面端默认的 mux 产物）
 #
 # 为什么 `verify` 不能省：`build` 验的是"这棵树"，`verify` 验的是"这个二进制"。
 # 中间隔着打包这一步（选错文件、漏拷、架构不对、tar 坏掉），而后者才是要发出去的东西。
@@ -46,6 +47,12 @@ on:
       - 'scripts/**'
       - '.github/workflows/**'
   workflow_dispatch:
+    inputs:
+      modules:
+        description: '要构建的模块（逗号分隔：audio / video / mux；可任意组合）'
+        required: false
+        default: 'mux'
+        type: string
 
 concurrency:
   group: ci-${{ github.ref }}
@@ -54,6 +61,28 @@ concurrency:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # ── 应用 → 模块 ───────────────────────────────────────────────────────────
+  # 产物只编"这个应用真正用到的模块"。目前只有桌面端（Lerxu）在消费这些产物，
+  # 它的播放功能暂时停用（只需 probe / mux / remux）⇒ 只编 mux。
+  # 以后新增应用：在这里按 job/matrix 给它自己的 ENGINE_MODULES，不要把所有
+  # 模块都塞进每个产物。手动触发时可用 inputs.modules 覆盖（默认仍是 mux）。
+  ENGINE_MODULES: ${{ github.event.inputs.modules || 'mux' }}
+
+# ── 按应用裁剪模块 ───────────────────────────────────────────────────────────
+# 引擎支持三个可组合的模块：audio（音频解析/解码）、video（视频解析/解码）、
+# mux（音视频合并/转封装）。发布产物只编**应用真正用到的模块**：
+#
+#   Lerxu 桌面端 → mux
+#     播放功能暂时停用（`MEDIA_PLAYER_ENABLED = false`），只调 probe / mux / remux；
+#     编进 audio/video 只会让每个安装包白背几 MB 解码器。
+#
+# 需要完整引擎时用 Actions 的 "Run workflow"，把 modules 填成 audio,video,mux。
+# 非默认组合的产物名会带 `-audio-video-mux` 这类后缀，且只上传 Actions artifact、
+# 不进 Release（Release 只收桌面端默认的 mux 产物）。
+# 各组合的编译门禁在 `modules-check`（不产生产物）。
+#
+# 新增应用时：给它的构建 job/matrix 设置自己的 ENGINE_MODULES 与产物名，
+# 不要让所有应用共用一份"全量"产物。
 
 jobs:
   # ---------------------------------------------------------------------------
@@ -112,6 +141,26 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # 产物名默认与宿主回填约定一致（zuvrust-<平台>.tar.gz）；手动选了别的模块
+      # 组合时加后缀，避免把"只有音频"的包覆盖到桌面端 mux 产物上。
+      - name: 校验模块参数 / 计算产物名后缀
+        shell: bash
+        run: |
+          set -euo pipefail
+          [ -n "$ENGINE_MODULES" ] || { echo "::error::ENGINE_MODULES 不能为空"; exit 1; }
+          for m in ${ENGINE_MODULES//,/ }; do
+            case "$m" in
+              audio|video|mux) ;;
+              *) echo "::error::未知模块 $m（只认 audio / video / mux）"; exit 1 ;;
+            esac
+          done
+          if [ "$ENGINE_MODULES" = "mux" ]; then
+            echo "ARTIFACT_SUFFIX=" >> "$GITHUB_ENV"
+          else
+            echo "ARTIFACT_SUFFIX=-${ENGINE_MODULES//,/-}" >> "$GITHUB_ENV"
+          fi
+          echo "本次构建模块：$ENGINE_MODULES"
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -143,6 +192,15 @@ jobs:
         shell: bash
         run: cargo test --workspace
 
+      # 上面跑的是"所有模块都开"的树；这一步跑**要发出去的那个 feature 组合**。
+      # 裁剪最容易坏在"测试一直用全量、产物却是子集"：某个命令在子集下根本
+      # 编不过，CI 却全绿。mux 组合会跑 cli_contract / mux_cli / lossless /
+      # mux_scenarios；audio / video 组合跑各自的单元测试。
+      - name: 产物同款模块测试
+        if: matrix.runnable
+        shell: bash
+        run: cargo test -p me-cli --no-default-features --features "$ENGINE_MODULES"
+
       # 交叉到 aarch64-linux 再编一遍核心层，补上**原生运行器覆盖不到的那一格**：
       # 四个原生运行器已覆盖 x86_64/arm64 的 macOS、x86_64 的 Linux 与 Windows，
       # 唯一没被原生验证的就是 aarch64-linux。`--all-targets` 不能省 ——
@@ -154,13 +212,13 @@ jobs:
         run: ./scripts/check-arches.sh aarch64-unknown-linux-musl
 
       # ── 构建 ──────────────────────────────────────────────────────────────
-      - name: Build（本机目标：macOS Intel/arm64、Linux x64、Windows x64）
+      - name: Build（按应用所需模块）
         if: matrix.target == ''
         shell: bash
         run: |
           set -euo pipefail
           EXT=; [ "$RUNNER_OS" = "Windows" ] && EXT=.exe
-          cargo build --release --bin zuvrust
+          ./scripts/build-modules.sh --release --modules="$ENGINE_MODULES"
           BIN="target/release/zuvrust$EXT"
           file "$BIN"
           "$BIN" version --json
@@ -174,7 +232,8 @@ jobs:
           python3 -m venv "$VENV"
           "$VENV/bin/pip" install --quiet cargo-zigbuild
           export PATH="$VENV/bin:$PATH"
-          cargo zigbuild --release --bin zuvrust --target "${{ matrix.target }}"
+          ./scripts/build-modules.sh --release --modules="$ENGINE_MODULES" \
+            --target "${{ matrix.target }}" --zigbuild
           file "target/${{ matrix.target }}/release/zuvrust"
 
       # ── 打包 ──────────────────────────────────────────────────────────────
@@ -188,11 +247,11 @@ jobs:
           else
             BIN="target/release/zuvrust$EXT"
           fi
-          mkdir -p "pkg/zuvrust-${{ matrix.artifact }}"
-          cp "$BIN" "pkg/zuvrust-${{ matrix.artifact }}/zuvrust$EXT"
-          cp LICENSE README.md "pkg/zuvrust-${{ matrix.artifact }}/"
-          tar -C "pkg/zuvrust-${{ matrix.artifact }}" \
-            -czf "zuvrust-${{ matrix.artifact }}.tar.gz" "zuvrust$EXT" LICENSE README.md
+          mkdir -p "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}"
+          cp "$BIN" "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}/zuvrust$EXT"
+          cp LICENSE README.md "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}/"
+          tar -C "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}" \
+            -czf "zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}.tar.gz" "zuvrust$EXT" LICENSE README.md
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v5
@@ -200,6 +259,54 @@ jobs:
           name: build-${{ matrix.artifact }}
           path: zuvrust-*.tar.gz
           if-no-files-found: error
+
+  # ---------------------------------------------------------------------------
+  # 模块组合门禁：产物只用一种组合（桌面端 mux），但 **feature 开关本身**要
+  # 经得起所有组合。这里不产出任何东西，只回答一个问题：
+  # "把不用的模块关掉之后，剩下的代码还编得过吗（包括测试目标）？"
+  #
+  # 为什么单独一个 job：跑在 Linux 上就够（feature 组合是平台无关的），
+  # 五个平台的矩阵已经跑全量测试，不必把组合数再乘一遍平台数。
+  # ---------------------------------------------------------------------------
+  modules-check:
+    name: 模块组合编译检查
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: modules-check
+
+      - name: crate 级开关（audio / video / mux）
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in audio video; do
+            echo "=== me-decode: ${f}"
+            cargo test -p me-decode --no-default-features --features "$f" --lib --no-run
+          done
+          echo "=== me-mux: convert only"
+          cargo test -p me-mux --no-default-features --lib --no-run
+          echo "=== me-mux: convert + muxers"
+          cargo test -p me-mux --lib --no-run
+
+      - name: CLI 所有模块组合（含测试目标）
+        shell: bash
+        run: |
+          set -euo pipefail
+          for f in audio video mux audio,video audio,mux video,mux audio,video,mux; do
+            echo "=== me-cli: ${f}"
+            cargo check -p me-cli --all-targets --no-default-features --features "$f"
+          done
+
+      - name: 产物同款组合跑测试
+        shell: bash
+        run: cargo test -p me-cli --no-default-features --features "$ENGINE_MODULES"
 
   # ---------------------------------------------------------------------------
   # 产物验收：**下载打包好的产物**，用这个二进制本身再跑一遍。
@@ -239,6 +346,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: 计算产物名后缀
+        shell: bash
+        run: |
+          if [ "$ENGINE_MODULES" = "mux" ]; then
+            echo "ARTIFACT_SUFFIX=" >> "$GITHUB_ENV"
+          else
+            echo "ARTIFACT_SUFFIX=-${ENGINE_MODULES//,/-}" >> "$GITHUB_ENV"
+          fi
+
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
@@ -259,9 +375,10 @@ jobs:
         shell: bash
         run: |
           ./scripts/verify-artifact.sh \
-            "pkg/zuvrust-${{ matrix.artifact }}.tar.gz" \
+            "pkg/zuvrust-${{ matrix.artifact }}${ARTIFACT_SUFFIX}.tar.gz" \
             "${{ matrix.bin }}" \
-            "${{ matrix.expect_arch }}"
+            "${{ matrix.expect_arch }}" \
+            "$ENGINE_MODULES"
 
       - name: Upload 失败日志
         if: failure()
@@ -277,8 +394,12 @@ jobs:
   # ---------------------------------------------------------------------------
   release:
     name: Release (草稿/不覆盖已发布)
-    if: (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
-    needs: [build, verify]
+    # 只有默认的桌面端 mux 组合进 Release；手动构建 audio/video/full 只上传
+    # Actions artifact（供验收/分发），不碰已经发布或草稿里的桌面端产物。
+    if: >-
+      (github.event_name == 'push' && github.ref == 'refs/heads/main')
+      || (github.event_name == 'workflow_dispatch' && (github.event.inputs.modules == '' || github.event.inputs.modules == 'mux'))
+    needs: [build, verify, modules-check]
     runs-on: ubuntu-latest
     permissions:
       contents: write

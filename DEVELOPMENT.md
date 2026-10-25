@@ -230,16 +230,52 @@ zuvrust version  [--json]                                  版本与支持的容
 `zuvrust version --json` 返回支持的容器/协议/特性列表，宿主据此决定
 界面上哪些按钮可点（而不是"点了再报错"）。
 
+从按模块构建开始，结果里多了一个 **`modules`** 字段：它是这个二进制**实际
+编译进来**的模块（`audio` / `video` / `mux` 的子集），与 `features` 一起由
+同一份 `#[cfg(feature = ...)]` 清单生成。未编译的命令不会"消失"或报内部错误，
+而是返回退出码 2 + 一句"需要用哪个 feature 重新构建"。
+
 ---
 
 ## 五、构建与测试
 
 ```bash
 cd ZuvRust
-cargo build --release          # 产物：target/release/zuvrust
-cargo test  --workspace        # 全部单测（无外部依赖，不需要网络/样例文件）
+./scripts/build-modules.sh --release    # 默认三个模块全开
+cargo test  --workspace                 # 全部单测（无外部依赖，不需要网络/样例文件）
 cargo clippy --workspace
 ```
+
+### 5.1 按模块构建
+
+三个模块各自是一个 Cargo feature，可以任意组合：
+
+| feature | 编译进来的东西 | 典型应用 |
+|---|---|---|
+| `audio` | `me-decode/audio`（AAC / MP3 / FLAC / Opus 软解） | 纯音频播放/转换 |
+| `video` | `me-decode/video`（AV1 软解、H.264 三平台硬解） | 视频播放器 |
+| `mux` | `me-mux` 的封装器（probe / mux / remux / fMP4 转封装） | 下载器、合并工具 |
+
+`probe` / `download` / `play` 属于基础层，任何组合都保留。`me-mux::convert`
+不依赖 `mux` feature（视频解码也要用它做 Annex-B ↔ AVCC 转换），所以它始终
+很小；封装器才由 `mux` 门控。
+
+```bash
+./scripts/build-modules.sh --modules=mux --release
+./scripts/build-modules.sh --modules=audio,video --release
+./scripts/build-modules.sh --modules=audio,audio   # 报错：模块重复
+```
+
+**CI 的应用映射**（`.github/workflows/ci.yml` 的 `ENGINE_MODULES`）：
+
+| 应用 | 模块 | 原因 |
+|---|---|---|
+| Lerxu 桌面端 | `mux` | 播放功能暂时停用，只需要 probe / mux / remux |
+
+以后新增应用时改这一处（或矩阵里的 `modules`），产物名保持不变，宿主回填路径
+就不用跟着改。手动触发工作流可以覆盖模块组合，用于验收 `audio` / `video` / 全量；
+非默认组合的产物名会带 `-audio-video-mux` 这类后缀，且**只上传 Actions artifact、
+不进 Release**（Release 只收桌面端默认的 mux 产物）。
 
 ### macOS 沙箱的坑（必读）
 

@@ -35,16 +35,21 @@
 //! 这样引擎侧永远不需要关心"播放器的进度条要显示什么"，
 //! 而宿主换来的是**正确的 `currentTime` 与进度条**。
 
+#[cfg(feature = "mux")]
 use std::collections::HashMap;
 use std::io::Write;
-use std::sync::Arc;
 
-use me_core::{CodecId, MediaError, MediaKind, ReadAt, Result, Timebase, Track};
+#[cfg(feature = "mux")]
+use me_core::{CodecId, Timebase};
+use me_core::{MediaError, MediaKind, Result, Track};
+#[cfg(any(feature = "mux", feature = "video"))]
 use me_mux::convert;
+#[cfg(feature = "mux")]
 use me_mux::Mp4Muxer;
-use me_stream::{OpenOptions, OpenedSource, Player, PlayerConfig};
+use me_stream::{OpenOptions, Player, PlayerConfig};
 
 use crate::json;
+#[cfg(feature = "video")]
 use serde_json::json;
 
 /// 一次流式播放的选项。
@@ -59,6 +64,8 @@ pub struct StreamOptions {
     ///
     /// 与 `video_frames` 一起用：前端拿到的是"带类型标签的包流"（见 `KIND_*`），
     /// 画面画到 canvas、PCM 喂给音频输出 —— 引擎自己解码，前端只负责放。
+    /// 只有出帧路径读它；纯 mux 构建保留字段是为了命令行参数形状不变。
+    #[allow(dead_code)]
     pub audio_pcm: bool,
     /// 从哪一刻开始（微秒）。`None` = 从能找到的第一个关键帧开始。
     pub seek_us: Option<i64>,
@@ -72,8 +79,39 @@ pub struct StreamOptions {
 /// 流式播放到 stdout，直到输入读完（或宿主关闭管道）。
 pub fn stream_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
     if opts.video_frames {
-        return frames_to_stdout(input, opts);
+        // 出帧模式只在编了视频模块时存在。纯 mux 构建没有解码器，宁可明确拒绝，
+        // 也不要退化成"把 fMP4 当成帧流"（那会让宿主的帧渲染器读到一堆垃圾）。
+        #[cfg(feature = "video")]
+        {
+            return frames_to_stdout(input, opts);
+        }
+        #[cfg(not(feature = "video"))]
+        {
+            return Err(crate::modules::disabled(
+                "视频解析（解码）",
+                "video",
+                "stream --video=frames",
+            ));
+        }
     }
+    #[cfg(feature = "mux")]
+    {
+        stream_fmp4(input, opts)
+    }
+    #[cfg(not(feature = "mux"))]
+    {
+        let _ = (input, opts);
+        Err(crate::modules::disabled(
+            "音视频合并",
+            "mux",
+            "stream（fMP4 转封装）",
+        ))
+    }
+}
+
+/// 默认模式：把输入转封装成分片 fMP4 交给宿主（不由引擎解码）。
+#[cfg(feature = "mux")]
+fn stream_fmp4(input: &str, opts: StreamOptions) -> Result<u8> {
     // 本地文件必须先存在。
     //
     // 为什么单独判：边下边播用的「增长文件源」**故意容忍文件还不存在**
@@ -87,7 +125,7 @@ pub fn stream_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
     }
     let client = me_stream::default_client()?;
     let opened = me_stream::open_input(&client, input, &opts.open)?;
-    let (src, dash_note) = pick_source(opened)?;
+    let (src, dash_note) = crate::source::pick_source(opened)?;
 
     // 播放缓冲给得小一些：流式播放的"缓冲"是管道对端的 MSE，
     // 引擎这边多攒一秒数据只会让内存白占、延迟变高
@@ -259,43 +297,11 @@ pub fn stream_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
 /// 一个永远不退出的僵尸进程。3 分钟足够覆盖"下载卡一下"的正常情形。
 const NEED_MORE_MAX_RETRIES: u32 = 360;
 
-/// 把打开结果收敛成"一条字节流 + 需要告知宿主的备注"。
-pub(crate) fn pick_source(opened: OpenedSource) -> Result<(Arc<dyn ReadAt>, Option<String>)> {
-    match opened {
-        OpenedSource::Single(s) => Ok((s, None)),
-        OpenedSource::Hls(h) => {
-            let note = if h.is_live {
-                Some("直播流：本版按当前快照播放，不做时移".to_string())
-            } else {
-                None
-            };
-            Ok((h.source, note))
-        }
-        OpenedSource::DashTracks(list) => {
-            // DASH 的视频与音频是两条独立字节流，播放窗一次只播一条。
-            if list.len() == 1 {
-                let t = list.into_iter().next().expect("刚判过");
-                return Ok((t.source, None));
-            }
-            let has_video = list.iter().any(|t| t.content_type == "video");
-            let note = format!(
-                "这份 DASH 有 {} 条轨（视频与音频分开），本流只含{}；要带声音请先用 mux 合并",
-                list.len(),
-                if has_video { "视频" } else { "音频" }
-            );
-            // 有画面优先：画面没声音还能看，只有声音算怎么回事
-            let pick = list.iter().position(|t| t.content_type == "video").unwrap_or(0);
-            let mut list = list;
-            let t = list.swap_remove(pick);
-            Ok((t.source, Some(note)))
-        }
-    }
-}
-
 /// 流式播放只支持 fMP4 装得下的编解码器；顺便拼出给 `SourceBuffer` 的 MIME。
 ///
 /// 装不下就返回 `Unsupported`（宿主据此回退到直接播放），**绝不硬凑**：
 /// 硬把 MP3 写成 fMP4 的 `mp4a` 只会得到一条解不出声的轨道。
+#[cfg(feature = "mux")]
 fn check_and_build_mime(tracks: &[Track]) -> Result<String> {
     let mut codecs: Vec<String> = Vec::new();
     let mut has_video = false;
@@ -337,6 +343,7 @@ fn check_and_build_mime(tracks: &[Track]) -> Result<String> {
 /// 这几个字符串是**浏览器的契约**：写错了 `addSourceBuffer` 直接抛
 /// `NotSupportedError`，播放不成立。所以每个字节都从 `extradata` 里取，
 /// 不猜、不省略。
+#[cfg(feature = "mux")]
 fn video_codec_string(codec: &CodecId, extradata: &[u8]) -> Result<String> {
     match codec {
         CodecId::H264 => {
@@ -408,6 +415,7 @@ fn video_codec_string(codec: &CodecId, extradata: &[u8]) -> Result<String> {
 ///
 /// `objectType` 从 `AudioSpecificConfig` 的前 5 位读；读不到就按最通用的
 /// AAC-LC（2）报 —— 这是绝大多数 AAC 的形态，报错反而让本来能播的流播不了。
+#[cfg(feature = "mux")]
 fn aac_codec_string(extradata: &[u8]) -> String {
     let aot = extradata.first().map(|b| b >> 3).unwrap_or(2);
     if aot == 0 || aot == 31 {
@@ -512,6 +520,7 @@ fn is_broken_pipe(e: &MediaError) -> bool {
 mod tests {
     use super::*;
 
+    #[cfg(feature = "mux")]
     fn track(kind: MediaKind, codec: CodecId, extradata: Vec<u8>) -> Track {
         let mut t = Track::new(1, kind, codec, Timebase::MPEG_TS);
         t.extradata = extradata;
@@ -519,6 +528,7 @@ mod tests {
     }
 
     /// 一个最小的 avcC（profile 0x64 / compat 0x00 / level 0x1F）。
+    #[cfg(feature = "mux")]
     fn avcc() -> Vec<u8> {
         let mut v = vec![1u8, 0x64, 0x00, 0x1F, 0xFF, 1];
         v.extend_from_slice(&2u16.to_be_bytes());
@@ -530,6 +540,7 @@ mod tests {
     }
 
     /// Annex-B 形态的参数集（TS 出来的 extradata 就长这样）。
+    #[cfg(feature = "mux")]
     fn annexb_params() -> Vec<u8> {
         // 复用 mux 里的转换：Annex-B → avcC，再手工拆回 Annex-B 没有意义，
         // 这里直接给一段"能被 split_annexb 拆出 SPS/PPS"的字节
@@ -538,6 +549,7 @@ mod tests {
         v
     }
 
+    #[cfg(feature = "mux")]
     #[test]
     fn h264_mime_comes_from_the_avcc_bytes() {
         let s = video_codec_string(&CodecId::H264, &avcc()).unwrap();
@@ -547,6 +559,7 @@ mod tests {
         assert!(s2.starts_with("avc1."), "{s2}");
     }
 
+    #[cfg(feature = "mux")]
     #[test]
     fn unsupported_video_codec_is_rejected_not_guessed() {
         let e = video_codec_string(&CodecId::Vp9, &[0x01, 0x00]).unwrap_err();
@@ -554,6 +567,7 @@ mod tests {
         assert!(e.to_string().contains("装不进 fMP4"), "{e}");
     }
 
+    #[cfg(feature = "mux")]
     #[test]
     fn aac_object_type_comes_from_asc_and_falls_back() {
         // AAC-LC：aot=2 → asc[0] = 00010xxx
@@ -565,6 +579,7 @@ mod tests {
         assert_eq!(aac_codec_string(&[0xF8, 0x00]), "mp4a.40.2");
     }
 
+    #[cfg(feature = "mux")]
     #[test]
     fn mime_joins_video_and_audio_codecs() {
         let tracks = vec![
@@ -575,6 +590,7 @@ mod tests {
         assert_eq!(mime, "video/mp4; codecs=\"avc1.64001F,mp4a.40.2\"");
     }
 
+    #[cfg(feature = "mux")]
     #[test]
     fn audio_only_input_gets_an_audio_mime() {
         let tracks = vec![track(MediaKind::Audio, CodecId::Aac, vec![0x12, 0x10])];
@@ -582,6 +598,7 @@ mod tests {
         assert!(mime.starts_with("audio/mp4"), "{mime}");
     }
 
+    #[cfg(feature = "mux")]
     #[test]
     fn non_aac_audio_does_not_block_the_video() {
         // MP3 声音装不进 fMP4：不能因此让整条流失败 —— 只丢声音
@@ -593,6 +610,7 @@ mod tests {
         assert_eq!(mime, "video/mp4; codecs=\"avc1.64001F\"");
     }
 
+    #[cfg(feature = "mux")]
     #[test]
     fn nothing_streamable_is_an_explicit_error() {
         let tracks = vec![track(MediaKind::Audio, CodecId::Mp3, vec![])];
@@ -618,18 +636,23 @@ mod tests {
 ///
 /// 为什么定长小端：前端（JS）用 DataView 两行就解出来，不需要任何解析库；
 /// 为什么带 pts：时钟长在包自己的时间戳上（音频当主时钟、画面跟随）。
+#[cfg(feature = "video")]
 pub const FRAME_HEADER_BYTES: usize = 28;
 /// 播放包魔数（前端拿它校验自己没跟丢字节）。
+#[cfg(feature = "video")]
 pub const FRAME_MAGIC: &[u8; 4] = b"MEV1";
 /// 包类型：画面（NV12）。
+#[cfg(feature = "video")]
 pub const KIND_VIDEO: u32 = 0;
 /// 包类型：声音（交织 S16LE PCM）。
+#[cfg(all(feature = "video", feature = "audio"))]
 pub const KIND_AUDIO: u32 = 1;
 
+#[cfg(feature = "video")]
 fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
     let client = me_stream::default_client()?;
     let opened = me_stream::open_input(&client, input, &opts.open)?;
-    let (src, dash_note) = pick_source(opened)?;
+    let (src, dash_note) = crate::source::pick_source(opened)?;
     // ⚠️ 缓冲窗口给到 **6 秒**（原来 1 秒）：见下面"音频优先"的长注释 ——
     // 宿主最多愿意把音频预读到播放头前 4 秒（`MAX_AUDIO_AHEAD_SEC`），
     // 引擎要能把这段音频"读出来"就得先读到它后面的视频采样。1 秒的窗口
@@ -648,15 +671,20 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
         None => (None, 0, me_core::Timebase::new(1_000_000)),
     };
 
-    // 音频（可选）：同一条流里发，前端按 kind 分流
+    // 音频（可选）：同一条流里发，前端按 kind 分流。
+    // 没编音频模块时 `audio_track` 恒为 None，下面的音频分支整段不参与编译。
+    #[cfg(feature = "audio")]
     let audio_track = if opts.audio_pcm {
         info.tracks.iter().find(|t| t.kind == MediaKind::Audio).cloned()
     } else {
         None
     };
+
     // 音频解码器起不来（编码还没接）**不该带走画面**：降级成"只出画面"，
     // 并在 meta.note 里说清楚少的是什么 —— 否则开了出帧模式放普通视频会整条流失败。
+    #[cfg(feature = "audio")]
     let mut audio_note: Option<String> = None;
+    #[cfg(feature = "audio")]
     let mut audio_decoder = match &audio_track {
         Some(t) => match me_decode::audio::open_audio_decoder(t.codec.clone(), &t.extradata) {
             Ok(d) => Some(d),
@@ -667,11 +695,20 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
         },
         None => None,
     };
-    if video_track.is_none() && audio_decoder.is_none() {
-        return Err(MediaError::Container(match &audio_note {
-            Some(n) => format!("{input}: 没有可播的轨道（{n}）"),
-            None => format!("{input}: 这条输入里没有可播的轨道"),
-        }));
+    if video_track.is_none() {
+        #[cfg(feature = "audio")]
+        {
+            return Err(MediaError::Container(match &audio_note {
+                Some(n) => format!("{input}: 没有可播的轨道（{n}）"),
+                None => format!("{input}: 这条输入里没有可播的轨道"),
+            }));
+        }
+        #[cfg(not(feature = "audio"))]
+        {
+            return Err(MediaError::Container(format!(
+                "{input}: 这条输入里没有可播的视频轨（当前构建未包含音频解析模块）"
+            )));
+        }
     }
 
     let out_tracks: Vec<Track> = video_track.iter().cloned().collect();
@@ -702,6 +739,7 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
         if video_track.is_none() {
             obj.insert("note".into(), json!("这条流只有声音（输入没有视频轨）"));
         }
+        #[cfg(feature = "audio")]
         match &audio_decoder {
             Some(dec) => {
                 let (rate, channels, bits) = dec.stream_info();
@@ -727,6 +765,13 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
                 obj.insert("note".into(), json!(note));
             }
         }
+        #[cfg(not(feature = "audio"))]
+        {
+            obj.insert(
+                "note".into(),
+                json!("画面由引擎解码（NV12 帧流）；当前构建未包含音频解析模块"),
+            );
+        }
     }
     println!("{}", json::progress_line("stream-meta", meta));
     std::io::stdout().flush()?;
@@ -741,7 +786,10 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
 
     let stderr = std::io::stderr();
     let mut frames = 0u64;
+    #[cfg(feature = "audio")]
     let mut audio_chunks = 0u64;
+    #[cfg(not(feature = "audio"))]
+    let audio_chunks = 0u64;
     // ⚠️ **音频优先**（2026-10-06，修"AV1+AAC 播放时音频跳帧"）：
     //
     // 解码是这条循环里最慢的一环（1080p AV1 软解 ~80ms/帧，比 33ms 的实时
@@ -765,6 +813,7 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
     let mut pending_video: std::collections::VecDeque<(i64, Vec<u8>)> =
         std::collections::VecDeque::new();
     let mut pending_bytes = 0usize;
+    #[cfg(feature = "audio")]
     let stdout = std::io::stdout();
     loop {
         let pkt = match player.next_packet() {
@@ -779,6 +828,7 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
             Err(e) => return Err(e),
         };
         // 音频包：解成 S16LE 直接发（与画面同一条流，按容器的顺序交错）
+        #[cfg(feature = "audio")]
         if let (Some(at), Some(dec)) = (&audio_track, audio_decoder.as_mut()) {
             if pkt.track_id == at.id {
                 let pts_us = at.timebase.ticks_to_us(pkt.pts);
@@ -828,7 +878,10 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
         }
         let pts_us = video_timebase.ticks_to_us(pkt.pts);
         // 音频还在跟的时候，视频先攒着（见上面"音频优先"的长注释）。
+        #[cfg(feature = "audio")]
         let audio_waiting = audio_track.is_some() && audio_decoder.is_some();
+        #[cfg(not(feature = "audio"))]
+        let audio_waiting = false;
         if !audio_waiting {
             // 没有音频要抢路：把攒着的先清掉，再照旧"读一个解一个"
             while let Some((pts, s)) = pending_video.pop_front() {
@@ -882,6 +935,7 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
         let _ = lock.flush();
         frames += 1;
     }
+    #[cfg(feature = "audio")]
     if let Some(dec) = audio_decoder.as_mut() {
         for chunk in dec.flush()? {
             let pcm = to_s16le(&chunk.samples, chunk.bits_per_sample);
@@ -908,6 +962,7 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
 ///
 /// 返回 `false` = 对端把管道关了（前端换 seek / 关窗）—— 调用方按**正常收尾**处理
 /// （与 `stream` 的 broken pipe 语义一致），不是错误。
+#[cfg(feature = "video")]
 fn decode_and_emit_video(
     vdec: &mut dyn me_decode::VideoDecoder,
     sample: &[u8],
@@ -942,6 +997,7 @@ fn decode_and_emit_video(
 ///
 /// 只做位移、不做抖动/重采样：解码器给多少位深，这里就按位对齐折算 ——
 /// 16 位原样、24 位丢最低 8 位、32 位丢最低 16 位、8 位补到高 8 位。
+#[cfg(all(feature = "video", feature = "audio"))]
 fn to_s16le(samples: &[i32], bits: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(samples.len() * 2);
     for s in samples {

@@ -155,7 +155,7 @@ zuvrust stream movie.mp4 --avail=/path/to/avail.json --wait-timeout=30000
 | Windows x86_64 | `zuvrust-windows-x86_64.tar.gz` |
 
 产物由 CI 在每个平台上**原生构建 + 跑完测试**之后才打包，并且打包后会再下载
-**产物本身**验一遍（架构、包内容、契约）。也就是说，从 Release 拿到的包是
+**产物本身**验一遍（架构、包内容、模块、契约）。也就是说，从 Release 拿到的包是
 "跑过测试且被独立验证过"的那一个。
 
 ---
@@ -163,12 +163,35 @@ zuvrust stream movie.mp4 --avail=/path/to/avail.json --wait-timeout=30000
 ## 构建与自测
 
 ```sh
-cargo build --release --bin zuvrust      # 产物在 target/release/zuvrust
+# 默认：三个模块全开（音频解析 + 视频解析 + 音视频合并）
+./scripts/build-modules.sh --release
 
-cargo test --workspace                   # 全量测试（单元 + 集成 + 契约）
+# 只构建应用真正用到的模块（可任意组合）
+./scripts/build-modules.sh --modules=mux --release
+./scripts/build-modules.sh --modules=audio,video --release
+./scripts/build-modules.sh --modules=audio            # 纯音频
+
+cargo test --workspace                   # 全量测试（模块全开的默认构建）
 ./scripts/check-arches.sh                # 用非本机架构编译一遍（见下）
-./scripts/verify-artifact.sh <包> zuvrust "<期望架构>"   # 验收打包产物
+./scripts/verify-artifact.sh <包> zuvrust "<期望架构>" "mux"   # 验收产物与模块
 ```
+
+模块就是 Cargo feature：
+
+| feature | 包含的能力 | 不含 |
+| --- | --- | --- |
+| `audio` | AAC / MP3 / FLAC / Opus 软解，`decode --audio` | 视频解码、合并 |
+| `video` | AV1 自研软解 + H.264 三平台硬解，`decode` / `stream --video=frames` | 音频解码、合并 |
+| `mux` | `probe` / `mux` / `remux` / `stream`（fMP4 转封装） | 任何解码器 |
+
+三个可以任意组合，默认全开。`probe`、`download`、`play` 属于基础层，始终保留。
+`zuvrust version --json` 的 `modules` 字段会如实报告这个二进制编了哪些模块；
+没编的命令会以退出码 2 明确报错，不会静默失败。
+
+**CI 按应用出产物**：桌面端（Lerxu）当前只用到合并（播放暂时停用），所以 Release
+里的五平台产物使用 `--modules=mux` 构建；需要完整能力时用 Actions 的
+"Run workflow" 手动选模块组合（非默认组合的产物名会带 `-audio-video-mux` 这类
+后缀，只上传 Actions artifact / 不进 Release）。
 
 **`check-arches.sh` 不是可选项**：引擎里大量 SIMD 实现按 `target_arch` 分叉，
 非 x86 的那一侧是**桩** —— 桩写错了在本机（Intel）永远浮现不出来，只有别的架构

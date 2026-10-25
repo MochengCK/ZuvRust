@@ -40,19 +40,34 @@
 //!   （每个 OBU 自带 `leb128` 长度），原样送进来，不做任何形态转换。
 //! - 输出帧：**紧凑 NV12**（Y 平面 w×h，CbCr 交织平面 (w/2)×h/2 行优先），
 //!   加上显示时间戳（微秒）。渲染层拿到它就能上屏（WebGL / 原生纹理都一样）。
+//!
+//! ## 按需构建
+//!
+//! `audio` / `video` 两个 feature 各自门控整块实现（默认全开）：
+//!
+//! ```sh
+//! cargo build -p me-cli --no-default-features --features audio  # 只有音频软解
+//! cargo build -p me-cli --no-default-features --features video  # 只有视频软解/硬解
+//! ```
+//!
+//! 两个都关掉时本 crate 不产生任何代码；`me-cli` 也不会依赖它。
 
+#[cfg(feature = "video")]
 use me_core::{CodecId, MediaError, Result};
 
+#[cfg(feature = "audio")]
 pub mod audio;
+#[cfg(feature = "video")]
 pub mod h264;
 
-#[cfg(target_os = "macos")]
+#[cfg(all(feature = "video", target_os = "macos"))]
 mod macos;
-#[cfg(target_os = "linux")]
+#[cfg(all(feature = "video", target_os = "linux"))]
 mod linux;
-#[cfg(target_os = "windows")]
+#[cfg(all(feature = "video", target_os = "windows"))]
 mod windows;
 
+#[cfg(feature = "video")]
 pub mod video;
 
 /// 一帧解码结果。
@@ -60,6 +75,7 @@ pub mod video;
 /// NV12 是刻意选的：它是所有平台解码器的"母语"（VideoToolbox / MediaCodec /
 /// D3D11 都直接产出），上屏时也正好是 GPU 最容易吃的格式 —— 引擎里不做
 /// 颜色空间转换，把这一步留给渲染层（那里是 GPU 的活）。
+#[cfg(feature = "video")]
 #[derive(Debug, Clone)]
 pub struct VideoFrame {
     pub width: u32,
@@ -70,6 +86,7 @@ pub struct VideoFrame {
     pub nv12: Vec<u8>,
 }
 
+#[cfg(feature = "video")]
 impl Drop for VideoFrame {
     fn drop(&mut self) {
         // 紧凑 NV12 是每帧 3 MB 的大缓冲，解码器每条路径都会**写满**它 ⇒
@@ -79,6 +96,7 @@ impl Drop for VideoFrame {
     }
 }
 
+#[cfg(feature = "video")]
 impl VideoFrame {
     /// 紧凑布局下 NV12 应有的字节数（诊断/校验用）。
     pub fn expected_len(width: u32, height: u32) -> usize {
@@ -90,6 +108,7 @@ impl VideoFrame {
 ///
 /// 同步接口：`decode` 返回这次调用**已经解出来**的帧（可能为空 —— 有 B 帧时
 /// 输入在先、输出在后，这是解码器的固有延迟，不是错误）。
+#[cfg(feature = "video")]
 pub trait VideoDecoder: Send {
     /// 喂一个采样（AVCC），返回此次新解出的帧。
     fn decode(&mut self, sample_avcc: &[u8], pts_us: i64) -> Result<Vec<VideoFrame>>;
@@ -106,6 +125,7 @@ pub trait VideoDecoder: Send {
 /// 为什么要有"仅硬解"这一档：硬解在少数素材上有兼容问题（花屏），而软解又慢得多。
 /// 三档把选择权交给用户：自适应（默认，能硬解就硬解）、仅硬解（**起不来就报错**，
 /// 不静默掉到慢路）、仅软解（完全不碰硬件解码器，用于排查"是不是硬解的锅"）。
+#[cfg(feature = "video")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DecodeMode {
     /// 自适应：优先硬解，起不来落自研软解
@@ -122,6 +142,7 @@ pub enum DecodeMode {
 /// - `ME_NO_HW`（旧名，值任意）等价于 `ME_DECODE=software` —— 留着是为了不打破
 ///   已经在用它的脚本与文档；两个都设时以旧名为准（它更"强"）。
 /// - 认不出来的值按自适应走并**告警**，不静默按某个方向解。
+#[cfg(feature = "video")]
 pub fn decode_mode() -> DecodeMode {
     parse_decode_mode(
         std::env::var("ME_DECODE").ok().as_deref(),
@@ -130,6 +151,7 @@ pub fn decode_mode() -> DecodeMode {
 }
 
 /// [`decode_mode`] 的纯函数部分（不碰进程环境，好写好测）。
+#[cfg(feature = "video")]
 fn parse_decode_mode(me_decode: Option<&str>, no_hw: bool) -> DecodeMode {
     if no_hw {
         return DecodeMode::Software;
@@ -151,11 +173,13 @@ fn parse_decode_mode(me_decode: Option<&str>, no_hw: bool) -> DecodeMode {
 /// `config` 是该编码的**解码器初始化数据**（H.264 = `avcC`、AV1 = `av1C`），
 /// 由容器层给出、`me-mux::convert` 归一化成各自的标准形态（AV1 本来就是
 /// `av1C`，没有 Annex-B 形态，所以是原样透传）。
+#[cfg(feature = "video")]
 pub fn open_video_decoder(codec: CodecId, config: &[u8]) -> Result<Box<dyn VideoDecoder>> {
     open_with_mode(decode_mode(), codec, config)
 }
 
 /// [`open_video_decoder`] 的实现（模式显式传入 —— 测试要能点名三档各自的行为）。
+#[cfg(feature = "video")]
 fn open_with_mode(mode: DecodeMode, codec: CodecId, config: &[u8]) -> Result<Box<dyn VideoDecoder>> {
     let use_hardware = mode != DecodeMode::Software;
     match codec {
@@ -267,6 +291,7 @@ fn open_with_mode(mode: DecodeMode, codec: CodecId, config: &[u8]) -> Result<Box
 }
 
 /// 当前平台可用的硬解后端名字（诊断/日志）。
+#[cfg(feature = "video")]
 pub fn hardware_backend() -> &'static str {
     #[cfg(target_os = "macos")]
     {
@@ -291,6 +316,7 @@ pub fn hardware_backend() -> &'static str {
 /// 与 [`open_video_decoder`] 的分工：这个回答"有没有硬件解码器"（决定"能不能
 /// 硬解"），后者负责"实际打开一个解码器"（可能是硬解，也可能是自研软解）。
 /// 日志与错误文案拿它来说清"为什么这台机器播不了 AV1"。
+#[cfg(feature = "video")]
 pub fn hardware_decode_available(codec: &CodecId) -> bool {
     #[cfg(target_os = "macos")]
     {
@@ -311,7 +337,7 @@ pub fn hardware_decode_available(codec: &CodecId) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "video"))]
 mod tests {
     use super::*;
 

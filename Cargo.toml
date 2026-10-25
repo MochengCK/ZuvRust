@@ -55,9 +55,10 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 # 内部 crate
 me-core = { path = "crates/me-core" }
 me-container = { path = "crates/me-container" }
-me-mux = { path = "crates/me-mux" }
+# 两个可选能力 crate 默认不替调用方打开模块：由 me-cli 的 feature 决定。
+me-mux = { path = "crates/me-mux", default-features = false }
 me-net = { path = "crates/me-net" }
 me-bt = { path = "crates/me-bt" }
 me-stream = { path = "crates/me-stream" }
-me-decode = { path = "crates/me-decode" }
+me-decode = { path = "crates/me-decode", default-features = false }
 me-cli = { path = "crates/me-cli" }

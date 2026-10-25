@@ -10,6 +10,7 @@ use me_core::{MediaError, MediaInfo, ReadAt, Result};
 
 use crate::exit_code;
 use crate::json;
+#[cfg(feature = "mux")]
 use crate::mux;
 use crate::progress::Progress;
 
@@ -19,12 +20,32 @@ pub fn dispatch(args: &[String]) -> Result<u8> {
     match cmd.as_str() {
         "version" => cmd_version(rest),
         "probe" => cmd_probe(rest),
+        #[cfg(feature = "mux")]
         "mux" => cmd_mux(rest),
+        #[cfg(not(feature = "mux"))]
+        "mux" => Err(crate::modules::disabled("音视频合并", "mux", "mux")),
+        #[cfg(feature = "mux")]
         "remux" => cmd_remux(rest),
+        #[cfg(not(feature = "mux"))]
+        "remux" => Err(crate::modules::disabled("音视频合并", "mux", "remux")),
         "download" => cmd_download(rest),
         "play" => cmd_play(rest),
+        #[cfg(any(feature = "mux", feature = "video"))]
         "stream" => cmd_stream(rest),
+        #[cfg(not(any(feature = "mux", feature = "video")))]
+        "stream" => Err(crate::modules::disabled(
+            "视频解析或音视频合并",
+            "video,mux",
+            "stream",
+        )),
+        #[cfg(any(feature = "audio", feature = "video"))]
         "decode" => cmd_decode(rest),
+        #[cfg(not(any(feature = "audio", feature = "video")))]
+        "decode" => Err(crate::modules::disabled(
+            "音频或视频解析",
+            "audio,video",
+            "decode",
+        )),
         other => Err(MediaError::Unsupported(format!("未知子命令 `{other}`"))),
     }
 }
@@ -61,9 +82,24 @@ fn has_flag(args: &[String], flag: &str) -> bool {
 }
 
 fn cmd_version(args: &[String]) -> Result<u8> {
+    // 能力清单必须与**这个二进制实际编进来的模块**一致：宿主据此决定哪些按钮
+    // 可点。写死一份全量清单会让裁剪版在界面上"看起来支持"，点了才报错。
+    let mut features = vec!["probe"];
+    #[cfg(feature = "mux")]
+    {
+        features.extend(["remux", "mux", "concat"]);
+    }
+    features.extend(["download", "play", "growing-file"]);
+    #[cfg(feature = "audio")]
+    features.push("decode-audio");
+    #[cfg(feature = "video")]
+    features.push("decode-video");
+
     let v = serde_json::json!({
         "name": "ZuvRust",
         "version": env!("CARGO_PKG_VERSION"),
+        // 这个构建编进来的模块（audio / video / mux 的子集）。
+        "modules": crate::modules::compiled_modules(),
         // 这两个列表是宿主"能力探测"的依据：界面据此决定哪些按钮可点。
         // `flac` / `adts` / `mpeg-audio` 是"裸流"（没有容器壳，只有一串首尾相接的音频帧）；
         // `ogg` 是真正的容器（页序列，`.opus` 就是它装 Opus）；
@@ -71,7 +107,7 @@ fn cmd_version(args: &[String]) -> Result<u8> {
         "containers": ["mpeg-ts", "iso-bmff", "matroska", "ogg", "flac", "adts", "mpeg-audio"],
         "protocols": ["http", "hls", "dash"],
         // `concat` = mux 能把同角色的多个输入（分片/分段）按顺序接成一条连续时间轴
-        "features": ["probe", "remux", "mux", "concat", "download", "play", "growing-file"],
+        "features": features,
         // 边下边播的契约：媒体引擎读"下载引擎正在写的文件"，并上报播放头。
         // BT 下载本身由下载引擎（XferRust）负责，不在本引擎里。
         "streaming": {
@@ -194,6 +230,7 @@ fn kind_name(k: me_core::MediaKind) -> &'static str {
 ///
 /// 输入个数**不设上限也不假设含义**：谁是画面、谁是声音由引擎探测，同角色的
 /// 多个输入按传入顺序接起来（见 [`crate::mux`]）。所以一个输入也合法（重封装）。
+#[cfg(feature = "mux")]
 fn cmd_mux(args: &[String]) -> Result<u8> {
     let pos = positional(args);
     if pos.len() < 2 {
@@ -207,6 +244,7 @@ fn cmd_mux(args: &[String]) -> Result<u8> {
 }
 
 /// `remux <输出> <输入>`：换容器重新封装（不重编码）。
+#[cfg(feature = "mux")]
 fn cmd_remux(args: &[String]) -> Result<u8> {
     let pos = positional(args);
     if pos.len() < 2 {
@@ -217,6 +255,7 @@ fn cmd_remux(args: &[String]) -> Result<u8> {
     mux_files(args, pos[0], &pos[1..2])
 }
 
+#[cfg(feature = "mux")]
 fn mux_files(args: &[String], output: &str, inputs: &[&str]) -> Result<u8> {
     let cancel = me_stream::CancelFlag::install();
     let client = me_stream::default_client()?;
@@ -399,8 +438,8 @@ fn cmd_play(args: &[String]) -> Result<u8> {
     Ok(exit_code::OK)
 }
 
-/// `stream <输入>`：**流式播放** —— stdout 吐"一行元信息 + 分片 fMP4 字节"，
-/// stderr 吐播放头（NDJSON）。宿主播放器把字节喂给 MSE，只负责解码。
+/// `decode <输入>`：解视频轨出帧，或 `--audio` 解音频轨出 WAV。
+#[cfg(any(feature = "audio", feature = "video"))]
 fn cmd_decode(args: &[String]) -> Result<u8> {
     let pos = positional(args);
     let Some(input) = pos.first() else {
@@ -408,9 +447,22 @@ fn cmd_decode(args: &[String]) -> Result<u8> {
             "decode 需要一个输入（文件路径或 URL）".into(),
         ));
     };
+    let audio = has_flag(args, "--audio");
+    #[cfg(not(feature = "audio"))]
+    if audio {
+        return Err(crate::modules::disabled(
+            "音频解析（解码）",
+            "audio",
+            "decode --audio",
+        ));
+    }
+    #[cfg(not(feature = "video"))]
+    if !audio {
+        return Err(crate::modules::disabled("视频解析（解码）", "video", "decode"));
+    }
     let cancel = me_stream::CancelFlag::install();
     let opts = crate::decode::DecodeOptions {
-        audio: has_flag(args, "--audio"),
+        audio,
         out_dir: opt(args, "out").map(|s| s.to_string()),
         max_frames: opt(args, "count").and_then(|v| v.parse::<u64>().ok()),
         seek_us: opt(args, "seek")
@@ -425,6 +477,9 @@ fn cmd_decode(args: &[String]) -> Result<u8> {
     crate::decode::decode_to_frames(input, opts)
 }
 
+/// `stream <输入>`：**流式播放** —— stdout 吐"一行元信息 + 分片 fMP4 字节"，
+/// stderr 吐播放头（NDJSON）。宿主播放器把字节喂给 MSE，只负责解码。
+#[cfg(any(feature = "mux", feature = "video"))]
 fn cmd_stream(args: &[String]) -> Result<u8> {
     let pos = positional(args);
     let Some(input) = pos.first() else {
@@ -563,17 +618,55 @@ mod tests {
 
     #[test]
     fn subcommands_validate_their_arguments() {
-        for cmd in ["mux", "remux", "download", "play", "probe"] {
+        for cmd in ["download", "play", "probe"] {
             let e = dispatch(&s(&[cmd])).unwrap_err();
             assert!(matches!(e, MediaError::Unsupported(_)), "{cmd} 缺参数时该报用法错误");
             assert_eq!(exit_code_of(&e), exit_code::USAGE, "{cmd}");
         }
-        // mux 至少要有一个输入（只给输出不够）
-        let e = dispatch(&s(&["mux", "out.mp4"])).unwrap_err();
-        assert!(matches!(e, MediaError::Unsupported(_)));
-        // 一个输入是合法的（重封装/单文件换容器），不该在参数校验就拦下
-        let e = dispatch(&s(&["mux", "out.mp4", "/definitely/not/here.ts"])).unwrap_err();
-        assert!(!matches!(e, MediaError::Unsupported(_)), "一个输入不该被判成用法错误：{e}");
+        #[cfg(feature = "mux")]
+        {
+            for cmd in ["mux", "remux"] {
+                let e = dispatch(&s(&[cmd])).unwrap_err();
+                assert!(matches!(e, MediaError::Unsupported(_)), "{cmd} 缺参数时该报用法错误");
+                assert_eq!(exit_code_of(&e), exit_code::USAGE, "{cmd}");
+            }
+            // mux 至少要有一个输入（只给输出不够）
+            let e = dispatch(&s(&["mux", "out.mp4"])).unwrap_err();
+            assert!(matches!(e, MediaError::Unsupported(_)));
+            // 一个输入是合法的（重封装/单文件换容器），不该在参数校验就拦下
+            let e = dispatch(&s(&["mux", "out.mp4", "/definitely/not/here.ts"])).unwrap_err();
+            assert!(!matches!(e, MediaError::Unsupported(_)), "一个输入不该被判成用法错误：{e}");
+        }
+    }
+
+    /// 裁剪版不能"命令消失"或"报内部错误"：宿主只认退出码与错误行，
+    /// 必须明确告诉它"这个二进制没编这块"（用法错误，重试无用）。
+    #[cfg(not(feature = "mux"))]
+    #[test]
+    fn missing_mux_module_is_a_usage_error() {
+        for cmd in ["mux", "remux"] {
+            let e = dispatch(&s(&[cmd])).unwrap_err();
+            assert_eq!(exit_code_of(&e), exit_code::USAGE, "{cmd}");
+            assert!(e.to_string().contains("--features mux"), "{e}");
+        }
+    }
+
+    #[cfg(not(feature = "audio"))]
+    #[test]
+    fn missing_audio_module_is_a_usage_error() {
+        let e = dispatch(&s(&["decode", "x.mp4", "--audio"])).unwrap_err();
+        assert_eq!(exit_code_of(&e), exit_code::USAGE);
+        let text = e.to_string();
+        assert!(text.contains("--features") && text.contains("audio"), "{text}");
+    }
+
+    #[cfg(not(feature = "video"))]
+    #[test]
+    fn missing_video_module_is_a_usage_error() {
+        let e = dispatch(&s(&["decode", "x.mp4"])).unwrap_err();
+        assert_eq!(exit_code_of(&e), exit_code::USAGE);
+        let text = e.to_string();
+        assert!(text.contains("--features") && text.contains("video"), "{text}");
     }
 
     #[test]

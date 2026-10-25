@@ -14,24 +14,42 @@
 //!   fMP4 里是裸帧），转换由这里的封装器负责；
 //! - 产物要么是**正确的**，要么**报错** —— 绝不静默产出坏文件；
 //! - 封装器**直写落点**（见 [`sink`]）：产物不攒在内存里，内存占用与产物大小无关。
+//!
+//! `convert` 永远可用；其余封装器由 `mux` feature 门控（默认开启）。只做解码/
+//! 播放的构建可以关掉它，省下整个写方向。
 
-pub mod adts;
 pub mod convert;
+
+#[cfg(feature = "mux")]
+pub mod adts;
+#[cfg(feature = "mux")]
 pub mod flac;
+#[cfg(feature = "mux")]
 pub mod interleave;
+#[cfg(feature = "mux")]
 pub mod mkv;
+#[cfg(feature = "mux")]
 pub mod mp4;
+#[cfg(feature = "mux")]
 pub mod sink;
+#[cfg(feature = "mux")]
 pub mod ts;
 
+#[cfg(feature = "mux")]
 pub use adts::AdtsMuxer;
 pub use convert::{
     annexb_to_avcc, annexb_to_avcc_extradata, avcc_to_annexb, avcc_to_annexb_extradata,
     extradata_to_annexb, extradata_to_avcc, looks_like_avcc, nal_length_size,
 };
+#[cfg(feature = "mux")]
 pub use flac::FlacMuxer;
+#[cfg(feature = "mux")]
 pub use interleave::{interleave_all, Interleaver};
+#[cfg(feature = "mux")]
 pub use mkv::{DocType, MkvMuxer};
+#[cfg(feature = "mux")]
 pub use mp4::Mp4Muxer;
+#[cfg(feature = "mux")]
 pub use sink::Sink;
+#[cfg(feature = "mux")]
 pub use ts::TsMuxer;

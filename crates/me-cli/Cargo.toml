@@ -9,13 +9,45 @@ description = "ZuvRust 通信层端点：zuvrust 可执行文件"
 name = "zuvrust"
 path = "src/main.rs"
 
+# 应用只需要自己用到的模块：`mux` = 合并/转封装，`audio` / `video` = 解码。
+# 默认全开；桌面端当前只用到 `mux`（播放暂时停用），CI 会按 `--features mux`
+# 出产物，其余组合留给其它应用与本地开发。
+[features]
+default = ["audio", "video", "mux"]
+audio = ["dep:me-decode", "me-decode/audio"]
+video = ["dep:me-decode", "me-decode/video", "dep:me-mux"]
+mux = ["dep:me-mux", "me-mux/mux"]
+
 [dependencies]
 me-core = { workspace = true }
 me-container = { workspace = true }
-me-mux = { workspace = true }
 me-stream = { workspace = true }
-me-decode = { workspace = true }
 me-net = { workspace = true }
+# 音视频解码：两个模块都不开时连 crate 都不编。
+me-decode = { workspace = true, optional = true, default-features = false }
+# `convert` 也供解码路径做 Annex-B ↔ AVCC 转换；只有 `mux` 才带上封装器。
+me-mux = { workspace = true, optional = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+
+# 集成测试各自点名需要的模块：Cargo 的 required-features 会跳过不满足的组合。
+[[test]]
+name = "cli_contract"
+required-features = ["mux"]
+
+[[test]]
+name = "av1_pipeline"
+required-features = ["video", "mux"]
+
+[[test]]
+name = "lossless"
+required-features = ["mux"]
+
+[[test]]
+name = "mux_cli"
+required-features = ["mux"]
+
+[[test]]
+name = "mux_scenarios"
+required-features = ["mux"]

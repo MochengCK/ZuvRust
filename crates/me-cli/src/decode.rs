@@ -16,17 +16,21 @@
 //! `--out=<目录>` 时每一帧落一个 `<目录>/frame-000001.nv12`（紧凑 NV12），
 //! 旁边一个 `frames.json` 记每帧的时间戳与大小 —— 校验解码对不对就靠它。
 
+#[cfg(feature = "video")]
 use std::io::Write;
 use std::time::Instant;
 
-use me_core::{CodecId, MediaError, MediaKind, Result};
+#[cfg(feature = "video")]
+use me_core::CodecId;
+use me_core::{MediaError, MediaKind, Result};
+#[cfg(feature = "video")]
 use me_mux::convert;
 use me_stream::{OpenOptions, Player, PlayerConfig};
 
 use crate::json;
 
 /// 真实素材的验收（手工跑，见文件末尾的 `real_av1_tests`）。
-#[cfg(test)]
+#[cfg(all(test, feature = "video"))]
 mod real_av1_tests {
     use super::*;
     use me_decode::video::context::CdfContext;
@@ -49,7 +53,7 @@ mod real_av1_tests {
     fn open_video(input: &str) -> (Player, u32, Vec<u8>) {
         let client = me_stream::default_client().unwrap();
         let opened = me_stream::open_input(&client, input, &OpenOptions::default()).unwrap();
-        let (src, _note) = crate::stream::pick_source(opened).unwrap();
+        let (src, _note) = crate::source::pick_source(opened).unwrap();
         let cfg = PlayerConfig { max_buffer_us: 1_000_000, max_buffer_packets: 1024 };
         let player = Player::open(src, input, cfg).unwrap();
         let (track_id, config) = {
@@ -2169,6 +2173,7 @@ mod real_av1_tests {
 /// 容器里存的可能是 `avcC`（MP4）或 Annex-B 的 SPS/PPS（TS），统一成 `avcC` ——
 /// 解码层只认这一种。**AV1 例外**：它是 OBU 流，没有 Annex-B 形态，`av1C`
 /// 原样送进解码层（见 `me_mux::convert::extradata_to_avcc`）。
+#[cfg(feature = "video")]
 pub(crate) fn video_track_and_config(
     info: &me_core::MediaInfo,
     name: &str,
@@ -2200,6 +2205,8 @@ pub struct DecodeOptions {
     /// 帧落盘目录（None = 只统计，不落盘）。
     pub out_dir: Option<String>,
     /// 最多解多少帧（None = 整条轨）。
+    /// 只有视频路径读它；纯音频构建保留字段是为了命令行参数形状不变。
+    #[allow(dead_code)]
     pub max_frames: Option<u64>,
     /// 从哪一刻开始（微秒；None = 从头）。
     pub seek_us: Option<i64>,
@@ -2209,11 +2216,36 @@ pub struct DecodeOptions {
 /// 解出视频帧（并可选落盘）。
 pub fn decode_to_frames(input: &str, opts: DecodeOptions) -> Result<u8> {
     if opts.audio {
-        return decode_audio(input, opts);
+        #[cfg(feature = "audio")]
+        {
+            return decode_audio(input, opts);
+        }
+        #[cfg(not(feature = "audio"))]
+        {
+            return Err(crate::modules::disabled(
+                "音频解析（解码）",
+                "audio",
+                "decode --audio",
+            ));
+        }
     }
+    #[cfg(feature = "video")]
+    {
+        decode_video(input, opts)
+    }
+    #[cfg(not(feature = "video"))]
+    {
+        let _ = (input, opts);
+        Err(crate::modules::disabled("视频解析（解码）", "video", "decode"))
+    }
+}
+
+/// 视频模式：把视频轨解成 NV12 帧（`--out` 是目录）。
+#[cfg(feature = "video")]
+fn decode_video(input: &str, opts: DecodeOptions) -> Result<u8> {
     let client = me_stream::default_client()?;
     let opened = me_stream::open_input(&client, input, &opts.open)?;
-    let (src, _note) = super::stream::pick_source(opened)?;
+    let (src, _note) = crate::source::pick_source(opened)?;
     // 解码不需要"边下边播"的缓冲：来一个采样解一个
     let cfg = PlayerConfig { max_buffer_us: 1_000_000, max_buffer_packets: 1024 };
     let mut player = Player::open(src, input, cfg)?;
@@ -2336,15 +2368,17 @@ pub fn decode_to_frames(input: &str, opts: DecodeOptions) -> Result<u8> {
 }
 
 /// 到帧数上限了吗（到就把 `frames` 停在边界，调用方负责跳出）。
+#[cfg(feature = "video")]
 fn max_reached(frames: &mut u64, max: Option<u64>) -> bool {
     matches!(max, Some(m) if *frames >= m)
 }
 
 /// 音频模式：把音频轨解成 PCM 写成 WAV（校验解码器、也给人一个"能听"的产物）。
+#[cfg(feature = "audio")]
 fn decode_audio(input: &str, opts: DecodeOptions) -> Result<u8> {
     let client = me_stream::default_client()?;
     let opened = me_stream::open_input(&client, input, &opts.open)?;
-    let (src, _note) = super::stream::pick_source(opened)?;
+    let (src, _note) = crate::source::pick_source(opened)?;
     let cfg = PlayerConfig { max_buffer_us: 1_000_000, max_buffer_packets: 1024 };
     let mut player = Player::open(src, input, cfg)?;
     let info = player.info();

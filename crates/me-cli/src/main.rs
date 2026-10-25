@@ -20,11 +20,20 @@
 use std::process::ExitCode;
 
 mod commands;
+#[cfg(any(feature = "audio", feature = "video"))]
 mod decode;
 mod json;
+#[cfg(feature = "mux")]
 mod mux;
+mod modules;
 mod progress;
+#[cfg(any(feature = "audio", feature = "video", feature = "mux"))]
+mod source;
+// `stream` 的两条路各有依赖：默认出 fMP4 要 mux，`--video=frames` 要 video。
+// 纯音频构建（decode --audio）不需要它，`pick_source` 已抽到 `source`。
+#[cfg(any(feature = "mux", feature = "video"))]
 mod stream;
+#[cfg(feature = "audio")]
 mod wav;
 
 /// 退出码是**对外契约**的一部分：宿主靠它区分"地址有问题"与"引擎自己坏了"。
@@ -142,23 +151,46 @@ fn init_tracing(args: &[String]) {
 }
 
 fn print_usage() {
-    println!(
+    let mut text = String::from(
         r#"zuvrust —— 自研媒体引擎（独立进程，通过命令行通信）
 
 用法: zuvrust <子命令> [参数...] [--json]
 
 子命令:
   probe <输入>                 探测容器与轨道信息
-  mux   <输出> <输入>...       合并成一个文件（角色由探测决定，同角色按顺序串接）
+"#,
+    );
+    #[cfg(feature = "mux")]
+    text.push_str(
+        r#"  mux   <输出> <输入>...       合并成一个文件（角色由探测决定，同角色按顺序串接）
   remux <输出> <输入>          换个容器重新封装（不重编码）
-  download <地址> [--out=路径]  下载（HTTP / HLS / DASH；磁力由下载引擎负责）
+"#,
+    );
+    text.push_str(
+        r#"  download <地址> [--out=路径]  下载（HTTP / HLS / DASH；磁力由下载引擎负责）
   play  <输入> [--seek=秒]      播放数据源（边下边播时给宿主喂采样）
-  stream <输入> [--seek=秒]     流式播放：一行元信息 + 分片 fMP4 字节（宿主喂 MSE）
+"#,
+    );
+    #[cfg(any(feature = "mux", feature = "video"))]
+    text.push_str(
+        r#"  stream <输入> [--seek=秒]     流式播放：一行元信息 + 分片 fMP4 字节（宿主喂 MSE）
                                 stream 支持 --avail=<文件>：可用性图（哪些字节已下到，空洞会等）
                                 stream 支持 --wait-timeout=<毫秒>：等数据的上限（默认 30000）
-  decode <输入> [--count=N]     把视频轨解成帧（播放内核的"解码"这块；--out=目录 落盘）
-                               --audio 解音频轨（自研软解）写成 WAV：--audio --out=x.wav
-  version                      打印版本与支持的容器/协议
+"#,
+    );
+    #[cfg(feature = "audio")]
+    text.push_str(
+        r#"  decode <输入> --audio --out=<wav>  解音频轨写成 WAV（自研软解）
+"#,
+    );
+    #[cfg(feature = "video")]
+    text.push_str(
+        r#"  decode <输入> [--count=N]     把视频轨解成帧（--out=目录 落盘）
+                               --video=frames 与 stream 一起用：出解码后的 NV12 帧流
+"#,
+    );
+    text.push_str(
+        r#"  version                      打印版本、已构建模块与支持的容器/协议
 
 通用选项:
   --version, -V                与 `version` 子命令等价（GNU 惯例）
@@ -169,6 +201,10 @@ fn print_usage() {
 退出码:
   0 成功   2 用法错误   3 输入不可用（重试无用）
   4 临时失败（可重试）   5 引擎内部错误   6 已取消
-"#
+
+本构建包含的模块: "#,
     );
+    text.push_str(&crate::modules::compiled_modules().join(", "));
+    text.push('\n');
+    println!("{text}");
 }

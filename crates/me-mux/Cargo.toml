@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 description = "合并层：多轨交织与 MPEG-TS / fMP4 封装"
 
+# `mux` 门控所有封装器；关掉时只剩 `convert`（解码/播放路径要用它做形态转换，
+# 但不需要任何容器封装代码）。me-cli 的 audio/video-only 构建就是这种形态。
+[features]
+default = ["mux"]
+mux = []
+
 [dependencies]
 me-core = { workspace = true }
 me-container = { workspace = true }
