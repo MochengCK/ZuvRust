@@ -5217,6 +5217,27 @@ pub(crate) unsafe fn cdef_pair16(
 ) {
 }
 
+/// 非 x86_64 的 CDEF U/V 4×4 桩（见 [`cdef_pair16`] 的同名桩）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn cdef_quad8_uv(
+    _du: &[u16],
+    _dv: &[u16],
+    _stride: isize,
+    _x0: isize,
+    _y0: isize,
+    _offs: &[isize; CDEF_CANDS],
+    _taps: &[i32; CDEF_CANDS],
+    _pri_thr: i32,
+    _pri_adj: u32,
+    _sec_thr: i32,
+    _sec_adj: u32,
+    _dst_u: *mut u16,
+    _dst_v: *mut u16,
+    _dst_stride: isize,
+) {
+}
+
 /// 非 x86_64 的 CDEF 4×4 桩（见 [`cdef_pair16`] 的同名桩）。
 #[cfg(not(target_arch = "x86_64"))]
 #[allow(clippy::too_many_arguments)]
