@@ -197,7 +197,7 @@ the protocol reference, and the `sdk/js` client source.
   providing one integration endpoint.
 
 More internal invariants, performance data and engineering notes:
-[DEVELOPMENT.md](DEVELOPMENT.md). AV1 conformance audit: [AV1-AUDIT.md](AV1-AUDIT.md).
+[DEVELOPMENT.md](DEVELOPMENT.md).
 
 ## License
 

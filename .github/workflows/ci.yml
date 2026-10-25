@@ -25,7 +25,7 @@ name: CI
 # 所以这里把"会进产物 / 会被 CI 用到"的东西逐个列出来，加新的构建输入时
 # 必须一起加这里。
 #
-# 不触发的（故意的）：`*.md`（README / AV1-AUDIT / *-HANDOFF）、`LICENSE`、
+# 不触发的（故意的）：`*.md`（README / API / DEVELOPMENT）、`LICENSE`、
 # `.gitignore`、`tools/`（分析脚本，不参与构建与测试）。
 # ⚠️ 代价要说清楚：只改文档时 `release` 作业也不会跑，草稿 Release 的说明不会更新。
 #    需要更新时用 Actions 页面的 "Run workflow"（`workflow_dispatch`）手动触发。

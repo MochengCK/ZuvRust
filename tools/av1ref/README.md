@@ -327,7 +327,7 @@ python attr_by_frame.py --frames 8
 | 关 OBMC | 0 | 3 | 6 | — | 与"现在"几乎相同 ⇒ OBMC 已无残差 |
 
 剩下的两块（**2026-10-03 全部修完，真素材 60 帧逐像素一致** —— 结论与证据见
-`ROWMT-REGRESS-HANDOFF.md` 的"收尾"一节，根因都不是猜的那两个）：
+`内部回归记录` 的"收尾"一节，根因都不是猜的那两个）：
 
 - **亮度**（曾是块级 LOCALWARP 的锅）：真根因是 warp 的取整用了 `Round2Signed`，
   规范 §4.7 的 `Round2` 与 dav1d 的 `FILTER_WARP_RND` 都是"加半再**算术右移**"
@@ -349,7 +349,7 @@ alt-ref 也在内、按解码序）把该点周围 `(2r+1)²` 的 Y/U/V 打一�
 ```sh
 # 我们（1 = 半径，即 3×3；中心是亮度坐标）
 ME_THREADS=1 AV1_TRACE_REGION=1240,804,16 zuvrust decode in.mp4 --count=14 --out=/tmp/r >/dev/null 2>/tmp/me.log
-# 参考（libaom 侧的同名插桩，见 ROWMT-REGRESS-HANDOFF.md）
+# 参考（libaom 侧的同名插桩，见 内部回归记录）
 LERXU_FREG=1240,804,16 aomdec --threads=1 --row-mt=0 --i420 --rawvideo --limit=14 -o /tmp/ref.yuv in.ivf 2>/tmp/aom.log
 ```
 

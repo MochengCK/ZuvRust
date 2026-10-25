@@ -21,7 +21,7 @@
 ## 用法
 
 ```sh
-P=/Users/zzzz/.workbuddy/binaries/python/envs/default/bin/python
+P=python3
 $P tools/h264ref/make_cases.py --out=/tmp/h264cases
 ./target/debug/zuvrust decode /tmp/h264cases/nodeblock_detail.mp4 --count=4 --out=/tmp/out --json
 $P tools/h264ref/refcmp.py /tmp/h264cases/nodeblock_detail.mp4 --dir=/tmp/out --noflt --map

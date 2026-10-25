@@ -34,5 +34,4 @@ cd ../.. && AV1_PROBE_DIR=/tmp/av1out ~/.cargo/bin/cargo test -p me-cli \
   `me-cli` 的 `bundled_probe_streams_pass_exit_symbol_exactly`（不需要 Chrome）。
 
 `AV1_TRACE_FH` / `AV1_TRACE_PART` / `AV1_TRACE_MODE` / `AV1_TRACE_TXB` / `AV1_TRACE_SYM`
-五个环境变量能把解码过程逐层打印出来，用法见
-`~/.workbuddy/skills/lerxu-av1-softdecode/SKILL.md` 的 §4c。
+五个环境变量能把解码过程逐层打印出来（打印点就在解码器对应的阶段函数里）。

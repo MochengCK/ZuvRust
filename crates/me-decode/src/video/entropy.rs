@@ -1218,7 +1218,7 @@ mod tests {
     ///
     /// 改动解析器后重跑生成命令（脚本在技能目录里）：
     /// ```text
-    /// python3 ~/.workbuddy/skills/lerxu-av1-softdecode/av1_entropy_ref.py
+    /// python3 tools/av1probe/required_bits.py   # 与 Rust 侧同一判据的独立复算
     /// ```
     /// 把输出里的 symbols / cdf_after / end 状态抄回上面的向量。
     #[test]

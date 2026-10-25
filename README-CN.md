@@ -181,7 +181,6 @@ CI 在每个平台原生构建并跑完测试，再下载**产物本身**做架�
 - JSON-RPC 服务是子进程监督者：既保留进程隔离，又只暴露一个集成端点。
 
 更多内部约定、性能数据与改造记录见 [DEVELOPMENT.md](DEVELOPMENT.md)；
-AV1 全面检查报告见 [AV1-AUDIT.md](AV1-AUDIT.md)。
 
 ## 许可
 

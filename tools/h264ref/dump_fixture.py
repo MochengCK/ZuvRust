@@ -34,7 +34,7 @@ u32 be  avcC 长度 | avcC 字节 | u32 be 采样长度 | 采样字节（AVCC：
 ## 用法
 
 ```sh
-P=/Users/zzzz/.workbuddy/binaries/python/envs/default/bin/python
+P=python3
 $P tools/h264ref/make_cases.py --out=/tmp/h264cases
 $P tools/h264ref/dump_fixture.py /tmp/h264cases/baseline_cavlc.mp4 \
     --out crates/me-decode/src/video/h264/testdata/i_slice_cavlc.bin \

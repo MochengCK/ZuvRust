@@ -4,7 +4,7 @@
 ## 为什么不用墙钟
 
 这台机器（MacBookAir9,1 / i5-1030NG7）负载会飘：同一对二进制在同一窗口里，
-`PHASE` 总和的 min 与 median 差 **20%**（PERF-HANDOFF 第九节记过 50.6 vs 61.6 ms）。
+`PHASE` 总和的 min 与 median 差 **20%**（内部优化记录 第九节记过 50.6 vs 61.6 ms）。
 墙钟 `elapsedMs` / `PHASE` **只在两版都稳定的窗口里**才有意义。
 
 CPU 时间（`getrusage` 的 `ru_utime + ru_stime`）量的是"这条进程真正花了多少 CPU"，

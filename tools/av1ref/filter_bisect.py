@@ -33,8 +33,10 @@ import sys
 
 import numpy as np
 
-ENGINE = "/Users/zzzz/Documents/Lerxu/ZuvRust/target/release/zuvrust"
-AOMDEC = "/tmp/libaom-3.9.0/build_g/aomdec"
+# 引擎与参照解码器：默认取仓库内 release 产物与 /tmp 下的 libaom 构建，
+# 换机器时用环境变量覆盖即可（别把本机绝对路径写进仓库）。
+ENGINE = os.environ.get("ZUVRUST_BIN", "target/release/zuvrust")
+AOMDEC = os.environ.get("AOMDEC", "/tmp/libaom-3.9.0/build_g/aomdec")
 
 CASES = [
     ("all_on", [], []),
