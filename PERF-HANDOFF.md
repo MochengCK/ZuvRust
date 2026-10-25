@@ -4519,3 +4519,43 @@ CDEF 四行内核"少占寄存器"（抽头不提前广播，省 4 个 YMM；`ad
 这是第三次"显式 AVX2 vs 自动向量化"的对照：**前两次负、这次微正**，差别在实现形状
 （16 位域打包 vs 32 位域打包）。⇒ 旧的否定结论要连着"当时那版的内核形状"一起记，
 不能当成"这个方向永远不行"。
+
+## 八十七、2026-10-25 采样复核（当前构建）+ 两个否定
+
+### 新的叶子排名（debuginfo+PGO，400 帧窗口，非 idle 样本约 5000）
+
+```
+MC 一族 ≈ 1236（25%）: comp_avg_rows 343、predict_inter 249、copy_rect_u16 208、
+                        mc_horiz_rows 174、mc_shift_rows 104、blend_masked8 72 …
+tiles 簿记 ≈ 1760（35%）: project_frame 212、decode_block 174+134+70、read_symbol 162、
+                        transform_block/coeffs/vt_forward ≈ 388、predict_intra 113 …
+去块 ≈ 648（13%）: edge4 239、run_outer 227、edge8_h 182
+CDEF ≈ 668（13%）: pair16x4 三实例 231、quad8 198、direction 96、apply/filter 143
+内存 ≈ 570（11%）: bzero 230、memmove 218、memset_pattern16 66、memset 57
+环路恢复 ≈ 100
+```
+
+* `bzero/memmove` 的最大来源：**`clone_visible`（intra.rs:315）144 个样本 ≈ 2.9%** —— 就是
+  CDEF 的整帧克隆（8.4 MB/帧，含 padding），与相位计时里 `cdef` 的 ~1.1 ms 对得上；
+  其余散在 `mv.rs:269`、`lr.rs:836`、`block.rs:713` 等每帧缓冲（各 0.3~1.3%）。
+* `narrow_u16_u8_rows` 改成 32 像素打包后仍有 190 样本（3.8%）—— 这段是**纯带宽**
+  （读 4.2 MB + 写 3.1 MB），指令数已经不是瓶颈。
+
+### 否定一：NV12 非临时存（`_mm256_stream_si256`）
+
+目标缓冲"只写一次"，本以为能省掉写分配的 RFO 读（3.1 MB/帧）。实测
+**±0.0%（8/16 轮）** —— 池化后的目标页早已驻留，RFO 不是瓶颈，NT 的绕过缓存反而抵消。
+**已回退。**
+
+### 否定二：`ME_PLANE_U8` 现状探针
+
+直接跑 `ME_PLANE_U8=1` 在第一帧就 panic（`intra.rs:298 px16_mut()`）⇒ u8 存储只有
+极少数读路径（`nv12_frame`、`mc_horiz16_u8`）接好了，**滤镜链（deblock/CDEF/LR）与重建
+写回都还是 u16 口径**。这条路线要动必须"重建 + MC + 滤镜 + 输出"整链一起切，
+不是单轮能验证的改动 —— 记为下一阶段的主线。
+
+### 结论
+
+当前构建里**没有任何 ≥3% 的"可省工作量"热点**；剩下的大头都是带宽受限
+（MC 25%、NV12 收窄、CDEF 克隆）或已到 16 位通道的吞吐极限（CDEF/去块内核）。
+在 1.18 GHz 的窗口里，继续按 1%/刀推进是对的，但要达到 33 ms 只能靠 u8 整链。
