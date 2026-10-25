@@ -103,8 +103,8 @@ pub(crate) fn version_value() -> serde_json::Value {
     features.push("decode-video");
 
     serde_json::json!({
-        "name": "ZuvRust",
-        "version": env!("CARGO_PKG_VERSION"),
+        "name": me_core::ENGINE_NAME,
+        "version": me_core::ENGINE_VERSION,
         // 这个构建编进来的模块（audio / video / mux 的子集）。
         "modules": crate::modules::compiled_modules(),
         // 这两个列表是宿主"能力探测"的依据：界面据此决定哪些按钮可点。

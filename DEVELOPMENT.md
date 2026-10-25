@@ -289,6 +289,19 @@ node sdk/js/test/run.mjs --bin target/debug/zuvrust
 非默认组合的产物名会带 `-audio-video-mux` 这类后缀，且**只上传 Actions artifact、
 不进 Release**（Release 只收桌面端默认的 mux 产物）。
 
+### 5.2 版本入口
+
+版本号只有一个运行时源：`me-core::ENGINE_VERSION`。CLI 的 `version --json`、
+JSON-RPC `initialize` 与契约测试都读它；它自己有一条测试与工作区
+`Cargo.toml` 的 `version` 严格对拍（照 XferRust 的 `xfer-types::ENGINE_VERSION`
+做法）。发布版本仍以 `Cargo.toml` 为准（CI 从这里取 tag）。
+
+SDK 的 `sdk/js/package.json` 必须与引擎版本一致；`sdk/js/test/run.mjs` 会把
+`engine.version` 与包版本对拍，所以升级时漏改一边会直接失败。
+
+`protocolVersion`（JSON-RPC 线上协议版本）是**独立**的，不跟引擎版本升级；
+只有分帧/方法/错误码发生不兼容变化时才动它。
+
 ### macOS 沙箱的坑（必读）
 
 在某些沙箱环境里，新链接出来的 Rust 二进制**未 ad-hoc 签名会被系统直接杀掉**，

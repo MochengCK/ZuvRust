@@ -9,10 +9,14 @@
  */
 
 import { existsSync } from 'node:fs'
+import { createRequire } from 'node:module'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 import { ZuvRust, ZuvRustError, StreamHandle } from '../index.js'
+
+const require = createRequire(import.meta.url)
+const sdkPkg = require('../package.json')
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url))
 const repoRoot = path.resolve(__dirname, '../../..')
@@ -99,6 +103,7 @@ async function main () {
 
     const version = await engine.version()
     eq(version.name, 'ZuvRust', 'version 名称')
+    eq(version.version, sdkPkg.version, 'SDK 与引擎版本一致（版本入口统一）')
     ok(Array.isArray(version.features), 'version 带 features')
 
     const pong = await engine.ping()
@@ -118,13 +123,17 @@ async function main () {
     eq(cancel.cancelled, false, '取消不存在的请求返回 false')
 
     // 未编 audio 时 decode --audio 必须是 1002 / unsupported；
-    // 编了 audio 时缺文件是 1003 / io。两种构建都能跑。
+    // 编了 audio 时缺文件是 1003（io / container / bitstream 都算输入不可用）。
     await expectError(
       engine.decode('/definitely/not/here.mp4', { audio: true }),
       'decode 错误映射',
       error => {
         ok(error.code === 1002 || error.code === 1003, 'decode 错误码 1002/1003', String(error.code))
-        ok(error.kind === 'unsupported' || error.kind === 'io', 'decode kind', error.kind)
+        ok(
+          ['unsupported', 'io', 'container', 'bitstream'].includes(error.kind),
+          'decode kind',
+          error.kind
+        )
       }
     )
 

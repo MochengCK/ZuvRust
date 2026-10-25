@@ -16,6 +16,13 @@
 //!    引擎的容器/合并/协议层完全不需要解码器；解码是另一层的事
 //!    （走平台解码器，见 DEVELOPMENT.md 的分层说明）。
 
+/// 引擎名称（CLI / JSON-RPC / SDK 展示用）。
+pub const ENGINE_NAME: &str = "ZuvRust";
+
+/// 引擎版本。与工作区 `Cargo.toml` 的 `version` 保持同步；
+/// `version --json`、JSON-RPC `initialize`、CLI 测试都只读这一个常量。
+pub const ENGINE_VERSION: &str = "0.2.0";
+
 pub mod bits;
 pub mod bytes;
 pub mod error;
@@ -29,3 +36,21 @@ pub use error::{MediaError, Result};
 pub use media::{CodecId, MediaInfo, MediaKind, Packet, Track};
 pub use source::{ChainedSource, Cursor, FileSource, ReadAt};
 pub use time::{Rational, Timebase};
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    /// `ENGINE_VERSION` 是手写常量，必须与 Cargo 工作区版本严格一致。
+    ///
+    /// 两者一旦漂移，CLI、JSON-RPC、SDK 与发布说明会对外宣称不同版本号；
+    /// 这条测试让版本升级时至少有一处会失败。
+    #[test]
+    fn engine_version_matches_cargo_version() {
+        assert_eq!(
+            ENGINE_VERSION,
+            env!("CARGO_PKG_VERSION"),
+            "me-core::ENGINE_VERSION 与工作区 Cargo.toml 的 version 不一致"
+        );
+    }
+}

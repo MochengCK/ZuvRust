@@ -11,6 +11,10 @@
 
 import { spawn } from 'node:child_process'
 import { EventEmitter } from 'node:events'
+import { createRequire } from 'node:module'
+
+const require = createRequire(import.meta.url)
+const { version: CLIENT_VERSION } = require('./package.json')
 
 const TYPE_JSON = 0
 const TYPE_BINARY = 1
@@ -250,7 +254,7 @@ export class ZuvRust extends EventEmitter {
     const result = await this._withTimeout(
       this._request('initialize', {
         protocolVersion: 1,
-        client: { name: 'zuvrust-client', version: '0.1.0' }
+        client: { name: 'zuvrust-client', version: CLIENT_VERSION }
       }),
       timeoutMs,
       'initialize'

@@ -138,12 +138,9 @@ fn version_reports_engine_name_and_version() {
     assert_eq!(v["ok"], serde_json::json!(true));
     // 键名是契约：宿主按字面量取，缺一个就静默降级。
     // 注意载荷键是 `result`（不是 `data`）—— 与 `json.rs` 的封装一致。
-    assert_eq!(v["result"]["name"], "ZuvRust");
-    let ver = v["result"]["version"].as_str().expect("version 必须是字符串");
-    assert!(
-        ver.starts_with(|c: char| c.is_ascii_digit()),
-        "版本号应形如 0.1.0，实际 {ver:?}"
-    );
+    assert_eq!(v["result"]["name"], me_core::ENGINE_NAME);
+    // 版本号只有一个源：`me-core::ENGINE_VERSION`（它自己与 Cargo 版本对拍）。
+    assert_eq!(v["result"]["version"], me_core::ENGINE_VERSION);
 }
 
 /// `--version` / `-V` 必须与 `version` 子命令等价。
