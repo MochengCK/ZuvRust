@@ -194,6 +194,9 @@ bool_flag! {
     /// `ME_NO_SGR_FINAL_PAT=1`（**诊断**）：SGR 末段 3×3 退回按权重表逐项 `mullo`。
     /// 两条路**逐字节相同**。
     no_sgr_final_pat = "ME_NO_SGR_FINAL_PAT";
+    /// `ME_NO_SGR_PREFIX=1`（**诊断**）：SGR 前缀和退回逐列标量。
+    /// 两条路**逐字节相同**。
+    no_sgr_prefix = "ME_NO_SGR_PREFIX";
     /// `ME_LR_STATS=1`（**诊断**）：打印 SGR 三段（box0 / box1 / 收尾）的累计耗时。
     lr_stats = "ME_LR_STATS";
     /// `ME_EOB_STATS=1`（**诊断**）：每帧打印 `eob` 分布（块数 / 像素数）。
@@ -201,6 +204,9 @@ bool_flag! {
     /// `ME_NO_CDEF_4ROW=1`（**诊断**）：CDEF 亮度滤波退回"两行一组"的 `cdef_pair16`。
     /// 两条路**逐字节相同**（有位对拍单测）。
     no_cdef_4row = "ME_NO_CDEF_4ROW";
+    /// `ME_NO_CDEF_STR_SPEC=1`（**诊断**）：CDEF 不按"哪一档强度为 0"单态化，
+    /// 退回完整 12 抽头内核。两条路**逐字节相同**。
+    no_cdef_str_spec = "ME_NO_CDEF_STR_SPEC";
     /// `ME_NO_CDEF_DIR2=1`（**诊断**）：CDEF 方向搜索退回逐块（不用两块并行的 YMM 版）。
     /// 两条路**逐字节相同**。
     no_cdef_dir2 = "ME_NO_CDEF_DIR2";

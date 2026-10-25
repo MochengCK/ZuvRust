@@ -1452,6 +1452,10 @@ fn box_filter(
     }
 
     let two_r_plus_1 = (2 * r + 1) as usize;
+    // 前缀和的落点缓冲：**提到行循环外**（原来每行在栈上重新声明两个 `[i32; 74]`，
+    // 每行约 600 字节的零初始化；而 `[1..=cols]` 每行都会被写满、`[0]` 恒为 0）。
+    let mut pre_s = [0i32; SGR_BOX_COLS_MAX + 2];
+    let mut pre_s2 = [0i32; SGR_BOX_COLS_MAX + 2];
     for i in -1..(h + 1) {
         if i > -1 {
             // 行窗口整体下移一行：进 `y+i+r`（表行 `i+2r+1`）、出 `y+i-r-1`（表行 `i`）
@@ -1484,11 +1488,18 @@ fn box_filter(
         //
         // j 的窗口（缓冲下标）是 `[j+1, j+2r+1]`；记 `jj = j+1 ∈ [0, w+1]`，
         // 则窗口和 `= pre[jj + 2r + 1] - pre[jj]`。
-        let mut pre_s = [0i32; SGR_BOX_COLS_MAX + 2];
-        let mut pre_s2 = [0i32; SGR_BOX_COLS_MAX + 2];
-        for k in 0..cols {
-            pre_s[k + 1] = pre_s[k] + cs[k];
-            pre_s2[k + 1] = pre_s2[k] + cs2[k];
+        if avx2 && !flags::no_sgr_prefix() {
+            // SAFETY: 已判 AVX2；`cols ≤ SGR_BOX_COLS_MAX` ⇒ 源/目标都够长。
+            unsafe {
+                super::simd::sgr_prefix8(&cs, &cs2, &mut pre_s, &mut pre_s2, cols);
+            }
+        } else {
+            pre_s[0] = 0;
+            pre_s2[0] = 0;
+            for k in 0..cols {
+                pre_s[k + 1] = pre_s[k] + cs[k];
+                pre_s2[k + 1] = pre_s2[k] + cs2[k];
+            }
         }
         let jj_n = (w + 2) as usize;
         let row_base = (i + 1) as usize * aw;

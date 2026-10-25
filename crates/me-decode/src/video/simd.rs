@@ -1338,6 +1338,64 @@ mod x86 {
         _mm256_storeu_si256(out.as_mut_ptr() as *mut __m256i, v);
     }
 
+    /// `box_filter` 的**前缀和**（两条 i32 数组一起做、一次 8 列）：
+    /// `pre[k+1] = pre[k] + cs[k]`（`pre[0] = 0`），填到 `pre[1..=n]`。
+    ///
+    /// 原来两趟各 `n` 次**串行**标量加（`n = w + 2 + 2r`，1080p 一个 64 宽分块
+    /// 每行 ~70 次 × 2 条链）。改成 8 路前缀扫描：lane 内 `slli+add` 两次、
+    /// 再把低 128 位的末元素广播到高 128 位 —— 整数加法**可结合**，结果逐位相同。
+    ///
+    /// # Safety
+    /// - 必须已确认 AVX2 可用；
+    /// - `cs`/`cs2` 至少 `n` 项，`pre`/`pre2` 至少 `n + 1` 项。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn sgr_prefix8(
+        cs: &[i32],
+        cs2: &[i32],
+        pre: &mut [i32],
+        pre2: &mut [i32],
+        n: usize,
+    ) {
+        #[inline(always)]
+        unsafe fn scan8(v: __m256i) -> __m256i {
+            let v = _mm256_add_epi32(v, _mm256_slli_si256::<4>(v));
+            let v = _mm256_add_epi32(v, _mm256_slli_si256::<8>(v));
+            // 把低 128 位的第 3 个元素搬到高 128 位的 4 个通道（低 128 位清零）：
+            // `permute2x128::<0x08>` = [zero, v.low]，再在 128 位内广播第 3 个元素。
+            let carry = _mm256_shuffle_epi32::<0xFF>(_mm256_permute2x128_si256::<0x08>(v, v));
+            _mm256_add_epi32(v, carry)
+        }
+        pre[0] = 0;
+        pre2[0] = 0;
+        let mut s1 = _mm256_setzero_si256();
+        let mut s2 = _mm256_setzero_si256();
+        let mut k = 0usize;
+        while k + 8 <= n {
+            let v1 = _mm256_add_epi32(
+                scan8(_mm256_loadu_si256(cs.as_ptr().add(k) as *const __m256i)),
+                s1,
+            );
+            let v2 = _mm256_add_epi32(
+                scan8(_mm256_loadu_si256(cs2.as_ptr().add(k) as *const __m256i)),
+                s2,
+            );
+            _mm256_storeu_si256(pre.as_mut_ptr().add(k + 1) as *mut __m256i, v1);
+            _mm256_storeu_si256(pre2.as_mut_ptr().add(k + 1) as *mut __m256i, v2);
+            s1 = _mm256_permutevar8x32_epi32(v1, _mm256_set1_epi32(7));
+            s2 = _mm256_permutevar8x32_epi32(v2, _mm256_set1_epi32(7));
+            k += 8;
+        }
+        let mut a = _mm256_extract_epi32::<0>(s1);
+        let mut b = _mm256_extract_epi32::<0>(s2);
+        while k < n {
+            a += *cs.get_unchecked(k);
+            b += *cs2.get_unchecked(k);
+            *pre.get_unchecked_mut(k + 1) = a;
+            *pre2.get_unchecked_mut(k + 1) = b;
+            k += 1;
+        }
+    }
+
     /// `box_filter` **竖直滑动和**的列更新（一次 8 列、i32 通道）：
     /// `cs[k] += add[k] − sub[k]`、`cs2[k] += add[k]² − sub[k]²`。
     ///
@@ -1842,9 +1900,52 @@ mod x86 {
     ///   `((y0+r)·stride + x0 + offs[c]) .. + 8 个 u16`。
     /// - `dst` 覆盖 `((y0+h-1)·dst_stride + x0) .. + wu 个 u16`。
     /// - `adj` 必须 < 16（同 [`cdef_pair16`]）。
-    #[target_feature(enable = "avx2")]
+    /// [`cdef_pair16x4_impl`] 的**按"哪一档强度为 0"分派**（2026-10-25）。
+    ///
+    /// 抽头档的约束量是 `t = subs_epu16(thr, mag >> adj)`：`thr == 0` 时
+    /// **恒为 0** ⇒ 这一档的 4（或 8）个候选只影响最后的 `min/max` 钳位，
+    /// 整条 `sub → abs → sra → subs → min → sign → add` 链可以整段消掉。
+    /// 本素材 **78% 的亮度块 `pri_str == 0`**（局部方差为 0 ⇒ `pri_str` 被清零），
+    /// 而只要次档不为 0 整块仍要滤波 ⇒ 这些块白白跑了 4 个主抽头的约束链。
+    ///
+    /// 调用方保证两档不会同时为 0（那整块就不滤波），这里仍保守走完整版。
     #[allow(clippy::too_many_arguments)]
     pub(crate) unsafe fn cdef_pair16x4(
+        data: &[u16],
+        stride: isize,
+        x0: isize,
+        y0: isize,
+        h: usize,
+        wu: usize,
+        offs: &[isize; super::CDEF_CANDS],
+        taps: &[i32; super::CDEF_CANDS],
+        pri_thr: i32,
+        pri_adj: u32,
+        sec_thr: i32,
+        sec_adj: u32,
+        dst: *mut u16,
+        dst_stride: isize,
+    ) {
+        macro_rules! call {
+            ($($t:tt)*) => {
+                cdef_pair16x4_impl::<$($t)*>(
+                    data, stride, x0, y0, h, wu, offs, taps, pri_thr, pri_adj, sec_thr, sec_adj,
+                    dst, dst_stride,
+                )
+            };
+        }
+        if crate::video::flags::no_cdef_str_spec() || (pri_thr != 0) == (sec_thr != 0) {
+            call!(true, true)
+        } else if pri_thr == 0 {
+            call!(false, true)
+        } else {
+            call!(true, false)
+        }
+    }
+
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn cdef_pair16x4_impl<const PRI: bool, const SEC: bool>(
         data: &[u16],
         stride: isize,
         x0: isize,
@@ -1907,11 +2008,43 @@ mod x86 {
             // ⇒ `v0·t + v1·t ≡ (v0+v1)·t`，逐位相同（内核本来就用 `_mm256_add_epi16`
             // 的回绕，见 `cdef_pair16` 的说明）。
             // 12 次乘 → 4 次；每组多 1 次相加。
-            for grp in 0..2usize {
-                let mut ga = zero;
-                let mut gb = zero;
-                for k in 0..2usize {
-                    let c = grp * 2 + k;
+            if PRI {
+                for grp in 0..2usize {
+                    let mut ga = zero;
+                    let mut gb = zero;
+                    for k in 0..2usize {
+                        let c = grp * 2 + k;
+                        let o = offs[c];
+                        let cand_a = _mm256_set_m128i(
+                            _mm_loadu_si128(base.offset(off1 + o) as *const __m128i),
+                            _mm_loadu_si128(base.offset(off0 + o) as *const __m128i),
+                        );
+                        let cand_b = _mm256_set_m128i(
+                            _mm_loadu_si128(base.offset(off3 + o) as *const __m128i),
+                            _mm_loadu_si128(base.offset(off2 + o) as *const __m128i),
+                        );
+                        let diff_a = _mm256_sub_epi16(cand_a, cur_a);
+                        let mag_a = _mm256_abs_epi16(diff_a);
+                        let t_a = _mm256_subs_epu16(pri_t, _mm256_sra_epi16(mag_a, pri_s));
+                        let t_a = _mm256_min_epu16(t_a, mag_a);
+                        ga = _mm256_add_epi16(ga, _mm256_sign_epi16(t_a, diff_a));
+                        mx_a = _mm256_max_epi16(mx_a, cand_a);
+                        mn_a = _mm256_min_epi16(mn_a, cand_a);
+
+                        let diff_b = _mm256_sub_epi16(cand_b, cur_b);
+                        let mag_b = _mm256_abs_epi16(diff_b);
+                        let t_b = _mm256_subs_epu16(pri_t, _mm256_sra_epi16(mag_b, pri_s));
+                        let t_b = _mm256_min_epu16(t_b, mag_b);
+                        gb = _mm256_add_epi16(gb, _mm256_sign_epi16(t_b, diff_b));
+                        mx_b = _mm256_max_epi16(mx_b, cand_b);
+                        mn_b = _mm256_min_epi16(mn_b, cand_b);
+                    }
+                    acc_a = _mm256_add_epi16(acc_a, _mm256_mullo_epi16(ga, pri_taps[grp]));
+                    acc_b = _mm256_add_epi16(acc_b, _mm256_mullo_epi16(gb, pri_taps[grp]));
+                }
+            } else {
+                // 主档强度为 0 ⇒ 约束量恒 0，只留钳位要用的 min/max。
+                for c in 0..4usize {
                     let o = offs[c];
                     let cand_a = _mm256_set_m128i(
                         _mm_loadu_si128(base.offset(off1 + o) as *const __m128i),
@@ -1921,30 +2054,48 @@ mod x86 {
                         _mm_loadu_si128(base.offset(off3 + o) as *const __m128i),
                         _mm_loadu_si128(base.offset(off2 + o) as *const __m128i),
                     );
-                    let diff_a = _mm256_sub_epi16(cand_a, cur_a);
-                    let mag_a = _mm256_abs_epi16(diff_a);
-                    let t_a = _mm256_subs_epu16(pri_t, _mm256_sra_epi16(mag_a, pri_s));
-                    let t_a = _mm256_min_epu16(t_a, mag_a);
-                    ga = _mm256_add_epi16(ga, _mm256_sign_epi16(t_a, diff_a));
                     mx_a = _mm256_max_epi16(mx_a, cand_a);
                     mn_a = _mm256_min_epi16(mn_a, cand_a);
-
-                    let diff_b = _mm256_sub_epi16(cand_b, cur_b);
-                    let mag_b = _mm256_abs_epi16(diff_b);
-                    let t_b = _mm256_subs_epu16(pri_t, _mm256_sra_epi16(mag_b, pri_s));
-                    let t_b = _mm256_min_epu16(t_b, mag_b);
-                    gb = _mm256_add_epi16(gb, _mm256_sign_epi16(t_b, diff_b));
                     mx_b = _mm256_max_epi16(mx_b, cand_b);
                     mn_b = _mm256_min_epi16(mn_b, cand_b);
                 }
-                acc_a = _mm256_add_epi16(acc_a, _mm256_mullo_epi16(ga, pri_taps[grp]));
-                acc_b = _mm256_add_epi16(acc_b, _mm256_mullo_epi16(gb, pri_taps[grp]));
             }
-            for grp in 0..2usize {
-                let mut ga = zero;
-                let mut gb = zero;
-                for k in 0..4usize {
-                    let c = 4 + grp * 4 + k;
+            if SEC {
+                for grp in 0..2usize {
+                    let mut ga = zero;
+                    let mut gb = zero;
+                    for k in 0..4usize {
+                        let c = 4 + grp * 4 + k;
+                        let o = offs[c];
+                        let cand_a = _mm256_set_m128i(
+                            _mm_loadu_si128(base.offset(off1 + o) as *const __m128i),
+                            _mm_loadu_si128(base.offset(off0 + o) as *const __m128i),
+                        );
+                        let cand_b = _mm256_set_m128i(
+                            _mm_loadu_si128(base.offset(off3 + o) as *const __m128i),
+                            _mm_loadu_si128(base.offset(off2 + o) as *const __m128i),
+                        );
+                        let diff_a = _mm256_sub_epi16(cand_a, cur_a);
+                        let mag_a = _mm256_abs_epi16(diff_a);
+                        let t_a = _mm256_subs_epu16(sec_t, _mm256_sra_epi16(mag_a, sec_s));
+                        let t_a = _mm256_min_epu16(t_a, mag_a);
+                        ga = _mm256_add_epi16(ga, _mm256_sign_epi16(t_a, diff_a));
+                        mx_a = _mm256_max_epi16(mx_a, cand_a);
+                        mn_a = _mm256_min_epi16(mn_a, cand_a);
+
+                        let diff_b = _mm256_sub_epi16(cand_b, cur_b);
+                        let mag_b = _mm256_abs_epi16(diff_b);
+                        let t_b = _mm256_subs_epu16(sec_t, _mm256_sra_epi16(mag_b, sec_s));
+                        let t_b = _mm256_min_epu16(t_b, mag_b);
+                        gb = _mm256_add_epi16(gb, _mm256_sign_epi16(t_b, diff_b));
+                        mx_b = _mm256_max_epi16(mx_b, cand_b);
+                        mn_b = _mm256_min_epi16(mn_b, cand_b);
+                    }
+                    acc_a = _mm256_add_epi16(acc_a, _mm256_mullo_epi16(ga, sec_taps[grp]));
+                    acc_b = _mm256_add_epi16(acc_b, _mm256_mullo_epi16(gb, sec_taps[grp]));
+                }
+            } else {
+                for c in 4..12usize {
                     let o = offs[c];
                     let cand_a = _mm256_set_m128i(
                         _mm_loadu_si128(base.offset(off1 + o) as *const __m128i),
@@ -1954,24 +2105,11 @@ mod x86 {
                         _mm_loadu_si128(base.offset(off3 + o) as *const __m128i),
                         _mm_loadu_si128(base.offset(off2 + o) as *const __m128i),
                     );
-                    let diff_a = _mm256_sub_epi16(cand_a, cur_a);
-                    let mag_a = _mm256_abs_epi16(diff_a);
-                    let t_a = _mm256_subs_epu16(sec_t, _mm256_sra_epi16(mag_a, sec_s));
-                    let t_a = _mm256_min_epu16(t_a, mag_a);
-                    ga = _mm256_add_epi16(ga, _mm256_sign_epi16(t_a, diff_a));
                     mx_a = _mm256_max_epi16(mx_a, cand_a);
                     mn_a = _mm256_min_epi16(mn_a, cand_a);
-
-                    let diff_b = _mm256_sub_epi16(cand_b, cur_b);
-                    let mag_b = _mm256_abs_epi16(diff_b);
-                    let t_b = _mm256_subs_epu16(sec_t, _mm256_sra_epi16(mag_b, sec_s));
-                    let t_b = _mm256_min_epu16(t_b, mag_b);
-                    gb = _mm256_add_epi16(gb, _mm256_sign_epi16(t_b, diff_b));
                     mx_b = _mm256_max_epi16(mx_b, cand_b);
                     mn_b = _mm256_min_epi16(mn_b, cand_b);
                 }
-                acc_a = _mm256_add_epi16(acc_a, _mm256_mullo_epi16(ga, sec_taps[grp]));
-                acc_b = _mm256_add_epi16(acc_b, _mm256_mullo_epi16(gb, sec_taps[grp]));
             }
             let adj_a = _mm256_and_si256(_mm256_cmpgt_epi16(zero, acc_a), one);
             let va = _mm256_add_epi16(
@@ -4853,7 +4991,8 @@ pub(crate) use x86::{
     mc_shift_rows, mc_vert8,
     mc_vert_rows_8bpc, mc_vert_rows_u16, comp_avg_rows, mc_vert2_avg_u16, add_residual_u16,
     deblock_edge8_h, add_residual_u16_rev, dequantize_8,
-    sgr_ab_8, sgr_cols_update8, sgr_final_8, sgr_final_8_pat, store_row_clamped, wiener_horiz_rows,
+    sgr_ab_8, sgr_cols_update8, sgr_final_8, sgr_final_8_pat, sgr_prefix8, store_row_clamped,
+    wiener_horiz_rows,
     wiener_vert_row,
     intra_smooth_row, cdef_direction_avx2_x2, copy_rect_u16, add_const_plane, sgr_proj_row8,
 };
@@ -5431,6 +5570,17 @@ pub(crate) unsafe fn sgr_final_8(
 ) {
 }
 
+/// 非 x86_64 的 [`sgr_prefix8`] 桩（`avx2_available()` 恒假 ⇒ 走标量前缀和）。
+#[cfg(not(target_arch = "x86_64"))]
+pub(crate) unsafe fn sgr_prefix8(
+    _cs: &[i32],
+    _cs2: &[i32],
+    _pre: &mut [i32],
+    _pre2: &mut [i32],
+    _n: usize,
+) {
+}
+
 /// 非 x86_64 的 [`sgr_final_8_pat`] 桩（`avx2_available()` 恒假 ⇒ 走标量 3×3）。
 #[cfg(not(target_arch = "x86_64"))]
 pub(crate) unsafe fn sgr_final_8_pat<const PAT: u8, const SHIFT: i32>(
@@ -5488,6 +5638,37 @@ pub(crate) unsafe fn mc_horiz8(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`sgr_prefix8`] 必须与**朴素前缀和**逐项相同（含负值、跨 8 段进位、尾巴）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sgr_prefix8_matches_scalar() {
+        if !avx2_available() {
+            return;
+        }
+        for n in [0usize, 1, 7, 8, 9, 16, 17, 63, 70, 72] {
+            let cs: Vec<i32> = (0..n)
+                .map(|i| ((i * 37) as i32 % 251) - 100 + (i as i32 % 7) * 13)
+                .collect();
+            let cs2: Vec<i32> = (0..n)
+                .map(|i| 1000 - ((i * 91) as i32 % 977) + (i as i32 % 5) * 31)
+                .collect();
+            let mut got = vec![0i32; n + 1];
+            let mut got2 = vec![0i32; n + 1];
+            // SAFETY: 已判 AVX2；两个源各 `n` 项、两个目标各 `n+1` 项。
+            unsafe {
+                sgr_prefix8(&cs, &cs2, &mut got, &mut got2, n);
+            }
+            let mut want = vec![0i32; n + 1];
+            let mut want2 = vec![0i32; n + 1];
+            for k in 0..n {
+                want[k + 1] = want[k] + cs[k];
+                want2[k + 1] = want2[k] + cs2[k];
+            }
+            assert_eq!(got, want, "n={n}");
+            assert_eq!(got2, want2, "n={n}");
+        }
+    }
 
     #[cfg(target_arch = "x86_64")]
     /// `mc_horiz16_u8`（u8 源 + `vpmovzxbw`）必须与 u16 版**逐位一致**。
@@ -6424,14 +6605,9 @@ mod tests {
         }
     }
 
-    /// [`cdef_pair16x4`]（四行一组）必须与 [`cdef_pair16`]（两行一组）**逐位相同**。
-    ///
-    /// 两条路的像素式完全相同、只是向量打包方式不同；这里对 8 个方向、
-    /// 两种宽度、三组强度逐字节对拍两块目标缓冲。
-    #[cfg(target_arch = "x86_64")]
-    #[test]
     /// **融合的"纵向两路 + AVERAGE"必须与"两路纵向 + 平均"逐位一致**
     /// （`mc_vert2_avg_u16` vs `mc_vert_rows_8bpc` ×2 + 标量混合）。
+    #[cfg(target_arch = "x86_64")]
     #[test]
     fn mc_vert2_avg_u16_matches_vert_then_average() {
         if !avx2_available() {
@@ -6474,6 +6650,16 @@ mod tests {
         }
     }
 
+    /// [`cdef_pair16x4`]（四行一组）必须与 [`cdef_pair16`]（两行一组）**逐位相同**。
+    ///
+    /// 两条路的像素式完全相同、只是向量打包方式不同；这里对 8 个方向、
+    /// 两种宽度、五组强度（含"某一档强度为 0"的单态化分支）逐字节对拍两块目标缓冲。
+    ///
+    /// ⚠️ 2026-10-25：这条测试的 `#[cfg]`/`#[test]` 之前**粘到了下一个函数**上
+    /// （`#[test]` 后面隔着文档注释又跟了一个 `#[test]`），于是它一直没被跑过 ——
+    /// 属性必须紧贴被标注的 `fn`。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
     fn cdef_pair16x4_matches_pair16_bit_for_bit() {
         if !avx2_available() {
             return;
@@ -6509,6 +6695,10 @@ mod tests {
                     (32i32, 8i32, 0u32, 1u32, 0usize),
                     (7, 3, 2, 3, 1),
                     (240, 240, 0, 0, 0),
+                    // 单档为 0：走 `cdef_pair16x4_impl` 的 min/max-only 单态化，
+                    // 约束量恒 0 ⇒ 必须与两行版的完整式子逐位相同。
+                    (0, 8, 0, 1, 0),
+                    (32, 0, 0, 0, 0),
                 ] {
                     let mut offs = [0isize; CDEF_CANDS];
                     let mut taps = [0i32; CDEF_CANDS];
