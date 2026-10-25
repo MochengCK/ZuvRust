@@ -203,6 +203,9 @@ bool_flag! {
     /// `ME_NO_SGR_PREFIX=1`（**诊断**）：SGR 前缀和退回逐列标量。
     /// 两条路**逐字节相同**。
     no_sgr_prefix = "ME_NO_SGR_PREFIX";
+    /// `ME_NO_BITCACHE=1`（**诊断**）：算术解码的位缓存退回逐次取 8 字节窗口。
+    /// 两条路**逐位相同**。
+    no_bitcache = "ME_NO_BITCACHE";
     /// `ME_NO_SGR_FLOAT=1`（**诊断**）：SGR 的 `a2` 退回 `vpgatherdd` 查表。
     /// 两条路**逐字节相同**（有全量对拍单测）。
     no_sgr_float = "ME_NO_SGR_FLOAT";

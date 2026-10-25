@@ -144,6 +144,13 @@ pub struct SymbolDecoder<'a> {
     record_recent: bool,
     /// `SymbolMaxBits` 的下限（规范 -14，`AV1_SMB_LIMIT` 可覆盖）。
     smb_lim: i64,
+    /// **位缓存**（2026-10-25）：`win` 从最高位起装着"紧随 `bit_pos` 之后"的
+    /// `win_n` 个位。重归一化每次只要 1~15 位，原来每次都要重新取 8 字节窗口
+    /// （越界判断 + 非对齐读 + `bswap` + 两次变长移位）；缓存后每 2~4 个符号才补一次。
+    win: u64,
+    win_n: u32,
+    /// `ME_NO_BITCACHE=1`（诊断）：关掉缓存、退回逐次取窗口。两条路逐位相同。
+    bitcache: bool,
 }
 
 /// 环形缓冲的深度（越界报错时倒出这么多条）。16 条足够看出"哪一步跳了"。
@@ -242,6 +249,9 @@ impl<'a> SymbolDecoder<'a> {
             dbg_txbs: 0,
             recent: [RecentSym::EMPTY; RECENT_SYMBOLS],
             recent_n: 0,
+            win: 0,
+            win_n: 0,
+            bitcache: !flags::no_bitcache(),
         })
     }
 
@@ -277,6 +287,67 @@ impl<'a> SymbolDecoder<'a> {
     /// `SymbolValue`（诊断/不变量检查用）。
     pub fn symbol_value(&self) -> u32 {
         self.symbol_value
+    }
+
+    /// 取 `n`（≤32）位：与 [`read_bits_at`] **逐位等价**（含越界报错口径），
+    /// 但走 64 位缓存。
+    #[inline]
+    fn take_bits(&mut self, n: u32) -> Result<u32> {
+        if n == 0 {
+            // `read_bits_at` 对 0 位返回 0；这里必须同样早退 —— 否则 `win >> 64` 在
+            // release 下会被掩成 `>> 0`，返回缓存里的垃圾（符号值就错了）。
+            return Ok(0);
+        }
+        let total = self.data.len() * 8;
+        if self.bit_pos + n as usize > total {
+            return Err(MediaError::NeedMore {
+                need: n as usize,
+                have: total.saturating_sub(self.bit_pos),
+            });
+        }
+        if !self.bitcache {
+            let v = read_bits_at(self.data, self.bit_pos, n)?;
+            self.bit_pos += n as usize;
+            return Ok(v);
+        }
+        if self.win_n < n {
+            self.refill();
+        }
+        let v = (self.win >> (64 - n)) as u32;
+        self.win <<= n;
+        self.win_n -= n;
+        self.bit_pos += n as usize;
+        Ok(v)
+    }
+
+    /// 把"`bit_pos + win_n` 起"的最多 32 位追加进缓存。
+    ///
+    /// 末尾不足 8 字节时左对齐补零 —— 与 `read_bits_at` 同一口径；越界的位
+    /// 永远不会被消费（`take_bits` 先做同样的越界检查）。
+    #[inline]
+    fn refill(&mut self) {
+        let p = self.bit_pos + self.win_n as usize;
+        let byte = p >> 3;
+        let off = (p & 7) as u32;
+        let len = self.data.len();
+        let w8 = if byte + 8 <= len {
+            // SAFETY: `byte + 8 <= len` ⇒ 这 8 字节可读（瓦片数据无对齐保证）。
+            u64::from_be(unsafe {
+                std::ptr::read_unaligned(self.data.as_ptr().add(byte) as *const u64)
+            })
+        } else {
+            let take = len.saturating_sub(byte);
+            let mut w = 0u64;
+            for k in 0..take {
+                w |= (self.data[byte + k] as u64) << (56 - 8 * k);
+            }
+            w
+        };
+        let room = 64 - self.win_n;
+        let take = (64 - off).min(room).min(32);
+        let chunk = (w8 << off) >> (64 - take);
+        self.win |= chunk << (64 - self.win_n - take);
+        self.win_n += take;
     }
 
     /// `read_symbol( cdf )`（规范 §8.2.3）。
@@ -448,7 +519,7 @@ impl<'a> SymbolDecoder<'a> {
             // numBits = Min(bits, Max(0, SymbolMaxBits))
             let avail = self.symbol_max_bits.max(0) as u32;
             let num_bits = bits.min(avail);
-            let new_data = read_bits_at(self.data, self.bit_pos, num_bits)?;
+            let new_data = self.take_bits(num_bits)?;
             let padded = new_data << (bits - num_bits);
             // SymbolValue = paddedData ^ ( ( ( SymbolValue + 1 ) << bits ) - 1 )
             //
@@ -456,7 +527,7 @@ impl<'a> SymbolDecoder<'a> {
             // `od_ec_dec_normalize` 的 `((dif + 1) << d) - 1`，高位的 1 是有意义的
             // （区间底部的"补码"形式），抹掉它会让后续 `SymbolValue < cur` 判错。
             self.symbol_value = padded ^ (((self.symbol_value + 1) << bits) - 1);
-            self.bit_pos += num_bits as usize;
+            // `bit_pos` 已在 `take_bits` 里推进（缓存与直读两条路都推）。
             self.symbol_max_bits -= bits as i64;
 
             // ── 越界探测器（必须有，否则会**死循环**）──
