@@ -2601,8 +2601,9 @@ mod x86 {
     /// - `adj` 必须 < 16（同 `cdef_pair16`）。
     #[target_feature(enable = "avx2")]
     #[allow(clippy::too_many_arguments)]
-    pub(crate) unsafe fn cdef_quad8(
-        data: &[u16],
+    pub(crate) unsafe fn cdef_quad8_uv(
+        du: &[u16],
+        dv: &[u16],
         stride: isize,
         x0: isize,
         y0: isize,
@@ -2612,10 +2613,15 @@ mod x86 {
         pri_adj: u32,
         sec_thr: i32,
         sec_adj: u32,
-        dst: *mut u16,
+        dst_u: *mut u16,
+        dst_v: *mut u16,
         dst_stride: isize,
     ) {
         debug_assert!(super::CDEF_CANDS == 12, "本内核按 12 个候选写死");
+        // 2026-10-25：**U/V 合并成一次调用**。原来每帧 ~6.5 万次 `cdef_quad8`，
+        // 每次都要付一遍函数序言 + 8 条广播；两个平面的参数完全相同，合成一次
+        // 就只付一遍（体在下面循环里跑两趟）。
+        for (data, dst) in [(du, dst_u), (dv, dst_v)] {
         let base = data.as_ptr();
         let zero = _mm256_setzero_si256();
         let one = _mm256_set1_epi16(1);
@@ -2703,6 +2709,30 @@ mod x86 {
                 *qq,
             );
         }
+        }
+    }
+
+    /// 单平面版（自测/兼容用）：把同一份数据跑两遍（第二遍写回同一 dst，结果不变）。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn cdef_quad8(
+        data: &[u16],
+        stride: isize,
+        x0: isize,
+        y0: isize,
+        offs: &[isize; super::CDEF_CANDS],
+        taps: &[i32; super::CDEF_CANDS],
+        pri_thr: i32,
+        pri_adj: u32,
+        sec_thr: i32,
+        sec_adj: u32,
+        dst: *mut u16,
+        dst_stride: isize,
+    ) {
+        cdef_quad8_uv(
+            data, data, stride, x0, y0, offs, taps, pri_thr, pri_adj, sec_thr, sec_adj, dst, dst,
+            dst_stride,
+        )
     }
 
     /// 纵向 8 抽头，一次算 **16 个输出**（i16 中间量，`pmaddwd` 两两配对）。
@@ -5071,7 +5101,8 @@ unsafe fn vt_adst_output_permute<const I32: bool>(v: &mut [__m256i], n: u32) {
 #[allow(unused_imports)]
 pub(crate) use x86::{
     diffwtd_mask8,
-    cdef_direction_avx2, cdef_pair16, cdef_pair16x4, cdef_quad8, deblock_edge4, inv_txfm_cols, inv_txfm_cols_i32, inv_txfm_rows,
+    cdef_direction_avx2, cdef_pair16, cdef_pair16x4, cdef_quad8, cdef_quad8_uv,
+    deblock_edge4, inv_txfm_cols, inv_txfm_cols_i32, inv_txfm_rows,
     inv_txfm_rows_i32,
     blend_avg8, blend_dist8, blend_masked8, blend_masked_u16in8, mc_delta8, mc_horiz8,
     mc_horiz16_8bpc, mc_horiz16_u8, mc_horiz_rows_8bpc, mc_shift8, mc_shift_row,

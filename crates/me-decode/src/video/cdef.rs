@@ -721,13 +721,9 @@ fn cdef_group_fast(
                 // SAFETY: 同亮度路径；色度坐标是亮度坐标右移得到，边距只会更宽。
                 unsafe {
                     if cw == 4 && ch == 4 {
-                        super::simd::cdef_quad8(
-                            du, stride_uv, x0, y0, &uv_offs, &uv_taps, uv_pri, pri_adj, uv_sec,
-                            sec_adj, dst_u, stride_uv,
-                        );
-                        super::simd::cdef_quad8(
-                            dv, stride_uv, x0, y0, &uv_offs, &uv_taps, uv_pri, pri_adj, uv_sec,
-                            sec_adj, dst_v, stride_uv,
+                        super::simd::cdef_quad8_uv(
+                            du, dv, stride_uv, x0, y0, &uv_offs, &uv_taps, uv_pri, pri_adj,
+                            uv_sec, sec_adj, dst_u, dst_v, stride_uv,
                         );
                     } else {
                         super::simd::cdef_pair16x4(
