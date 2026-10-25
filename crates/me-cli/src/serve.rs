@@ -553,15 +553,13 @@ fn run_stream(
         .stdout
         .take()
         .ok_or_else(|| RpcError::internal("child stdout unavailable"))?;
-    let stderr = child
-        .stderr
-        .take()
-        .ok_or_else(|| RpcError::internal("child stderr unavailable"))?;
+    let mut stderr = Some(
+        child
+            .stderr
+            .take()
+            .ok_or_else(|| RpcError::internal("child stderr unavailable"))?,
+    );
     job.set_child(child);
-
-    let stderr_writer = writer.clone();
-    let request_id = job.request_id.clone();
-    let stderr_thread = thread::spawn(move || read_stderr(stderr, stderr_writer, request_id, true));
 
     let mut reader = BufReader::new(stdout);
     let mut meta_line = String::new();
@@ -576,7 +574,10 @@ fn run_stream(
             .transpose()
             .ok()
             .flatten();
-        let stderr_text = stderr_thread.join().unwrap_or_default();
+        let stderr_text = stderr
+            .take()
+            .map(|s| read_stderr(s, writer.clone(), job.request_id.clone(), true))
+            .unwrap_or_default();
         if job.cancelled.load(Ordering::SeqCst) {
             return Err(RpcError::cancelled());
         }
@@ -594,7 +595,10 @@ fn run_stream(
             .transpose()
             .ok()
             .flatten();
-        let stderr_text = stderr_thread.join().unwrap_or_default();
+        let stderr_text = stderr
+            .take()
+            .map(|s| read_stderr(s, writer.clone(), job.request_id.clone(), true))
+            .unwrap_or_default();
         return Err(engine_error_from_text(&stderr_text, exit_code(status)).into_rpc_error());
     }
     let meta = meta_msg.get("data").cloned().unwrap_or_else(|| json!({}));
@@ -614,13 +618,23 @@ fn run_stream(
     {
         job.terminate();
         let _ = job.take_child().map(|mut c| c.wait());
-        let _ = stderr_thread.join();
+        let _ = stderr
+            .take()
+            .map(|s| read_stderr(s, writer.clone(), job.request_id.clone(), true));
         streams
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .remove(&stream_id);
         return Ok(());
     }
+
+    // 进度必须在 result 之后才开始转发：客户端按 requestId 把 progress 归到流上，
+    // result 还没到就发 progress，客户端没有登记这条流，只能丢弃。
+    let stderr_thread = stderr.take().map(|s| {
+        let stderr_writer = writer.clone();
+        let request_id = job.request_id.clone();
+        thread::spawn(move || read_stderr(s, stderr_writer, request_id, true))
+    });
 
     let mut buf = vec![0u8; 256 * 1024];
     let mut write_failed = false;
@@ -645,7 +659,9 @@ fn run_stream(
         .transpose()
         .ok()
         .flatten();
-    let stderr_text = stderr_thread.join().unwrap_or_default();
+    let stderr_text = stderr_thread
+        .map(|h| h.join().unwrap_or_default())
+        .unwrap_or_default();
     streams
         .lock()
         .unwrap_or_else(|e| e.into_inner())

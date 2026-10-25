@@ -218,6 +218,10 @@ The response is sent as soon as the stream is ready:
 }}
 ```
 
+The result is guaranteed to arrive **before** any binary frame or `progress`
+notification for that stream; a client can register `streamId` on the response
+without racing the data.
+
 After that, type-1 frames carry `stream_id = 1`. The stream ends with a
 `stream/end` notification:
 
