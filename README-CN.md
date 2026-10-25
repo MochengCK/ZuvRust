@@ -5,9 +5,9 @@
 **面向应用集成的自研媒体引擎。** 一个可执行文件、一套稳定的 JSON-RPC API，
 不依赖任何第三方媒体库。
 
-ZuvRust 自己实现容器解析、转封装、合并、AV1 软解、H.264 硬解与音频解码；
-不链接 FFmpeg、GStreamer 或其它媒体引擎。应用通过进程边界与它通信：
-启动 `zuvrust serve --stdio`，发送 JSON-RPC 请求，接收进度通知与二进制媒体帧。
+容器解析、转封装、合并、AV1 软解、H.264 硬解与音频解码全部由它自己实现。
+应用通过进程边界与它通信：启动 `zuvrust serve --stdio`，发送 JSON-RPC 请求，
+接收进度通知与二进制媒体帧。
 
 - **稳定的集成接口**：JSON-RPC 2.0、请求 ID、取消、进度与二进制流。见 [API-CN.md](API-CN.md)。
 - **官方 JavaScript 客户端**：[sdk/js](sdk/js)，零依赖，Node 18+。

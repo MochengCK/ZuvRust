@@ -6,10 +6,9 @@ English | [简体中文](README-CN.md)
 JSON-RPC API, and zero third-party media libraries.
 
 ZuvRust implements container parsing, remuxing, muxing, AV1 software decoding,
-H.264 hardware decoding and audio decoding itself. It does not link FFmpeg,
-GStreamer or any other media engine. Applications talk to it over a process
-boundary: start `zuvrust serve --stdio`, send JSON-RPC requests, receive progress
-notifications and binary media frames.
+H.264 hardware decoding and audio decoding itself. Applications talk to it over a
+process boundary: start `zuvrust serve --stdio`, send JSON-RPC requests, receive
+progress notifications and binary media frames.
 
 - **Stable integration surface** — JSON-RPC 2.0, request IDs, cancellation,
   progress and binary streaming. See [API.md](API.md).
