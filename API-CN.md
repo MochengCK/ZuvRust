@@ -129,9 +129,13 @@ type 1  := 二进制流块：
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"remux","params":{
-  "output":"/media/out.mkv","input":"/media/in.ts"
+  "output":"/media/out.mkv","input":"/media/in.ts",
+  "fragmentMs":2000,"tracks":"both"
 }}
 ```
+
+`output`、`input` 必填；`fragmentMs` 与 `tracks` 可选，含义同 `mux`。
+进度通知的 type 是 `mux`。
 
 ### `download`
 
@@ -159,7 +163,9 @@ type 1  := 二进制流块：
 
 视频模式把 `frame-000001.nv12` 与 `frames.json` 写进 `out`。
 音频模式（`"audio": true`、`"out": "/media/audio.wav"`）写 WAV。
-`noGrow` 关闭增长文件读取。进度通知的 type 是 `decode-progress`。
+`noGrow` 关闭增长文件读取。`decodeMode` 取 `auto`（默认）、`hardware`
+（仅硬解）或 `software`（不碰硬件）；`threads` 设置解码线程数。
+进度通知的 type 是 `decode-progress`。
 
 ### `stream`
 
@@ -182,7 +188,9 @@ type 1  := 二进制流块：
   内容为下面的 `MEV1` 包。加 `"audioPcm": true` 才包含音频。
 
 可选字段：`mode`、`seek`（秒）、`fragmentMs`、`audioPcm`、`avail`（可用性图路径）、
-`waitTimeoutMs`、`grow`、`size`、`maxHeight`、`maxBandwidth`。
+`waitTimeoutMs`、`grow`、`size`、`maxHeight`、`maxBandwidth`、`decodeMode`
+（`auto|hardware|software`）、`threads`（解码线程数）。`decodeMode`/`threads`
+只作用于该任务的子进程，不影响共享服务进程。
 
 流就绪后先返回响应：
 
@@ -227,7 +235,9 @@ payload    len 字节
 ```
 
 视频载荷是紧凑 NV12（`w*h` 亮度 + `w*(h/2)` 交织色度）；音频是交织 S16LE。
-一个包可能跨多个二进制帧，客户端必须缓冲（官方 SDK 已处理）。
+一个包可能跨多个二进制帧，客户端必须缓冲（官方 SDK 已处理）。如果只想原样
+转发包流，给 SDK 传 `rawFrames: true`，它会直接输出 `{type:"frames", data}`
+块而不解析。
 
 ### `cancel`
 

@@ -64,8 +64,9 @@ function rpcError (error) {
  *   - `{ type:'end', ok, error? }`
  */
 export class StreamHandle {
-  constructor (client) {
+  constructor (client, { rawFrames = false } = {}) {
     this.client = client
+    this.rawFrames = rawFrames
     this.requestId = null
     this.streamId = null
     this.meta = null
@@ -92,6 +93,10 @@ export class StreamHandle {
       return
     }
     if (kind !== KIND_FRAMES) return
+    if (this.rawFrames) {
+      this._pushEvent({ type: 'frames', data: Buffer.from(data) })
+      return
+    }
     this._frameBuf = Buffer.concat([this._frameBuf, data])
     while (this._frameBuf.length >= FRAME_HEADER_BYTES) {
       if (!this._frameBuf.subarray(0, 4).equals(FRAME_MAGIC)) {
@@ -128,6 +133,7 @@ export class StreamHandle {
       error: error || undefined
     })
     this.client._streams.delete(this.streamId)
+    this.client._streamRequests.delete(this.requestId)
   }
 
   _fail (error) {
@@ -135,6 +141,7 @@ export class StreamHandle {
     this._ended = true
     this._queue.length = 0
     if (this.streamId != null) this.client._streams.delete(this.streamId)
+    this.client._streamRequests.delete(this.requestId)
     this._drain()
   }
 
@@ -210,6 +217,7 @@ export class ZuvRust extends EventEmitter {
     this._nextId = 1
     this._pending = new Map()
     this._streams = new Map()
+    this._streamRequests = new Map()
     this._stderrTail = ''
     this.engine = null
 
@@ -301,8 +309,8 @@ export class ZuvRust extends EventEmitter {
 
   /** 开一条流；返回可 `for await` 的 StreamHandle。 */
   stream (input, options = {}) {
-    const { onProgress, signal, ...params } = options
-    const handle = new StreamHandle(this)
+    const { onProgress, signal, rawFrames = false, ...params } = options
+    const handle = new StreamHandle(this, { rawFrames })
     const promise = this._request(
       'stream',
       { input, ...params },
@@ -438,11 +446,10 @@ export class ZuvRust extends EventEmitter {
     if (message && typeof message.method === 'string') {
       const params = message.params || {}
       if (message.method === 'progress') {
+        const stream = this._streamRequests.get(params.requestId)
+        if (stream) stream._progress(params)
         const entry = this._pending.get(params.requestId)
-        if (entry) {
-          if (entry.onProgress) entry.onProgress(params.data, params.type)
-          if (entry.stream) entry.stream._progress(params)
-        }
+        if (entry && entry.onProgress) entry.onProgress(params.data, params.type)
         this.emit('progress', params)
         return
       }
@@ -468,6 +475,7 @@ export class ZuvRust extends EventEmitter {
     }
     if (entry.stream) {
       this._streams.set(message.result.streamId, entry.stream)
+      this._streamRequests.set(message.id, entry.stream)
       entry.stream._started(message.result)
     }
     entry.resolve(message.result)
@@ -495,6 +503,7 @@ export class ZuvRust extends EventEmitter {
     this._pending.clear()
     for (const handle of this._streams.values()) handle._fail(error)
     this._streams.clear()
+    this._streamRequests.clear()
   }
 }
 

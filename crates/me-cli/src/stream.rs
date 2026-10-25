@@ -695,20 +695,18 @@ fn frames_to_stdout(input: &str, opts: StreamOptions) -> Result<u8> {
         },
         None => None,
     };
+    #[cfg(feature = "audio")]
+    if video_track.is_none() && audio_decoder.is_none() {
+        return Err(MediaError::Container(match &audio_note {
+            Some(n) => format!("{input}: 没有可播的轨道（{n}）"),
+            None => format!("{input}: 这条输入里没有可播的轨道"),
+        }));
+    }
+    #[cfg(not(feature = "audio"))]
     if video_track.is_none() {
-        #[cfg(feature = "audio")]
-        {
-            return Err(MediaError::Container(match &audio_note {
-                Some(n) => format!("{input}: 没有可播的轨道（{n}）"),
-                None => format!("{input}: 这条输入里没有可播的轨道"),
-            }));
-        }
-        #[cfg(not(feature = "audio"))]
-        {
-            return Err(MediaError::Container(format!(
-                "{input}: 这条输入里没有可播的视频轨（当前构建未包含音频解析模块）"
-            )));
-        }
+        return Err(MediaError::Container(format!(
+            "{input}: 这条输入里没有可播的视频轨（当前构建未包含音频解析模块）"
+        )));
     }
 
     let out_tracks: Vec<Track> = video_track.iter().cloned().collect();

@@ -67,7 +67,7 @@ export interface MuxOptions extends RequestOptions {
   tracks?: 'both' | 'audio' | 'video'
 }
 
-export interface RemuxOptions extends RequestOptions {}
+export interface RemuxOptions extends MuxOptions {}
 
 export interface DownloadOptions extends RequestOptions {
   output?: string
@@ -81,6 +81,10 @@ export interface DecodeOptions extends RequestOptions {
   count?: number
   seek?: number
   noGrow?: boolean
+  /** Decoder preference: auto (default), hardware-only, software-only. */
+  decodeMode?: 'auto' | 'hardware' | 'software'
+  /** Decoder thread count; omitted/0 = engine default. */
+  threads?: number
 }
 
 export interface StreamOptions extends RequestOptions {
@@ -89,12 +93,18 @@ export interface StreamOptions extends RequestOptions {
   seek?: number
   fragmentMs?: number
   audioPcm?: boolean
+  /** Forward raw MEV1 chunks instead of parsing them into video/audio events. */
+  rawFrames?: boolean
   avail?: string
   waitTimeoutMs?: number
   grow?: boolean
   size?: number
   maxHeight?: number
   maxBandwidth?: number
+  /** Decoder preference: auto (default), hardware-only, software-only. */
+  decodeMode?: 'auto' | 'hardware' | 'software'
+  /** Decoder thread count; omitted/0 = engine default. */
+  threads?: number
 }
 
 export interface MetaEvent {
@@ -110,6 +120,11 @@ export interface ProgressEvent {
 
 export interface Fmp4Event {
   type: 'fmp4'
+  data: Buffer
+}
+
+export interface RawFramesEvent {
+  type: 'frames'
   data: Buffer
 }
 
@@ -139,6 +154,7 @@ export type StreamEvent =
   | MetaEvent
   | ProgressEvent
   | Fmp4Event
+  | RawFramesEvent
   | VideoEvent
   | AudioEvent
   | EndEvent

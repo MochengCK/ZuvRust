@@ -175,8 +175,9 @@ fn start_stream(client: &mut Client, params: Value) -> (u64, Value) {
     }
 }
 
-fn drain_stream(client: &mut Client, stream_id: u64) -> (Vec<u8>, bool) {
+fn drain_stream(client: &mut Client, stream_id: u64) -> (Vec<u8>, bool, Vec<String>) {
     let mut bytes = Vec::new();
+    let mut progress = Vec::new();
     loop {
         let (ty, payload) = client.recv();
         if ty == TYPE_BINARY {
@@ -187,9 +188,19 @@ fn drain_stream(client: &mut Client, stream_id: u64) -> (Vec<u8>, bool) {
             continue;
         }
         let value: Value = serde_json::from_slice(&payload).unwrap();
+        if value.get("method").and_then(Value::as_str) == Some("progress") {
+            if let Some(ty) = value["params"]["type"].as_str() {
+                progress.push(ty.to_string());
+            }
+            continue;
+        }
         if value.get("method").and_then(Value::as_str) == Some("stream/end") {
             assert_eq!(value["params"]["streamId"], stream_id);
-            return (bytes, value["params"]["ok"].as_bool().unwrap_or(false));
+            return (
+                bytes,
+                value["params"]["ok"].as_bool().unwrap_or(false),
+                progress,
+            );
         }
     }
 }
@@ -278,17 +289,41 @@ fn serve_exposes_a_framed_json_rpc_api() {
         "合并产物缺音频轨"
     );
 
+    let remuxed = dir.join("remuxed.mkv");
+    let remux = client.call(
+        "remux",
+        json!({
+            "output": remuxed.to_string_lossy(),
+            "input": out.to_string_lossy(),
+            "fragmentMs": 500,
+            "tracks": "both"
+        }),
+    );
+    assert!(remux.get("error").is_none(), "remux 失败：{remux}");
+    assert!(remuxed.is_file() && std::fs::metadata(&remuxed).unwrap().len() > 0);
+
     // 流式 fMP4：先拿 result（streamId + meta），之后是二进制帧，最后 stream/end。
+    // decodeMode/threads 对 fMP4 不生效，但必须被接受并透传到子进程环境。
     let (stream_id, meta) = start_stream(
         &mut client,
-        json!({"input": video.to_string_lossy(), "mode":"fmp4", "fragmentMs":500}),
+        json!({
+            "input": video.to_string_lossy(),
+            "mode": "fmp4",
+            "fragmentMs": 500,
+            "decodeMode": "software",
+            "threads": 2
+        }),
     );
     assert!(
         meta["mime"].as_str().unwrap_or("").starts_with("video/mp4"),
         "流元信息不对：{meta}"
     );
-    let (bytes, end_ok) = drain_stream(&mut client, stream_id);
+    let (bytes, end_ok, progress) = drain_stream(&mut client, stream_id);
     assert!(end_ok, "stream/end 不是 ok");
+    assert!(
+        progress.iter().any(|p| p == "playhead"),
+        "流式播放必须上报 playhead（客户端据此优先下载）：{progress:?}"
+    );
     assert!(
         bytes.windows(4).any(|w| w == b"ftyp"),
         "流式 fMP4 里没有 ftyp（拿到 {} 字节）",
@@ -313,6 +348,14 @@ fn serve_exposes_a_framed_json_rpc_api() {
         assert_eq!(error["code"], 1002);
         assert_eq!(error["data"]["kind"], "unsupported");
     }
+
+    // 非法的解码方式属于参数错误（不是引擎内部错误）。
+    let bad_mode = client.call(
+        "stream",
+        json!({"input": video.to_string_lossy(), "decodeMode": "nope"}),
+    );
+    let error = bad_mode.get("error").expect("非法 decodeMode 必须报错");
+    assert_eq!(error["code"], -32602);
 
     client.shutdown();
     let _ = std::fs::remove_dir_all(&dir);

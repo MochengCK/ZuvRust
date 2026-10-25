@@ -142,9 +142,13 @@ result is the same object as the CLI `mux --json` result.
 
 ```json
 {"jsonrpc":"2.0","id":4,"method":"remux","params":{
-  "output":"/media/out.mkv","input":"/media/in.ts"
+  "output":"/media/out.mkv","input":"/media/in.ts",
+  "fragmentMs":2000,"tracks":"both"
 }}
 ```
+
+`output`, `input` are required. `fragmentMs` and `tracks` are optional and have
+the same meaning as in `mux`. Progress notifications use type `mux`.
 
 ### `download`
 
@@ -173,7 +177,9 @@ Progress notifications use type `download`.
 
 Video mode writes `frame-000001.nv12` files plus `frames.json` into `out`.
 Audio mode (`"audio": true`, `"out": "/media/audio.wav"`) writes a WAV.
-`noGrow` disables growing-file reads. Progress notifications use type
+`noGrow` disables growing-file reads. `decodeMode` is `auto` (default),
+`hardware` (hardware only) or `software` (never touch hardware); `threads`
+sets the decoder thread count. Progress notifications use type
 `decode-progress`.
 
 ### `stream`
@@ -199,7 +205,9 @@ Audio mode (`"audio": true`, `"out": "/media/audio.wav"`) writes a WAV.
 
 Optional fields: `mode`, `seek` (seconds), `fragmentMs`, `audioPcm`, `avail`
 (availability bitmap path), `waitTimeoutMs`, `grow`, `size`, `maxHeight`,
-`maxBandwidth`.
+`maxBandwidth`, `decodeMode` (`auto|hardware|software`), `threads` (decoder
+thread count). `decodeMode`/`threads` are applied to the job child process; the
+shared service process itself is unaffected.
 
 The response is sent as soon as the stream is ready:
 
@@ -247,7 +255,9 @@ payload    len bytes
 
 Video payload is compact NV12 (`w*h` luma + `w*(h/2)` interleaved chroma).
 Audio payload is interleaved S16LE. A chunk may split a packet; clients must
-buffer across binary frames (the SDK does this).
+buffer across binary frames (the SDK does this). If you only need to forward the
+packet stream unchanged, pass `rawFrames: true` to the SDK and it will emit
+`{type:"frames", data}` chunks without parsing.
 
 ### `cancel`
 

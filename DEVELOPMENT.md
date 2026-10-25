@@ -358,30 +358,45 @@ await engine.close()
 
 ### 6.2 前端（Electron）
 
-前端的职责只有两件：
+桌面端现在**统一走 `serve --stdio`**，不再由渲染进程 spawn 引擎：
 
-1. 拼命令行、起进程、按行读 NDJSON、按 `type` 更新界面；
-2. **不再自己合并音视频**（以前是调 `ffmpeg -c copy`），改成
-   `zuvrust mux <输出> <视频> <音频> --json` —— 合并是引擎的事，
-   宿主不该关心容器细节，也不该把"能不能合"绑在用户机器上装没装 FFmpeg。
+```
+渲染进程 EngineClient.vue
+   └─ IPC (media-engine:*)
+        └─ 主进程 MediaEngineService（单例）
+             ├─ EngineApi（JSON-RPC 客户端）
+             ├─ 合并 / 探测 / 转封装
+             └─ EnginePlayer（API stream + 背压）
+```
 
-具体落点：
+- 渲染进程只发 `probe/mux/remux/download/decode` IPC，进度经
+  `media-engine:progress` 回来；超时/卸载用 `media-engine:cancel` 取消。
+- 播放只在主进程：`EnginePlayer` 用 API `stream`，把原始 MEV1/fMP4 块写进
+  `MediaStreamServer` 的响应体；seek = 取消旧流、按新位置再开一条。
+- `decodeMode` / `threads` 作为 API 参数按流传给子进程，不再靠渲染进程拼
+  `ME_DECODE` / `ME_THREADS` 环境变量。
+- 具体落点：
 
-| 位置 | 改动 |
+| 位置 | 作用 |
 |---|---|
-| `src/shared/zuvrust/index.js` | 引擎适配层（**纯函数**，可单测）：二进制定位、NDJSON 解析、错误文案、产物校验 |
-| `src/renderer/components/Native/EngineClient.vue` | 合并路径改调 `zuvrust mux`；校验产物改调 `zuvrust probe`；换容器改调 `zuvrust remux`；**ffmpeg 相关代码全部移除** |
-| `test/zuvrust/run.mjs` | 适配层单测 + 引擎真实契约测试（`npm run test:zuvrust`） |
+| `src/main/engine/EngineApi.js` | 分帧 JSON-RPC 客户端（请求/进度/取消/原始流） |
+| `src/main/engine/MediaEngineService.js` | 主进程单例、路径热替换、退出关闭 |
+| `src/main/engine/ipc.js` | `media-engine:*` IPC 契约 |
+| `src/shared/zuvrust/index.js` | 纯函数：二进制定位、进度归一化、解码偏好 |
+| `src/main/playback/EnginePlayer.js` | API stream → HTTP 响应（元信息/背压/seek） |
+| `src/renderer/components/Native/EngineClient.vue` | 合并/探测/转封装改走 IPC |
+| `test/zuvrust/run.mjs` | 适配层 + `EngineApi` 真实契约测试 |
+| `test/playback/run.mjs` | 播放数据通路（含背压、seek、播放头） |
 
-**引擎缺失时直接报错**（不再回退 ffmpeg）：回退会让"引擎坏了"这件事永远
-没人发现，而且两条路径的产物形态会不一致。缺引擎时的提示文案里写明
-二进制该放在哪里。
+**引擎缺失/版本过旧时直接报错**（不回退 ffmpeg，也不回退 CLI）：回退会把
+"引擎坏了"藏起来，而且两条路径的产物形态会不一致。宿主提示里写明二进制
+该放在哪里。
 
 ### 6.3 Android
 
 同样只调二进制（`assets/zuvrust` 解包到应用私有目录后执行），
-**不链接引擎代码**：APK 不需要为每个 ABI 重新链接引擎，
-引擎升级也不需要重新发版宿主。
+**不链接引擎代码**。Android 端可直接说 `serve --stdio` 的 JSON-RPC；
+引擎升级不需要重新发版宿主。
 
 ### 6.4 与下载引擎的分工（重要边界）
 

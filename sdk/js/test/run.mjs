@@ -69,7 +69,7 @@ async function main () {
   {
     const video = mev1(0, 640, 360, 123456n, Buffer.from([1, 2, 3, 4]))
     const audio = mev1(1, 48000, 2, 123456n, Buffer.from([5, 6]))
-    const handle = new StreamHandle({ _streams: new Map() })
+    const handle = new StreamHandle({ _streams: new Map(), _streamRequests: new Map() })
     // 故意拆成两段，验证跨 chunk 的粘包处理。
     handle._push(1, Buffer.concat([video, audio]).subarray(0, 31))
     handle._push(1, Buffer.concat([video, audio]).subarray(31))
@@ -80,12 +80,20 @@ async function main () {
     ok(events.some(e => e.type === 'audio' && e.sampleRate === 48000 && e.channels === 2), 'SDK 解出音频帧')
     eq(events.filter(e => e.type === 'end').length, 1, 'SDK 收到 end 事件')
 
-    const fmp4 = new StreamHandle({ _streams: new Map() })
+    const fmp4 = new StreamHandle({ _streams: new Map(), _streamRequests: new Map() })
     fmp4._push(0, Buffer.from('fmp4-bytes'))
     fmp4._endedByServer({ ok: true })
     const fmp4Events = []
     for await (const event of fmp4) fmp4Events.push(event)
     eq(fmp4Events[0].type, 'fmp4', 'SDK 透传 fMP4 字节')
+
+    const raw = new StreamHandle({ _streams: new Map(), _streamRequests: new Map() }, { rawFrames: true })
+    raw._push(1, Buffer.concat([video, audio]))
+    raw._endedByServer({ ok: true })
+    const rawEvents = []
+    for await (const event of raw) rawEvents.push(event)
+    eq(rawEvents[0].type, 'frames', 'rawFrames 模式不透传解析后的帧')
+    eq(rawEvents[0].data.length, video.length + audio.length, 'rawFrames 原样转发 MEV1 字节')
   }
 
   if (!existsSync(bin)) {

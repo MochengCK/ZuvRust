@@ -462,8 +462,8 @@ fn execute_job(
 }
 
 fn run_oneshot(job: &Arc<Job>, writer: &Arc<FrameWriter>) -> std::result::Result<(), RpcError> {
-    let args = build_args(&job.method, &job.params)?;
-    let mut child = spawn_engine(&args)?;
+    let (args, env) = build_args(&job.method, &job.params)?;
+    let mut child = spawn_engine(&args, &env)?;
     let stdout = child
         .stdout
         .take()
@@ -547,8 +547,8 @@ fn run_stream(
     next_stream: &Arc<AtomicU32>,
     request_key: &str,
 ) -> std::result::Result<(), RpcError> {
-    let (args, kind) = build_stream_args(&job.params)?;
-    let mut child = spawn_engine(&args)?;
+    let (args, kind, env) = build_stream_args(&job.params)?;
+    let mut child = spawn_engine(&args, &env)?;
     let stdout = child
         .stdout
         .take()
@@ -750,7 +750,7 @@ fn log_notification(request_id: &Value, line: &str) -> Value {
 // 子进程
 // ---------------------------------------------------------------------------
 
-fn spawn_engine(args: &[String]) -> std::result::Result<Child, RpcError> {
+fn spawn_engine(args: &[String], env: &[(String, String)]) -> std::result::Result<Child, RpcError> {
     let exe = std::env::current_exe()
         .map_err(|e| RpcError::internal(format!("locate engine binary: {e}")))?;
     let mut cmd = Command::new(exe);
@@ -758,6 +758,9 @@ fn spawn_engine(args: &[String]) -> std::result::Result<Child, RpcError> {
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (key, value) in env {
+        cmd.env(key, value);
+    }
     #[cfg(target_os = "windows")]
     {
         use std::os::windows::process::CommandExt;
@@ -877,8 +880,12 @@ impl EngineError {
 // 参数 → CLI 参数
 // ---------------------------------------------------------------------------
 
-fn build_args(method: &str, params: &Value) -> std::result::Result<Vec<String>, RpcError> {
+fn build_args(
+    method: &str,
+    params: &Value,
+) -> std::result::Result<(Vec<String>, Vec<(String, String)>), RpcError> {
     let mut args = vec![method.to_string()];
+    let mut env = Vec::new();
     match method {
         "probe" => {
             args.push(need_str(params, "input", "probe")?);
@@ -891,33 +898,17 @@ fn build_args(method: &str, params: &Value) -> std::result::Result<Vec<String>, 
         }
         "mux" => {
             args.push(need_str(params, "output", "mux")?);
-            let inputs = params
-                .get("inputs")
-                .and_then(Value::as_array)
-                .filter(|a| !a.is_empty())
-                .ok_or_else(|| RpcError::invalid_params("`inputs` must be a non-empty array"))?;
-            for input in inputs {
-                let s = input
-                    .as_str()
-                    .ok_or_else(|| RpcError::invalid_params("`inputs` must contain strings"))?;
-                args.push(s.to_string());
-            }
+            push_inputs(&mut args, params)?;
             push_num(&mut args, "fragment-ms", opt_u64(params, "fragmentMs"));
-            match params.get("tracks").and_then(Value::as_str) {
-                None | Some("both") => {}
-                Some("audio") => args.push("--audio-only".into()),
-                Some("video") => args.push("--video-only".into()),
-                Some(_) => {
-                    return Err(RpcError::invalid_params(
-                        "`tracks` must be both|audio|video",
-                    ))
-                }
-            }
+            push_tracks(&mut args, params)?;
             args.push("--progress".into());
         }
         "remux" => {
             args.push(need_str(params, "output", "remux")?);
             args.push(need_str(params, "input", "remux")?);
+            push_num(&mut args, "fragment-ms", opt_u64(params, "fragmentMs"));
+            push_tracks(&mut args, params)?;
+            args.push("--progress".into());
         }
         "download" => {
             args.push(need_str(params, "input", "download")?);
@@ -943,15 +934,18 @@ fn build_args(method: &str, params: &Value) -> std::result::Result<Vec<String>, 
             if opt_bool(params, "noGrow") == Some(true) {
                 args.push("--no-grow".into());
             }
+            env = decode_env(params)?;
         }
-        "stream" => return build_stream_args(params).map(|(a, _)| a),
+        "stream" => return build_stream_args(params).map(|(a, _, e)| (a, e)),
         other => return Err(RpcError::method_not_found(other)),
     }
     args.push("--json".into());
-    Ok(args)
+    Ok((args, env))
 }
 
-fn build_stream_args(params: &Value) -> std::result::Result<(Vec<String>, u32), RpcError> {
+fn build_stream_args(
+    params: &Value,
+) -> std::result::Result<(Vec<String>, u32, Vec<(String, String)>), RpcError> {
     let mut args = vec!["stream".to_string(), need_str(params, "input", "stream")?];
     let mode = params.get("mode").and_then(Value::as_str).unwrap_or("fmp4");
     let kind = match mode {
@@ -980,7 +974,60 @@ fn build_stream_args(params: &Value) -> std::result::Result<(Vec<String>, u32), 
         args.push("--no-grow".into());
     }
     args.push("--json".into());
-    Ok((args, kind))
+    let env = decode_env(params)?;
+    Ok((args, kind, env))
+}
+
+/// `decodeMode` / `threads` → 子进程环境变量。只影响解码任务。
+fn decode_env(params: &Value) -> std::result::Result<Vec<(String, String)>, RpcError> {
+    let mut env = Vec::new();
+    if let Some(mode) = params.get("decodeMode").and_then(Value::as_str) {
+        match mode {
+            "auto" => {}
+            "hardware" => env.push(("ME_DECODE".to_string(), "hardware".to_string())),
+            "software" => env.push(("ME_DECODE".to_string(), "software".to_string())),
+            _ => {
+                return Err(RpcError::invalid_params(
+                    "`decodeMode` must be auto|hardware|software",
+                ))
+            }
+        }
+    }
+    if let Some(threads) = opt_u64(params, "threads") {
+        if threads > 0 {
+            env.push(("ME_THREADS".to_string(), threads.min(256).to_string()));
+        }
+    }
+    Ok(env)
+}
+
+fn push_inputs(args: &mut Vec<String>, params: &Value) -> std::result::Result<(), RpcError> {
+    let inputs = params
+        .get("inputs")
+        .and_then(Value::as_array)
+        .filter(|a| !a.is_empty())
+        .ok_or_else(|| RpcError::invalid_params("`inputs` must be a non-empty array"))?;
+    for input in inputs {
+        let s = input
+            .as_str()
+            .ok_or_else(|| RpcError::invalid_params("`inputs` must contain strings"))?;
+        args.push(s.to_string());
+    }
+    Ok(())
+}
+
+fn push_tracks(args: &mut Vec<String>, params: &Value) -> std::result::Result<(), RpcError> {
+    match params.get("tracks").and_then(Value::as_str) {
+        None | Some("both") => {}
+        Some("audio") => args.push("--audio-only".into()),
+        Some("video") => args.push("--video-only".into()),
+        Some(_) => {
+            return Err(RpcError::invalid_params(
+                "`tracks` must be both|audio|video",
+            ))
+        }
+    }
+    Ok(())
 }
 
 fn push_num(args: &mut Vec<String>, name: &str, value: Option<u64>) {
