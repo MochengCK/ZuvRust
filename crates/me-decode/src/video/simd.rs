@@ -1469,6 +1469,35 @@ mod x86 {
         }
     }
 
+    /// `a2 = ((z << 8) + z/2) / (z + 1)` 的**浮点等价式**（2026-10-25）。
+    ///
+    /// 对 `z ∈ [1, 254]`，这个整数式与 `round(256·z/(z+1))`（就近取偶）**逐值相同**：
+    /// `256z/(z+1) = 256 − 256/(z+1)`，值恰好落在 `x.5` 上当且仅当
+    /// `512/(z+1)` 是奇数，而区间内 `z+1 ∈ [2,255]` 不含这样的值（512 的奇商只有
+    /// `z+1 = 512`）。`z = 0` 取 1、`z >= 255` 取 256，与常量表一致。
+    /// 单测 `sgr_a2_vec_matches_integer_formula` 对 `0..=255` 全量对拍。
+    ///
+    /// 为什么值得：`vpgatherdd` 在本机约 12~20 uop、20 拍延迟，而这里是
+    /// 2 次 `cvtdq2ps` + 1 次 `vdivps`（吞吐 5 拍）+ 1 次 `cvtps2dq` + max/blend。
+    /// ⚠️ `z < 0`（`p·s_factor` 的 i32 溢出档）**不走这里**：调用方仍用标量兜底，
+    /// 本函数只保证非负输入与表相同（负输入被夹到 0 ⇒ 返回 1，调用方随后覆盖）。
+    ///
+    /// # Safety
+    /// 必须已确认 AVX2 可用。
+    #[target_feature(enable = "avx2")]
+    pub(crate) unsafe fn sgr_a2_vec(z: __m256i) -> __m256i {
+        let zero = _mm256_setzero_si256();
+        let zc = _mm256_min_epi32(_mm256_max_epi32(z, zero), _mm256_set1_epi32(255));
+        let zf = _mm256_cvtepi32_ps(zc);
+        let q = _mm256_div_ps(
+            _mm256_mul_ps(_mm256_set1_ps(256.0), zf),
+            _mm256_add_ps(zf, _mm256_set1_ps(1.0)),
+        );
+        let a2 = _mm256_max_epi32(_mm256_cvtps_epi32(q), _mm256_set1_epi32(1));
+        let hi = _mm256_cmpgt_epi32(zc, _mm256_set1_epi32(254));
+        _mm256_blendv_epi8(a2, _mm256_set1_epi32(256), hi)
+    }
+
     /// `box_filter` 里 **A/B 表**那段"每输出一次"的算术（§7.17.3），一次 8 列。
     ///
     /// 规范对每个输出 (i,j) 要算：
@@ -1533,7 +1562,12 @@ mod x86 {
         // 先把 `z` 夹到 `[0,255]`（表末项已改成 256 ⇒ `z >= 255` 也正确），
         // 负值（真实素材里会因 i32 溢出出现）再用标量兜底。
         let idx = _mm256_min_epi32(_mm256_max_epi32(z, _mm256_setzero_si256()), _mm256_set1_epi32(255));
-        let mut a2v = if crate::video::flags::no_sgr_gather() {
+        let mut a2v = if !crate::video::flags::no_sgr_gather()
+            && !crate::video::flags::no_sgr_float()
+        {
+            // 2026-10-25：**浮点等价式**取代 `vpgatherdd`（见 [`sgr_a2_vec`]）。
+            sgr_a2_vec(z)
+        } else if crate::video::flags::no_sgr_gather() {
             let mut zs = [0i32; 8];
             _mm256_storeu_si256(zs.as_mut_ptr() as *mut __m256i, z);
             let mut a2s = [0i32; 8];
@@ -4991,7 +5025,8 @@ pub(crate) use x86::{
     mc_shift_rows, mc_vert8,
     mc_vert_rows_8bpc, mc_vert_rows_u16, comp_avg_rows, mc_vert2_avg_u16, add_residual_u16,
     deblock_edge8_h, add_residual_u16_rev, dequantize_8,
-    sgr_ab_8, sgr_cols_update8, sgr_final_8, sgr_final_8_pat, sgr_prefix8, store_row_clamped,
+    sgr_ab_8, sgr_a2_vec, sgr_cols_update8, sgr_final_8, sgr_final_8_pat, sgr_prefix8,
+    store_row_clamped,
     wiener_horiz_rows,
     wiener_vert_row,
     intra_smooth_row, cdef_direction_avx2_x2, copy_rect_u16, add_const_plane, sgr_proj_row8,
@@ -5638,6 +5673,47 @@ pub(crate) unsafe fn mc_horiz8(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`sgr_a2_vec`] 的浮点等价式必须与**整数原式**
+    /// `((z << 8) + z/2) / (z + 1)` 逐值相同（`z = 0` 取 1、`z >= 255` 取 256）。
+    ///
+    /// 覆盖 `0..=255` 全表 + 越界正数（`>= 255` 一律 256）。
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn sgr_a2_vec_matches_integer_formula() {
+        use std::arch::x86_64::*;
+        if !avx2_available() {
+            return;
+        }
+        let mut zs: Vec<i32> = (0..256).collect();
+        zs.extend_from_slice(&[255, 256, 1000, 65_535, i32::MAX]);
+        while zs.len() % 8 != 0 {
+            zs.push(0);
+        }
+        let mut got = vec![0i32; zs.len()];
+        for chunk in 0..zs.len() / 8 {
+            // SAFETY: 已判 AVX2；每次读写 8 个 i32，下标在界内。
+            unsafe {
+                let v = _mm256_loadu_si256(zs.as_ptr().add(chunk * 8) as *const __m256i);
+                _mm256_storeu_si256(
+                    got.as_mut_ptr().add(chunk * 8) as *mut __m256i,
+                    sgr_a2_vec(v),
+                );
+            }
+        }
+        for (i, &z) in zs.iter().enumerate() {
+            let want = if z >= 255 {
+                256
+            } else if z > 0 {
+                ((z << 8) + (z / 2)) / (z + 1)
+            } else if z == 0 {
+                1
+            } else {
+                1 // 负值调用方另行覆盖；这里只锁"夹到 0 ⇒ 1"
+            };
+            assert_eq!(got[i], want, "z={z}");
+        }
+    }
 
     /// [`sgr_prefix8`] 必须与**朴素前缀和**逐项相同（含负值、跨 8 段进位、尾巴）。
     #[cfg(target_arch = "x86_64")]

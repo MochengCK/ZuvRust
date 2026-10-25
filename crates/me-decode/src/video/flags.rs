@@ -197,6 +197,9 @@ bool_flag! {
     /// `ME_NO_SGR_PREFIX=1`（**诊断**）：SGR 前缀和退回逐列标量。
     /// 两条路**逐字节相同**。
     no_sgr_prefix = "ME_NO_SGR_PREFIX";
+    /// `ME_NO_SGR_FLOAT=1`（**诊断**）：SGR 的 `a2` 退回 `vpgatherdd` 查表。
+    /// 两条路**逐字节相同**（有全量对拍单测）。
+    no_sgr_float = "ME_NO_SGR_FLOAT";
     /// `ME_LR_STATS=1`（**诊断**）：打印 SGR 三段（box0 / box1 / 收尾）的累计耗时。
     lr_stats = "ME_LR_STATS";
     /// `ME_EOB_STATS=1`（**诊断**）：每帧打印 `eob` 分布（块数 / 像素数）。
