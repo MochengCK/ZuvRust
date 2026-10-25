@@ -1173,13 +1173,29 @@ fn nv12_frame(frame: &CurrFrame, pts_us: i64) -> Result<VideoFrame> {
         // ⇒ 每帧上千次真实调用，测出来 +1.9%。现在整个平面一次调用（行循环在内核里）。
         let (luma_row, dst) = (frame.planes[0].stride, &mut nv12[..w * h]);
         let src = frame.planes[0].px16();
-        // ⚠️ 两次显式 AVX2（逐行 / 整平面一次调用）都更慢（+1.9% / +0.4%）——
-        // LLVM 的自动向量化已经够好，这一段的瓶颈是**内存带宽**（读 4.2 MB、写 3.1 MB）。
-        for y in 0..h {
-            let s = &src[y * luma_row..y * luma_row + w];
-            let d = &mut dst[y * w..y * w + w];
-            for (dv, sv) in d.iter_mut().zip(s.iter()) {
-                *dv = (*sv >> shift) as u8;
+        // 2026-10-25：`packus_epi16 + permute4x64` 一次 32 像素（旧的两版显式 AVX2
+        // 是 u16→i32→pack，反而更慢；见第八十五节之后的重测）。
+        if super::simd::avx2_available() && !flags::no_nv12_luma_simd() {
+            // SAFETY: 已判 AVX2；`src` 是整帧亮度平面（行距 `luma_row`，可读 h 行 × w），
+            // `dst` 是 nv12 的亮度区（h 行 × w 字节）。
+            unsafe {
+                super::simd::narrow_u16_u8_rows(
+                    src.as_ptr(),
+                    luma_row,
+                    dst.as_mut_ptr(),
+                    w,
+                    w,
+                    h,
+                    shift,
+                );
+            }
+        } else {
+            for y in 0..h {
+                let s = &src[y * luma_row..y * luma_row + w];
+                let d = &mut dst[y * w..y * w + w];
+                for (dv, sv) in d.iter_mut().zip(s.iter()) {
+                    *dv = (*sv >> shift) as u8;
+                }
             }
         }
     }

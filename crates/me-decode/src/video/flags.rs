@@ -197,6 +197,9 @@ bool_flag! {
     /// `ME_NO_SGR_FINAL_PAT=1`（**诊断**）：SGR 末段 3×3 退回按权重表逐项 `mullo`。
     /// 两条路**逐字节相同**。
     no_sgr_final_pat = "ME_NO_SGR_FINAL_PAT";
+    /// `ME_NO_NV12_LUMA_SIMD=1`（**诊断**）：NV12 亮度收窄退回逐像素标量循环。
+    /// 两条路**逐字节相同**。
+    no_nv12_luma_simd = "ME_NO_NV12_LUMA_SIMD";
     /// `ME_NO_SGR_PREFIX=1`（**诊断**）：SGR 前缀和退回逐列标量。
     /// 两条路**逐字节相同**。
     no_sgr_prefix = "ME_NO_SGR_PREFIX";

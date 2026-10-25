@@ -4382,6 +4382,59 @@ unsafe fn vt_adst_output_permute<const I32: bool>(v: &mut [__m256i], n: u32) {
     /// 一次边界检查）。这里：`min`（钳上界）→ `packus`（负数收成 0、同时收窄成
     /// u16）→ 顺序修正（`packus` 是按 128 位道交错的）→ 一次 16 字节写。
     ///
+    /// 8bit 平面的 **u16 → u8 收窄**（一次 32 像素、按行扫完整平面）。
+    ///
+    /// `packus_epi16` 在 256 位上是**按 128 位 lane** 打包的，直接存出去的顺序是
+    /// `[a0..a7, b0..b7, a8..a15, b8..b15]`，要再 `permute4x64::<0xD8>` 还原成
+    /// `[a0..a15, b0..b15]`。`shift` 是 10/12bit 的右移（8bit 为 0）。
+    ///
+    /// # Safety
+    /// 必须已确认 AVX2 可用；`src` 可读 `h` 行 × `w` 项（行距 `src_stride`），
+    /// `dst` 可写 `h` 行 × `w` 字节（行距 `dst_stride`）。
+    #[target_feature(enable = "avx2")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) unsafe fn narrow_u16_u8_rows(
+        src: *const u16,
+        src_stride: usize,
+        dst: *mut u8,
+        dst_stride: usize,
+        w: usize,
+        h: usize,
+        shift: u32,
+    ) {
+        for y in 0..h {
+            let s = src.add(y * src_stride);
+            let d = dst.add(y * dst_stride);
+            let mut x = 0usize;
+            while x + 32 <= w {
+                let a = _mm256_loadu_si256(s.add(x) as *const __m256i);
+                let b = _mm256_loadu_si256(s.add(x + 16) as *const __m256i);
+                let (a, b) = match shift {
+                    0 => (a, b),
+                    2 => (_mm256_srli_epi16::<2>(a), _mm256_srli_epi16::<2>(b)),
+                    _ => (_mm256_srli_epi16::<4>(a), _mm256_srli_epi16::<4>(b)),
+                };
+                let p = _mm256_permute4x64_epi64::<0xD8>(_mm256_packus_epi16(a, b));
+                _mm256_storeu_si256(d.add(x) as *mut __m256i, p);
+                x += 32;
+            }
+            while x + 8 <= w {
+                let a = _mm_loadu_si128(s.add(x) as *const __m128i);
+                let a = match shift {
+                    0 => a,
+                    2 => _mm_srli_epi16::<2>(a),
+                    _ => _mm_srli_epi16::<4>(a),
+                };
+                _mm_storel_epi64(d.add(x) as *mut __m128i, _mm_packus_epi16(a, a));
+                x += 8;
+            }
+            while x < w {
+                *d.add(x) = (*s.add(x) >> shift) as u8;
+                x += 1;
+            }
+        }
+    }
+
     /// # Safety
     /// 必须已确认 AVX2 可用；`dst` 处可写 `n` 个 u16、`src` 至少 `n` 项。
     #[target_feature(enable = "avx2")]
@@ -5030,6 +5083,7 @@ pub(crate) use x86::{
     wiener_horiz_rows,
     wiener_vert_row,
     intra_smooth_row, cdef_direction_avx2_x2, copy_rect_u16, add_const_plane, sgr_proj_row8,
+    narrow_u16_u8_rows,
 };
 
 /// 非 x86_64：没有 AVX2 内核，`avx2_available()` 恒为 false ⇒ 这两个入口
@@ -5602,6 +5656,20 @@ pub(crate) unsafe fn sgr_final_8(
     _u: *const u16,
     _shift: u32,
     _out: &mut [i32],
+) {
+}
+
+/// 非 x86_64 的 [`narrow_u16_u8_rows`] 桩（`avx2_available()` 恒假 ⇒ 走标量收窄）。
+#[cfg(not(target_arch = "x86_64"))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) unsafe fn narrow_u16_u8_rows(
+    _src: *const u16,
+    _src_stride: usize,
+    _dst: *mut u8,
+    _dst_stride: usize,
+    _w: usize,
+    _h: usize,
+    _shift: u32,
 ) {
 }
 
