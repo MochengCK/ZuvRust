@@ -851,3 +851,204 @@ fn a_combined_input_plus_an_extra_audio_input() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ───────────────────────── 8. 片段裁剪（帧级） ─────────────────────────
+
+/// `remux` + 附加参数，返回结果 JSON。
+fn remux_ok(out: &Path, input: &Path, extra: &[&str]) -> String {
+    let mut args: Vec<String> = vec![
+        "remux".into(),
+        out.to_string_lossy().to_string(),
+        input.to_string_lossy().to_string(),
+    ];
+    for e in extra {
+        args.push((*e).to_string());
+    }
+    args.push("--json".into());
+    let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+    let (ok, stdout, stderr) = run(&refs);
+    assert!(
+        ok,
+        "remux 应当成功：out={} extra={extra:?}\nstderr={stderr}",
+        out.display()
+    );
+    stdout
+}
+
+/// 从结果 JSON 里取一个数字字段（不必引入 serde_json 依赖）。
+fn num_field(json: &str, key: &str) -> Option<i64> {
+    json.split(&format!("\"{key}\":"))
+        .nth(1)
+        .and_then(|s| s.split([',', '}']).next())
+        .and_then(|s| s.trim().parse::<i64>().ok())
+}
+
+/// 在产物里找 `box` 的**第一个字节位置**（盒子类型 + 可选偏移）。
+fn find_box(data: &[u8], kind: &[u8; 4]) -> Option<usize> {
+    data.windows(4).position(|w| w == kind)
+}
+
+/// 帧级裁剪：切点落在两个关键帧之间时，**看到的起点仍然是切点**。
+///
+/// 素材：4 秒 / 30fps / 每秒一个关键帧；裁 `1.5s ~ 2.5s`。
+/// 视频只能从 1.0s 的关键帧开始解码（铺垫 0.5 秒），所以：
+/// - 文件里第一帧的 dts 是 0（铺垫段），
+/// - `edts/elst` 的 `media_time` = 0.5 秒 —— 播放器从 0 秒看到的就是 1.5 秒那一帧，
+/// - 报出来的时长是 1.0 秒（不是 1.5 秒）。
+#[test]
+fn clip_starts_on_the_exact_frame_via_the_edit_list() {
+    let dir = tmp_dir("clip");
+    let src = dir.join("src.mp4");
+    write_fmp4(&src, &[h264_track(1)], &video_packets(1, 4.0, 0));
+    let out = dir.join("out.mp4");
+
+    let json = remux_ok(&out, &src, &["--clip-start=1.5", "--clip-end=2.5"]);
+    assert_close(
+        num_field(&json, "durationUs").unwrap_or(0),
+        1_000_000,
+        60_000,
+        "裁剪后报出的时长",
+    );
+    assert_eq!(num_field(&json, "container"), None, "container 是字符串，不该被当成数字");
+
+    let data = std::fs::read(&out).expect("读产物");
+    let elst = find_box(&data, b"elst").expect("mp4 产物里必须有编辑列表（edts/elst）");
+    // elst 布局：type(已在位置) → version+flags(4) → entry_count(4) → segment_duration(4) → media_time(4)
+    let at = elst + 4 + 4 + 4 + 4;
+    let media_time = u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+    assert_eq!(
+        media_time, 15_000,
+        "media_time 应当是 0.5 秒（1.5s 切点 − 1.0s 关键帧 = 30000 刻度/秒 × 0.5）"
+    );
+
+    // 用**我们自己的解封装器**再读一遍：它会把 `elst` 的 `media_time` 应用成
+    // 时间平移，所以铺垫段应当落在**负时间戳**上、切点那一帧正好是 0 ——
+    // 这一条同时钉住了"编辑列表真的被解析方认，不是写了个没人看的盒子"。
+    let packets = read_dts(&out);
+    assert_eq!(
+        packets.first().map(|(_, d)| *d),
+        Some(-15_000),
+        "铺垫段应当是负时间戳（切点被编辑列表挪到 0）"
+    );
+    assert_eq!(packets.len(), 45, "1.0s~2.5s 之间应当是 45 帧");
+    let last = packets.iter().map(|(_, d)| *d).max().unwrap_or(0);
+    assert_eq!(last, 29_000, "最后一帧在呈现时间轴的 2.4667s（= 44000 − 15000 刻度）");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 只给切尾：起点从 0 开始，不写编辑列表，时长按切尾算。
+#[test]
+fn clip_without_a_start_just_trims_the_tail() {
+    let dir = tmp_dir("clip-tail");
+    let src = dir.join("src.mp4");
+    write_fmp4(&src, &[h264_track(1)], &video_packets(1, 4.0, 0));
+    let out = dir.join("out.mp4");
+
+    let json = remux_ok(&out, &src, &["--clip-end=1.0"]);
+    assert_close(
+        num_field(&json, "durationUs").unwrap_or(0),
+        1_000_000,
+        60_000,
+        "只切尾时的时长",
+    );
+    let data = std::fs::read(&out).expect("读产物");
+    assert!(
+        find_box(&data, b"elst").is_none(),
+        "起点为 0 时不该写编辑列表（普通换封装不能被改坏）"
+    );
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// mkv / ts 没有编辑列表：起点只能落到切点之前的关键帧上（多出最多一个 GOP），
+/// 但**切尾仍然是帧级的**。这条钉住的是「容器能力差异」这个既定行为。
+#[test]
+fn clip_on_matroska_falls_back_to_the_keyframe() {
+    let dir = tmp_dir("clip-mkv");
+    let src = dir.join("src.mp4");
+    write_fmp4(&src, &[h264_track(1)], &video_packets(1, 4.0, 0));
+    let out = dir.join("out.mkv");
+
+    let json = remux_ok(&out, &src, &["--clip-start=1.5", "--clip-end=2.5"]);
+    // 铺垫段没地方藏，所以时长 = 0.5 秒铺垫 + 1.0 秒窗口
+    assert_close(
+        num_field(&json, "durationUs").unwrap_or(0),
+        1_500_000,
+        60_000,
+        "mkv 的时长含解码铺垫",
+    );
+    assert!(out.exists(), "mkv 产物应当存在");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 多输入 + 裁剪：明确拒绝（"第几秒"没有唯一定义），且不留半截产物。
+#[test]
+fn clip_with_multiple_inputs_is_rejected() {
+    let dir = tmp_dir("clip-multi");
+    let v = dir.join("v.mp4");
+    let a = dir.join("a.mp4");
+    write_fmp4(&v, &[h264_track(1)], &video_packets(1, 2.0, 0));
+    write_fmp4(&a, &[aac_track(2)], &audio_packets(2, 2.0, 0));
+    let out = dir.join("out.mp4");
+
+    // 用 `mux`：`remux` 只认一个输入（多给的会被忽略），多输入的裁剪要在 mux 上验证
+    let (ok, _stdout, stderr) = run(&[
+        "mux",
+        out.to_string_lossy().as_ref(),
+        v.to_string_lossy().as_ref(),
+        a.to_string_lossy().as_ref(),
+        "--clip-start=0.5",
+        "--json",
+    ]);
+    assert!(!ok, "多输入 + 裁剪必须报错");
+    assert!(
+        stderr.contains("片段裁剪") || stderr.contains("单个输入"),
+        "错误信息要说清是裁剪的限制，实际：{stderr}"
+    );
+    assert!(!out.exists(), "失败时不能留下产物");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 分片输入：seek 只能定位到**含关键帧的分片开头**，落点之前还夹着预滚帧。
+/// 这些帧必须丢掉，否则文件起点比落点更早，`elst.media_time` 会整体偏掉
+/// （最多一个分片，实测 2 秒 —— 用户看到的就是"起点比我拖的位置早两秒"）。
+#[test]
+fn clip_drops_the_fragment_preroll_before_the_landing_keyframe() {
+    let dir = tmp_dir("clip-preroll");
+    let src = dir.join("src.mp4");
+    // 分片 2 秒、关键帧每秒一个：切 1.5s 时关键帧在 1.0s，而它所在的分片从 0 开始
+    {
+        let mut m = Mp4Muxer::new();
+        m.set_fragment_duration_us(2_000_000);
+        m.set_tracks(&[h264_track(1)]).expect("声明轨道");
+        for p in video_packets(1, 4.0, 0) {
+            m.write_packet(&p).expect("写采样");
+        }
+        std::fs::write(&src, m.finish().expect("收尾")).expect("落盘");
+    }
+    let out = dir.join("out.mp4");
+
+    let json = remux_ok(&out, &src, &["--clip-start=1.5", "--clip-end=2.5"]);
+    assert_close(
+        num_field(&json, "durationUs").unwrap_or(0),
+        1_000_000,
+        60_000,
+        "裁剪后报出的时长",
+    );
+
+    let data = std::fs::read(&out).expect("读产物");
+    let elst = find_box(&data, b"elst").expect("应当有编辑列表");
+    let at = elst + 4 + 4 + 4 + 4;
+    let media_time = u32::from_be_bytes([data[at], data[at + 1], data[at + 2], data[at + 3]]);
+    assert_eq!(media_time, 15_000, "media_time 必须是 0.5 秒（落点 1.0s，不是分片起点 0s）");
+
+    // 预滚帧被丢掉：第一帧就是落点关键帧（读回来被 elst 平移成 -15000）
+    let packets = read_dts(&out);
+    assert_eq!(packets.first().map(|(_, d)| *d), Some(-15_000));
+    assert_eq!(packets.len(), 45, "1.0s~2.5s 是 45 帧；多出来就是预滚帧没丢");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}

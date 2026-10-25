@@ -150,6 +150,24 @@ result is the same object as the CLI `mux --json` result.
 `output`, `input` are required. `fragmentMs` and `tracks` are optional and have
 the same meaning as in `mux`. Progress notifications use type `mux`.
 
+`clipStart` / `clipEnd` (seconds, optional) keep only that window:
+
+```json
+{"jsonrpc":"2.0","id":4,"method":"remux","params":{
+  "output":"/media/clip.mp4","input":"/media/in.mp4",
+  "clipStart":12.5,"clipEnd":30
+}}
+```
+
+`clipStart` alone trims everything before it, `clipEnd` alone keeps the head.
+The cut is **frame-accurate**: video is decoded from the keyframe at or before
+the cut (a mid-GOP start would have no reference frames), and the fMP4 output
+carries an `edts/elst` edit list so playback starts at the requested frame —
+the leading GOP stays in the file as decode lead-in. Matroska and MPEG-TS
+cannot express a start offset, so there the output starts at that keyframe
+(up to one GOP earlier); the end cut is frame-accurate in every container.
+Clipping requires exactly one `input`.
+
 ### `download`
 
 ```json

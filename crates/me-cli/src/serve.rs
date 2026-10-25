@@ -923,6 +923,9 @@ fn build_args(
             args.push(need_str(params, "output", "remux")?);
             args.push(need_str(params, "input", "remux")?);
             push_num(&mut args, "fragment-ms", opt_u64(params, "fragmentMs"));
+            // 片段裁剪（秒）：帧级切点，见 mux::ClipRange
+            push_secs(&mut args, "clip-start", opt_f64(params, "clipStart"));
+            push_secs(&mut args, "clip-end", opt_f64(params, "clipEnd"));
             push_tracks(&mut args, params)?;
             args.push("--progress".into());
         }
@@ -1048,6 +1051,13 @@ fn push_tracks(args: &mut Vec<String>, params: &Value) -> std::result::Result<()
 
 fn push_num(args: &mut Vec<String>, name: &str, value: Option<u64>) {
     if let Some(v) = value {
+        args.push(format!("--{name}={v}"));
+    }
+}
+
+/// 带小数的秒数（`clipStart` / `clipEnd` 这类）。NaN/Inf 直接忽略。
+fn push_secs(args: &mut Vec<String>, name: &str, value: Option<f64>) {
+    if let Some(v) = value.filter(|v| v.is_finite()) {
         args.push(format!("--{name}={v}"));
     }
 }

@@ -306,9 +306,31 @@ fn mux_files(args: &[String], output: &str, inputs: &[&str]) -> Result<u8> {
     } else {
         mux::TrackChoice::Both
     };
+    // 片段裁剪：`--clip-start=12.5 --clip-end=30`（秒，浮点）。
+    //
+    // 两个都给才成窗口？不是 —— 只给 end 就是"从开头到第 30 秒"，只给 start
+    // 就是"从第 12.5 秒到结尾"。end <= start 视为没给（那是空窗口，不是错误：
+    // 界面上拖到头时正好相等）。
+    let clip_start = opt(args, "clip-start")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v >= 0.0);
+    let clip_end = opt(args, "clip-end")
+        .and_then(|v| v.parse::<f64>().ok())
+        .filter(|v| v.is_finite() && *v > 0.0);
+    let clip = match (clip_start, clip_end) {
+        (None, None) => None,
+        (start, end) => {
+            let start_us = start.map(|v| (v * 1_000_000.0).round() as i64).unwrap_or(0);
+            let end_us = end
+                .map(|v| (v * 1_000_000.0).round() as i64)
+                .filter(|v| *v > start_us);
+            Some(mux::ClipRange { start_us, end_us })
+        }
+    };
     let opts = mux::MergeOptions {
         fragment_us: opt(args, "fragment-ms").and_then(|v| v.parse::<i64>().ok()).map(|ms| ms.clamp(20, 30_000) * 1000),
         tracks,
+        clip,
     };
     let outcome = mux::mux_to_file(output, &refs, opts, has_flag(args, "--progress"), &cancel)?;
     emit(args, &mux::outcome_json(&outcome));

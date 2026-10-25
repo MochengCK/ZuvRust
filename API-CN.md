@@ -51,7 +51,7 @@ type 1  := 二进制流块：
 | `ping` | 健康检查 |
 | `probe` | 容器与轨道信息 |
 | `mux` | 合并/串接输入为一个文件 |
-| `remux` | 换容器，不重编码 |
+| `remux` | 换容器，不重编码（可带 `clipStart`/`clipEnd` 做帧级片段裁剪） |
 | `download` | 下载 HTTP/HLS/DASH |
 | `decode` | 视频解码成帧，或音频解码成 WAV |
 | `stream` | 输出 fMP4 字节流或解码帧流 |

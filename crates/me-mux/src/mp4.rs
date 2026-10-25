@@ -77,6 +77,13 @@ struct EsTrack {
     last_dts: Option<i64>,
     /// 最近一次见到的非零时长（给分片最后一条采样兜底）。
     last_duration: u32,
+    /// 编辑列表的媒体起点（本轨刻度）：> 0 时写 `edts/elst`。
+    ///
+    /// 片段裁剪要用：视频切片只能从关键帧起（否则首帧没有参考帧，解码就是花屏），
+    /// 而用户要的切点通常落在关键帧之后。把这一段"解码铺垫"留在文件里、用编辑
+    /// 列表把**呈现起点**挪到真正的切点，播放器从 0 秒看到的就是切点那一帧 ——
+    /// 这就是"帧级裁剪"在只搬字节（不重编码）前提下的实现方式。
+    edit_onset_ticks: i64,
 }
 
 impl EsTrack {
@@ -156,6 +163,8 @@ pub struct Mp4Muxer {
     /// `ftyp + moov` 是否已经写出。
     header_written: bool,
     packets_written: u64,
+    /// 编辑列表的呈现起点（微秒）：0 = 不写 `edts`（见 [`Mp4Muxer::set_edit_onset_us`]）。
+    edit_onset_us: i64,
 }
 
 impl Default for Mp4Muxer {
@@ -187,6 +196,7 @@ impl Mp4Muxer {
             base_us: None,
             header_written: false,
             packets_written: 0,
+            edit_onset_us: 0,
         }
     }
 
@@ -201,6 +211,18 @@ impl Mp4Muxer {
     /// 播放器的 `currentTime` 与进度条才是媒体真实位置。
     pub fn set_timeline_base_us(&mut self, us: i64) {
         self.base_us = Some(us);
+    }
+
+    /// 设「呈现起点」：写 `edts/elst`，让播放从媒体的第 `us` 微秒开始。
+    ///
+    /// 必须在本结构的 `set_tracks`（它会写 `ftyp + moov`）**之前**调用，
+    /// 之后再设也进不去产物。
+    ///
+    /// 用途是片段裁剪：文件里从关键帧写起（解码需要），但用户要的切点是
+    /// 关键帧之后的某一帧 —— 编辑列表把呈现时间轴的 0 点挪到切点。
+    /// `us <= 0` = 不写（普通合并/换容器不受影响）。
+    pub fn set_edit_onset_us(&mut self, us: i64) {
+        self.edit_onset_us = us.max(0);
     }
 
     /// 已经落盘的分片数（流式播放靠它判断"该把管道刷出去"了）。
@@ -251,6 +273,7 @@ impl Mp4Muxer {
                 next_dts: None,
                 last_dts: None,
                 last_duration: 0,
+                edit_onset_ticks: t.timebase.us_to_ticks(self.edit_onset_us),
             });
         }
         self.write_header()?;
@@ -627,6 +650,26 @@ fn write_mvhd(w: &mut ByteWriter) {
 fn write_trak(w: &mut ByteWriter, t: &EsTrack, track_id: u32) -> Result<()> {
     let trak_at = box_open(w, b"trak");
     write_tkhd(w, t, track_id);
+    // 编辑列表（`edts/elst`）：只在片段裁剪设过「呈现起点」时写。
+    //
+    // 文件里的媒体**从关键帧开始**（视频不从关键帧起就解不出来），而用户要的
+    // 切点在关键帧之后；编辑列表把呈现时间轴的 0 点挪到切点，于是：
+    // 产物多带了一小段解码铺垫（最多一个 GOP，通常 1~3 秒），但**看到的**
+    // 第一帧就是切点那一帧，时长也正好是裁出来的长度。
+    //
+    // `segment_duration = 0` 是 MP4 里"这一段一直到媒体末尾"的写法 —— 分片
+    // 文件在写 moov 时还不知道总时长（mvhd/tkhd 的 duration 同样是 0）。
+    if t.edit_onset_ticks > 0 {
+        let edts_at = box_open(w, b"edts");
+        let elst_at = full_box_open(w, b"elst", 0, 0);
+        w.u32_be(1); // entry_count
+        w.u32_be(0); // segment_duration（0 = 到媒体末尾）
+        w.u32_be(t.edit_onset_ticks as u32); // media_time（本轨刻度，有符号位模式一致）
+        w.u16_be(1); // media_rate_integer = 1.0
+        w.u16_be(0); // media_rate_fraction
+        box_close(w, elst_at);
+        box_close(w, edts_at);
+    }
     let mdia_at = box_open(w, b"mdia");
     write_mdhd(w, t);
     write_hdlr(w, t);

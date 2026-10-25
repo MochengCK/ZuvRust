@@ -152,6 +152,20 @@ struct SegInput {
     map: Vec<(u32, u32)>,
 }
 
+/// 片段裁剪窗口（微秒）：只把 `[start, end)` 这一段写进产物。
+///
+/// 起点是**帧级**的：视频从切点之前最近的关键帧开始解码（丢帧会花屏），
+/// 但容器会把「呈现起点」挪到切点 —— fMP4 写 `edts/elst`，所以看到的
+/// 第一帧就是切点那一帧；mkv / ts 没有编辑列表，只能从那个关键帧开始
+/// （多出最多一个 GOP 的画面）。终点在所有容器上都是帧级的（按显示时间丢采样）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClipRange {
+    /// 切点（微秒，相对媒体起点）。
+    pub start_us: i64,
+    /// 切尾（微秒）；`None` = 一直到结尾。
+    pub end_us: Option<i64>,
+}
+
 /// 合并的可选项（宿主「视频」设置项映射到这里）。
 #[derive(Debug, Clone, Copy, Default)]
 pub struct MergeOptions {
@@ -159,6 +173,8 @@ pub struct MergeOptions {
     pub fragment_us: Option<i64>,
     /// 要哪些内容（默认画面与声音都要）。
     pub tracks: TrackChoice,
+    /// 只保留某一段（默认整条）。
+    pub clip: Option<ClipRange>,
 }
 
 /// 合并产物保留哪些内容。
@@ -331,22 +347,60 @@ fn run(
         segments.push(seg);
     }
 
+    // ── 3.5 片段裁剪：归一化窗口 + 先把落点问出来 ──
+    //
+    // 必须赶在**建 muxer 之前**：mp4 的呈现起点（`edts/elst`）是 `moov` 的一部分，
+    // 而 `moov` 在 `Muxer::with_writer` 里就写出去了，之后再改不进产物。
+    let clip = opts.clip.and_then(|c| {
+        let start = c.start_us.max(0);
+        let end = c.end_us.filter(|e| *e > start);
+        (start > 0 || end.is_some()).then_some(ClipRange { start_us: start, end_us: end })
+    });
+    if clip.is_some() && inputs.len() != 1 {
+        return Err(MediaError::Unsupported(
+            "片段裁剪只支持单个输入：多输入串接时「第几秒」没有唯一定义".into(),
+        ));
+    }
+
+    // 每个输入一个解封装器（懒开：没被任何一段用到的输入不必打开）
+    let mut demuxers: Vec<Option<Box<dyn Demuxer>>> = (0..inputs.len()).map(|_| None).collect();
+    // 裁剪起点落到「切点之前最近的关键帧」，这个落点就是铺垫段（解码必需）的起点
+    let mut clip_landing_us = 0i64;
+    if let Some(c) = clip {
+        if c.start_us > 0 {
+            let (name, src, _) = &inputs[0];
+            let mut d = me_container::demux::open(src.clone(), name)?;
+            clip_landing_us = d.seek(c.start_us)?;
+            demuxers[0] = Some(d);
+        }
+    }
+    // 呈现起点 = 切点相对铺垫起点的偏移（只有 mp4 能表达，见 `set_edit_onset_us`）
+    let edit_onset_us = clip.map_or(0, |c| (c.start_us - clip_landing_us).max(0));
+
     // 声明总时长：各输入 duration 之和（**不是 min**：多段串接的总时长是加起来）。
     // 它只作参考（分片源常常没有声明时长），但 MKV 的 `Info.Duration` 可以先用它 ——
     // 播放器/探针就不用先扫全文件才知道有多长（fMP4 那边靠每段的 `sidx` 解决）。
-    let declared_us: i64 = inputs.iter().filter_map(|(_, _, i)| i.duration_us).sum();
+    let mut declared_us: i64 = inputs.iter().filter_map(|(_, _, i)| i.duration_us).sum();
+    // 裁剪后声明时长也要跟着缩，否则进度条按整条视频算，永远走不到 100%
+    if let (Some(c), true) = (clip, declared_us > 0) {
+        let end = c.end_us.unwrap_or(declared_us).min(declared_us);
+        declared_us = (end - c.start_us).max(0);
+    }
 
     // ── 4. 产物直写目标（不攒内存） ──
     let file = std::fs::File::create(output)?;
     // 1 MiB 缓冲：合并是顺序写，缓冲再大收益有限，而 1 MiB 已经能把 syscall 压到可忽略
     let writer = Box::new(std::io::BufWriter::with_capacity(1 << 20, file));
-    let mut muxer = Muxer::with_writer(container, &out_tracks, (declared_us > 0).then_some(declared_us), writer)?;
+    let mut muxer = Muxer::with_writer(
+        container,
+        &out_tracks,
+        (declared_us > 0).then_some(declared_us),
+        edit_onset_us,
+        writer,
+    )?;
     if let Some(us) = opts.fragment_us {
         muxer.set_fragment_us(us);
     }
-
-    // 每个输入一个解封装器（懒开：没被任何一段用到的输入不必打开）
-    let mut demuxers: Vec<Option<Box<dyn Demuxer>>> = (0..inputs.len()).map(|_| None).collect();
 
     // ── 5. 进度口径 ──
     // 输入总字节：只搬字节的任务里，它是最准的分母（媒体的声明时长常常是 0）。
@@ -403,6 +457,54 @@ fn run(
                             continue;
                         };
                         let out_tb = out_timebases.get(&out_id).copied().unwrap_or(src_tb);
+
+                        // ── 片段裁剪：丢掉落点之前的「预滚帧」 ──
+                        //
+                        // 分片输入（fMP4 / HLS）的 seek 只能定位到**含该关键帧的
+                        // 分片开头**，那个分片里落在关键帧之前的帧既不是关键帧、
+                        // 也不会被后面引用 —— 留着只会让文件起点比落点更早，
+                        // `elst` 的 `media_time` 于是偏掉（最多一个分片，实测 2 秒）。
+                        // 渐进式 mp4 的 seek 直接定位到关键帧下标，这条对它是空操作。
+                        if let Some(c) = clip {
+                            if c.start_us > 0 {
+                                let seg_end_us = src_tb.ticks_to_us(p.pts)
+                                    + src_tb.ticks_to_us(p.duration as i64);
+                                // 关键帧留 100ms 余量：`elst`/`cts` 会让落点关键帧的
+                                // pts 比 seek 报回来的值早一点点，别把它一起丢了
+                                let todo = if p.keyframe {
+                                    seg_end_us + 100_000 <= clip_landing_us
+                                } else {
+                                    seg_end_us <= clip_landing_us
+                                };
+                                if todo {
+                                    continue;
+                                }
+                            }
+                        }
+
+                        // ── 片段裁剪：切尾（帧级） ──
+                        //
+                        // 判据用 **pts**（显示时间）而不是 dts：B 帧的 dts 早于 pts，
+                        // 按 dts 丢会把该留的帧丢掉，结尾会闪一下窗口外的画面。
+                        //
+                        // 起点那边的处理见上：落点关键帧之后的采样一条都不能丢
+                        // （丢了就缺参考帧），落点之前的预滚帧可以丢 —— 容器把
+                        // 剩下的铺垫藏进 mp4 的 edts/elst，mkv/ts 则如实保留。
+                        if let Some(end_us) = clip.and_then(|c| c.end_us) {
+                            if src_tb.ticks_to_us(p.pts) >= end_us {
+                                continue;
+                            }
+                            // 解码顺序已经明显越过窗口 → 这个输入读完了。
+                            // 留 1 秒余量：B 帧重排下 dts 落后于 pts，丢早了会少帧
+                            if src_tb.ticks_to_us(p.dts) >= end_us + 1_000_000 {
+                                done[k] = true;
+                                for (_, out_id) in &si.map {
+                                    interleaver.finish_track(*out_id);
+                                }
+                                continue;
+                            }
+                        }
+
                         let base = *first_dts
                             .entry((si.input_index, p.track_id))
                             .or_insert(p.dts);
@@ -479,7 +581,15 @@ fn run(
 
     // ── 6. 收尾 ──
     let bytes = muxer.finish()?;
-    let written_end_us = track_end_us.values().copied().filter(|v| *v > 0).max();
+    // 呈现时长要扣掉铺垫段：mp4 把铺垫藏在编辑列表里（从切点开始播），
+    // 不扣的话「裁出来的 30 秒」会报成 32 秒
+    let presented_us = if matches!(container, OutputContainer::Fmp4) { edit_onset_us } else { 0 };
+    let written_end_us = track_end_us
+        .values()
+        .copied()
+        .filter(|v| *v > 0)
+        .max()
+        .map(|v| (v - presented_us).max(0));
     // 时长以实际写出的媒体时间为准（声明时长只作参考：分片常常没有声明时长）
     let duration_us = written_end_us.or(if declared_us > 0 { Some(declared_us) } else { None });
     reporter.finish(&progress_line(
@@ -622,6 +732,7 @@ impl Muxer {
         container: OutputContainer,
         tracks: &[Track],
         duration_hint_us: Option<i64>,
+        edit_onset_us: i64,
         writer: Box<dyn Write + Send>,
     ) -> Result<Self> {
         match container {
@@ -632,6 +743,8 @@ impl Muxer {
             }
             OutputContainer::Fmp4 => {
                 let mut m = Mp4Muxer::with_writer(writer);
+                // ⚠️ 必须在 `set_tracks`（写 moov）之前设：编辑列表是 moov 的一部分
+                m.set_edit_onset_us(edit_onset_us);
                 m.set_tracks(tracks)?;
                 Ok(Muxer::Mp4(m))
             }
