@@ -1,6 +1,6 @@
 {
   "name": "zuvrust-client",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "description": "Official Node.js client for the ZuvRust media engine (JSON-RPC over stdio)",
   "type": "module",
   "main": "./index.js",
