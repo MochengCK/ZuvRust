@@ -224,7 +224,12 @@ struct EsTrack {
     codec_private: Vec<u8>,
     nal_len: u8,
     samples: Vec<Sample>,
-    last_pts_us: Option<i64>,
+    /// 上一包的**解码时间**（微秒，相对时间轴基准）。
+    ///
+    /// 判"倒流"只能用 dts：B 帧的呈现时间天然是来回跳的（0,3,1,2…），拿 pts
+    /// 判会把几乎所有带 B 帧的 H.264 素材当成坏文件（表现就是"换成 mkv 一律
+    /// 失败"，而换成 mp4 / ts 都正常）。
+    last_dts_us: Option<i64>,
 }
 
 /// Matroska 的「文档类型」：`.mkv` 与 `.webm` 用的是**同一个封装器**，
@@ -390,7 +395,7 @@ impl MkvMuxer {
                 codec_private,
                 nal_len,
                 samples: Vec::new(),
-                last_pts_us: None,
+                last_dts_us: None,
             });
         }
         self.write_header()
@@ -417,12 +422,17 @@ impl MkvMuxer {
             }
         };
         let pts_us = tb.ticks_to_us(p.pts - base);
+        let dts_us = tb.ticks_to_us(p.dts - base);
         // 时间**严格后退**会让块时间戳乱掉：当场报错，别产出坏文件。
-        if let Some(prev) = self.tracks[idx].last_pts_us {
-            if pts_us < prev {
+        //
+        // ⚠️ 判据是 **dts**（解码顺序），不是 pts：B 帧的 pts 天然会来回跳
+        // （0,3,1,2…），用 pts 判会把所有带 B 帧的 H.264 素材都拒掉 ——
+        // 症状就是"换成 mkv 一律失败，换 mp4 / ts 都正常"（用户报的形态）。
+        if let Some(prev) = self.tracks[idx].last_dts_us {
+            if dts_us < prev {
                 return Err(MediaError::Container(format!(
-                    "轨道 {} 的时间戳倒流了（{} < {}）：调用方必须先交织好再写",
-                    p.track_id, pts_us, prev
+                    "轨道 {} 的解码时间倒流了（{} < {}）：调用方必须先交织好再写",
+                    p.track_id, dts_us, prev
                 )));
             }
         }
@@ -448,7 +458,7 @@ impl MkvMuxer {
         let data = self.convert_sample(idx, p)?;
         let t = &mut self.tracks[idx];
         t.samples.push(Sample { pts_us, keyframe: p.keyframe, data });
-        t.last_pts_us = Some(pts_us);
+        t.last_dts_us = Some(dts_us);
         self.packets_written += 1;
         Ok(())
     }
@@ -932,6 +942,39 @@ mod tests {
         let err = m
             .write_packet(&video_packet(0, true))
             .expect_err("时间戳倒流必须当场报错");
+        assert!(format!("{err}").contains("倒流"));
+    }
+
+    /// B 帧：**pts 倒退、但 dts 递增**是完全合法的，不能当成坏文件拒掉。
+    ///
+    /// 曾经这里判的是 pts 单调，于是"把普通 H.264 视频换成 mkv"全部失败，
+    /// 而换成 mp4 / ts 都正常 —— 症状看起来像"选了 MKV 没生效"。
+    #[test]
+    fn b_frames_with_pts_jumping_back_are_allowed() {
+        let mut m = MkvMuxer::new();
+        m.set_tracks(&[video_track()]).unwrap();
+        let mk = |dts: i64, pts: i64| {
+            let mut p = video_packet(dts, dts == 0);
+            p.pts = pts;
+            p
+        };
+        // 典型的 I-B-B-P 呈现/解码时间关系
+        m.write_packet(&mk(0, 0)).expect("I 帧");
+        m.write_packet(&mk(40, 120)).expect("P 帧（pts 在后）");
+        m.write_packet(&mk(80, 40)).expect("B 帧（pts 回跳）");
+        m.write_packet(&mk(120, 80)).expect("B 帧（pts 仍在前面之后）");
+        m.finish().expect("收尾");
+    }
+
+    /// 但 **dts** 真倒退仍然是坏输入，必须当场报错。
+    #[test]
+    fn dts_going_backwards_is_still_rejected() {
+        let mut m = MkvMuxer::new();
+        m.set_tracks(&[video_track()]).unwrap();
+        m.write_packet(&video_packet(80, true)).unwrap();
+        let err = m
+            .write_packet(&video_packet(40, false))
+            .expect_err("dts 倒流必须报错");
         assert!(format!("{err}").contains("倒流"));
     }
 }

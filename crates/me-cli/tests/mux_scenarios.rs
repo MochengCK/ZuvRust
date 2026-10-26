@@ -1052,3 +1052,40 @@ fn clip_drops_the_fragment_preroll_before_the_landing_keyframe() {
 
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// 合并产物的容器**由输出扩展名决定**。
+///
+/// 调用方若把"临时文件名后缀"与"目标容器"分开维护，很容易写出 `.mkv` 名字
+/// 下装着 mp4 的文件；事后再想换容器，又会撞上 Matroska 对解码时间单调性的
+/// 要求而失败。这条用例保证：只要输出后缀给对，产物就是那个容器，而且回读
+/// 也认得出来（`mux` 报告与 `probe` 的容器名不同源，两侧分别断言）。
+#[test]
+fn mux_container_follows_the_output_extension() {
+    let dir = tmp_dir("mux-ext");
+    let v = dir.join("v.mp4");
+    let a = dir.join("a.m4a");
+    write_fmp4(&v, &[h264_track(1)], &video_packets(1, 2.0, 0));
+    write_fmp4(&a, &[aac_track(2)], &audio_packets(2, 2.0, 0));
+
+    // 两侧的容器名不同源：mux 报告用自己的枚举名（fmp4），probe 用解封装侧的
+    // 名字（iso-bmff）。两边都断言，才算"写出来的确实是那个容器、而且认得回来"。
+    for (name, mux_want, probe_want) in [
+        ("out.mkv", "matroska", "matroska"),
+        ("out.mp4", "fmp4", "iso-bmff"),
+        ("out.ts", "mpeg-ts", "mpeg-ts"),
+    ] {
+        let out = dir.join(name);
+        let stdout = mux_ok(&out, &[v.as_path(), a.as_path()]);
+        assert!(
+            stdout.contains(&format!("\"container\":\"{mux_want}\"")),
+            "{name} 的产物容器应当是 {mux_want}，实际输出：{stdout}"
+        );
+        let probe = probe_json(&out);
+        assert!(
+            probe.contains(&format!("\"container\":\"{probe_want}\"")),
+            "{name} 回读的容器应当是 {probe_want}，实际：{probe}"
+        );
+    }
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
