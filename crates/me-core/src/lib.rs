@@ -21,7 +21,7 @@ pub const ENGINE_NAME: &str = "ZuvRust";
 
 /// 引擎版本。与工作区 `Cargo.toml` 的 `version` 保持同步；
 /// `version --json`、JSON-RPC `initialize`、CLI 测试都只读这一个常量。
-pub const ENGINE_VERSION: &str = "0.2.0";
+pub const ENGINE_VERSION: &str = "0.2.1";
 
 pub mod bits;
 pub mod bytes;
