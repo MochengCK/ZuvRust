@@ -1707,7 +1707,8 @@ fn load_subtitle_track(path: String, track_id: i32, generation: u64, sh: Arc<Sha
                 // 没有 BlockDuration 时按 2 秒兜底，免得整条字幕永不消失
                 dur = 2_000_000;
             }
-            cues.push(subtitle::Cue { start_us: start, end_us: start + dur, text });
+            let align = subtitle::packet_align(&codec, &pkt.data);
+            cues.push(subtitle::Cue { start_us: start, end_us: start + dur, text, align });
         }
         cues.sort_by_key(|c| c.start_us);
         Ok(cues)
@@ -1796,6 +1797,30 @@ pub unsafe extern "C" fn zuvsrc_load_subtitle_text(
     st.cues = cues;
     st.state = SUB_READY;
     ZUV_OK
+}
+
+/// 当前这条字幕的位置：0 底部、1 居中、2 顶部。
+///
+/// ASS 的 `\an8`（顶部居中）常用于片名/说明，一律按底部显示会压在画面中间。
+#[no_mangle]
+pub unsafe extern "C" fn zuvsrc_subtitle_align(p: *mut ZuvSource, pts_us: i64) -> c_int {
+    let Some(src) = as_source(p) else {
+        return 0;
+    };
+    let s = src.sh.subs.lock().unwrap_or_else(|e| e.into_inner());
+    if s.state != SUB_READY || s.cues.is_empty() {
+        return 0;
+    }
+    let idx = match s.cues.binary_search_by(|c| c.start_us.cmp(&pts_us)) {
+        Ok(i) => i,
+        Err(0) => return 0,
+        Err(i) => i - 1,
+    };
+    let cue = &s.cues[idx];
+    if pts_us >= cue.end_us {
+        return 0;
+    }
+    cue.align as c_int
 }
 
 /// 字幕状态：0 未启用、1 解析中、2 就绪、3 失败。

@@ -14,6 +14,34 @@ pub struct Cue {
     pub start_us: i64,
     pub end_us: i64,
     pub text: String,
+    /// 位置：0 = 底部（默认）、1 = 居中、2 = 顶部。
+    /// 来自 ASS 的 `\an1..\an9`（`\an8` 是最常见的"顶部居中"，常用于片名/说明）。
+    pub align: u8,
+}
+
+/// 从正文里取 `\an` 对齐码并返回（对齐, 去掉该码后的正文）。
+///
+/// 只认 1..9：`\an1-3` 底部、`\an4-6` 居中、`\an7-9` 顶部。
+/// 找不到就按底部处理（SRT 没有位置概念）。
+fn take_alignment(text: &str) -> (u8, &str) {
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    while i + 3 < bytes.len() {
+        if bytes[i] == b'\\' && bytes[i + 1] == b'a' && bytes[i + 2] == b'n' {
+            let d = bytes[i + 3];
+            if (b'1'..=b'9').contains(&d) {
+                let n = d - b'0';
+                let align = match n {
+                    1..=3 => 0,
+                    4..=6 => 1,
+                    _ => 2,
+                };
+                return (align, text);
+            }
+        }
+        i += 1;
+    }
+    (0, text)
 }
 
 /// 把一条字幕包解析成纯文本。时间来自容器，不从文本里抠。
@@ -53,6 +81,15 @@ pub fn packet_text(codec: &CodecId, data: &[u8]) -> Option<String> {
     } else {
         Some(cleaned)
     }
+}
+
+/// 包体里的对齐码（`text` 已被 `packet_text` 清理，所以单独扫原始字节）。
+pub fn packet_align(codec: &CodecId, data: &[u8]) -> u8 {
+    if !matches!(*codec, CodecId::ASS) {
+        return 0;
+    }
+    let s = String::from_utf8_lossy(data);
+    take_alignment(&s).0
 }
 
 /// 去掉排版标记，只留下能直接显示的文本。
@@ -126,7 +163,7 @@ pub fn parse_srt(data: &str) -> Vec<Cue> {
         if cleaned.is_empty() {
             continue;
         }
-        cues.push(Cue { start_us: start, end_us: end, text: cleaned });
+        cues.push(Cue { start_us: start, end_us: end, text: cleaned, align: 0 });
     }
     cues.sort_by_key(|c| c.start_us);
     cues
@@ -161,11 +198,12 @@ pub fn parse_ass_file(data: &str) -> Vec<Cue> {
             parts.next();
         }
         let Some(body) = parts.next() else { continue };
+        let (align, _) = take_alignment(body);
         let cleaned = cleanup(body);
         if cleaned.is_empty() {
             continue;
         }
-        cues.push(Cue { start_us: start, end_us: end, text: cleaned });
+        cues.push(Cue { start_us: start, end_us: end, text: cleaned, align });
     }
     cues.sort_by_key(|c| c.start_us);
     cues
@@ -246,6 +284,22 @@ mod tests {
         assert_eq!(cues[0].end_us, 3_500_000);
         assert_eq!(cues[0].text, "第一行\n第二行");
         assert_eq!(cues[1].text, "斜体");
+    }
+
+    #[test]
+    fn ass_alignment_is_detected() {
+        // \an8 = 顶部居中，常用于片名/说明；\an2 是底部居中（默认）
+        let top = packet_align(&CodecId::ASS, "1,0,Default,,0,0,0,,{\\an8}顶部的字".as_bytes());
+        assert_eq!(top, 2);
+        let bottom = packet_align(&CodecId::ASS, "1,0,Default,,0,0,0,,{\\an2}底部的字".as_bytes());
+        assert_eq!(bottom, 0);
+        let none = packet_align(&CodecId::ASS, "1,0,Default,,0,0,0,,没有位置码".as_bytes());
+        assert_eq!(none, 0);
+
+        let ass = "[Script Info]\n\n[Events]\n\
+                   Dialogue: 0,0:00:01.00,0:00:03.00,Default,,0,0,0,,{\\an8}顶部\n";
+        let cues = parse_text(ass);
+        assert_eq!(cues[0].align, 2, "文件级 ASS 也要认位置");
     }
 
     #[test]
