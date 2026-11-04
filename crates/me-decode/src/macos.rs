@@ -209,8 +209,11 @@ extern "C" {
         size_array: *const usize,
         sample_buffer_out: *mut CMSampleBufferRef,
     ) -> OSStatus;
+    static kCFBooleanTrue: CFTypeRef;
     /// 采样描述盒的键：`{"av1C": <数据>}` 就是这么挂上去的。
     static kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms: CFStringRef;
+    /// 解码器规格键：允许使用硬件解码器（不传时由 VT 自行决定，会掉到软解）
+    static kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder: CFStringRef;
 }
 
 #[link(name = "VideoToolbox", kind = "framework")]
@@ -442,15 +445,32 @@ unsafe fn create_session(
         callback: Some(output_callback),
         refcon: shared as *mut c_void,
     };
+    // 明确"可以用硬件解码器"：不传这条例时 VT 有时会挑软件实现，
+    // 同一个会话从 ~5 ms/帧 变成 ~50 ms/帧（实测 1080p H.264）
+    let spec = unsafe {
+        let key = kVTVideoDecoderSpecification_EnableHardwareAcceleratedVideoDecoder as CFTypeRef;
+        let value = kCFBooleanTrue;
+        CFDictionaryCreate(
+            std::ptr::null(),
+            &key,
+            &value,
+            1,
+            &kCFTypeDictionaryKeyCallBacks as *const c_void,
+            &kCFTypeDictionaryValueCallBacks as *const c_void,
+        )
+    };
     let mut session: VTDecompressionSessionRef = std::ptr::null_mut();
     let status = VTDecompressionSessionCreate(
         std::ptr::null(),
         format,
-        std::ptr::null(),
+        spec,
         attrs,
         &record,
         &mut session,
     );
+    if !spec.is_null() {
+        CFRelease(spec);
+    }
     CFRelease(attrs);
     if status != 0 || session.is_null() {
         let hint = if codec == VtCodec::Av1 && !hardware_decode_available(&CodecId::Av1) {

@@ -178,6 +178,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "me-capi"
+version = "0.2.1"
+dependencies = [
+ "me-container",
+ "me-core",
+ "me-decode",
+ "me-mux",
+ "me-stream",
+ "tracing",
+]
+
+[[package]]
 name = "me-cli"
 version = "0.2.1"
 dependencies = [

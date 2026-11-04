@@ -40,7 +40,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
-use me_core::{CodecId, MediaError, MediaInfo, MediaKind, Packet, ReadAt, Result, Timebase, Track};
+use me_core::{CodecId, MediaError, MediaInfo, MediaKind, MediaTags, Packet, ReadAt, Result, Timebase, Track};
 
 use crate::codec;
 use crate::demux::Demuxer;
@@ -49,6 +49,12 @@ use crate::demux::Demuxer;
 const ID_EBML: u32 = 0x1A45_DFA3;
 const ID_SEGMENT: u32 = 0x1853_8067;
 const ID_INFO: u32 = 0x1549_A966;
+const ID_TITLE: u32 = 0x7BA9;
+const ID_TAGS: u32 = 0x1254_C367;
+const ID_TAG: u32 = 0x7373;
+const ID_SIMPLE_TAG: u32 = 0x67C8;
+const ID_TAG_NAME: u32 = 0x45A3;
+const ID_TAG_STRING: u32 = 0x4487;
 const ID_TIMESTAMP_SCALE: u32 = 0x2AD7_B1;
 const ID_DURATION: u32 = 0x4489;
 const ID_TRACKS: u32 = 0x1654_AE6B;
@@ -258,6 +264,11 @@ fn codec_of(id: &str) -> Option<CodecId> {
         "A_AC3" => CodecId::Ac3,
         "A_EAC3" => CodecId::Eac3,
         "A_FLAC" => CodecId::Flac,
+        // 字幕：只认**纯文本**格式。PGS / DVD 的图形字幕（S_HDMV/PGS、
+        // S_VOBSUB）是位图，需要另一条渲染链，这里明确不支持。
+        "S_TEXT/UTF8" => CodecId::SUBRIP,
+        "S_TEXT/ASS" | "S_TEXT/SSA" => CodecId::ASS,
+        "S_TEXT/WEBVTT" => CodecId::WEBVTT,
         _ => return None,
     })
 }
@@ -275,6 +286,8 @@ pub struct MkvDemuxer {
     segment_end: Option<u64>,
     /// 当前 Cluster 的基准时间戳（时基刻度）。
     cluster_ts: i64,
+    /// 标题 / 艺术家 / 专辑（Info 的 Title 与 Tags 里的 SimpleTag）
+    tags: MediaTags,
     /// 已经切好、等着返回的采样（lacing 一包多帧，且每轨延迟一帧）。
     queue: VecDeque<Packet>,
     /// 每条轨"上一条还没定 duration 的采样"。
@@ -296,6 +309,7 @@ impl MkvDemuxer {
                 source: source.to_string(),
             },
             tracks: Vec::new(),
+            tags: MediaTags::default(),
             by_number: HashMap::new(),
             off: 0,
             segment_end: None,
@@ -361,6 +375,7 @@ impl MkvDemuxer {
             match elem.id {
                 ID_INFO => self.parse_info(elem.data_off, end, &mut scale_ns, &mut duration_ticks)?,
                 ID_TRACKS => self.parse_tracks(elem.data_off, end)?,
+                ID_TAGS => self.parse_tags(elem.data_off, end)?,
                 _ => {}
             }
             self.off = end;
@@ -412,9 +427,72 @@ impl MkvDemuxer {
             match e.id {
                 ID_TIMESTAMP_SCALE => *scale_ns = read_uint(&data).max(1),
                 ID_DURATION => *duration = read_float(&data),
+                ID_TITLE => {
+                    let t = String::from_utf8_lossy(&data).trim().to_string();
+                    if !t.is_empty() {
+                        self.tags.title = Some(t);
+                    }
+                }
                 _ => {}
             }
             cur = e.data_off + sz;
+        }
+        Ok(())
+    }
+
+    /// 解析 `Tags`：`Tag` → `SimpleTag` → (`TagName`, `TagString`)。
+    ///
+    /// 只认 TITLE / ARTIST / ALBUM 这三个名字（Matroska 的标签名是自由文本，
+    /// 大小写不敏感，这里统一按大写比较）。同名标签取第一次出现的值。
+    fn parse_tags(&mut self, off: u64, end: u64) -> Result<()> {
+        let mut cur = off;
+        while cur < end {
+            let Some(e) = read_element(&mut self.reader, cur)? else { break };
+            let Some(sz) = e.size else { break };
+            if e.id == ID_TAG {
+                self.parse_tag(e.data_off, e.data_off + sz)?;
+            }
+            cur = e.data_off + sz;
+        }
+        Ok(())
+    }
+
+    fn parse_tag(&mut self, off: u64, end: u64) -> Result<()> {
+        let mut cur = off;
+        while cur < end {
+            let Some(e) = read_element(&mut self.reader, cur)? else { break };
+            let Some(sz) = e.size else { break };
+            if e.id == ID_SIMPLE_TAG {
+                self.parse_simple_tag(e.data_off, e.data_off + sz)?;
+            }
+            cur = e.data_off + sz;
+        }
+        Ok(())
+    }
+
+    fn parse_simple_tag(&mut self, off: u64, end: u64) -> Result<()> {
+        let mut name = String::new();
+        let mut value = String::new();
+        let mut cur = off;
+        while cur < end {
+            let Some(e) = read_element(&mut self.reader, cur)? else { break };
+            let Some(sz) = e.size else { break };
+            let data = self.reader.at(e.data_off, sz as usize)?.to_vec();
+            match e.id {
+                ID_TAG_NAME => name = String::from_utf8_lossy(&data).trim().to_ascii_uppercase(),
+                ID_TAG_STRING => value = String::from_utf8_lossy(&data).trim().to_string(),
+                _ => {}
+            }
+            cur = e.data_off + sz;
+        }
+        if value.is_empty() {
+            return Ok(());
+        }
+        match name.as_str() {
+            "TITLE" if self.tags.title.is_none() => self.tags.title = Some(value),
+            "ARTIST" if self.tags.artist.is_none() => self.tags.artist = Some(value),
+            "ALBUM" if self.tags.album.is_none() => self.tags.album = Some(value),
+            _ => {}
         }
         Ok(())
     }
@@ -493,14 +571,21 @@ impl MkvDemuxer {
         let kind = match track_type {
             1 => MediaKind::Video,
             2 => MediaKind::Audio,
+            17 => MediaKind::Subtitle,
             _ => return Ok(()),
         };
 
-        let codec = codec_of(&codec_id).ok_or_else(|| {
-            MediaError::Unsupported(format!(
-                "这个 Matroska 里的 `{codec_id}` 引擎还不支持（Vorbis 还没做）"
-            ))
-        })?;
+        let codec = match codec_of(&codec_id) {
+            Some(c) => c,
+            // 图形字幕（PGS / VobSub）是位图，我们不做这条渲染链；
+            // 跳过这条轨就行，不能因为它打不开整部片子
+            None if kind == MediaKind::Subtitle => return Ok(()),
+            None => {
+                return Err(MediaError::Unsupported(format!(
+                    "这个 Matroska 里的 `{codec_id}` 引擎还不支持（Vorbis 还没做）"
+                )))
+            }
+        };
 
         // 长度前缀宽度：H.264 / H.265 的采样是「[N 字节长度][NAL]」，N 写在配置盒里
         let nal_len = match codec {
@@ -821,11 +906,17 @@ impl Demuxer for MkvDemuxer {
         self.parse_head()?;
         let tb = self.info.tracks.first().map(|t| t.timebase).unwrap_or(Timebase::new(1000));
         let mut landed = 0i64;
+        let dbg = std::env::var("MKV_SEEK_DEBUG").is_ok();
+        let mut kf_count = 0usize;
         while let Some(p) = self.poll()? {
             if !p.keyframe {
                 continue;
             }
             let us = tb.ticks_to_us(p.pts);
+            if dbg && kf_count < 6 {
+                eprintln!("[seek] keyframe track={} us={:.3}s target={:.3}s", p.track_id, us as f64 / 1e6, target_us as f64 / 1e6);
+            }
+            kf_count += 1;
             if us >= target_us {
                 landed = us;
                 // 把这一帧留给调用方（它是这次 seek 的落点）
@@ -833,6 +924,9 @@ impl Demuxer for MkvDemuxer {
                 break;
             }
             landed = us;
+        }
+        if dbg {
+            eprintln!("[seek] 结束: keyframes={} landed={:.3}s queue={}", kf_count, landed as f64 / 1e6, self.queue.len());
         }
         Ok(landed)
     }
@@ -843,6 +937,10 @@ impl Demuxer for MkvDemuxer {
 
     fn container(&self) -> &'static str {
         "matroska"
+    }
+
+    fn tags(&self) -> MediaTags {
+        self.tags.clone()
     }
 }
 
@@ -912,11 +1010,16 @@ mod tests {
         ts_scale: u64,
         duration: Option<f64>,
         seg_unknown: bool,
+        title: Option<String>,
+        tags: Vec<(String, String)>,
     }
 
     impl Builder {
         fn new() -> Self {
-            Self { tracks: Vec::new(), clusters: Vec::new(), ts_scale: 1_000_000, duration: None, seg_unknown: false }
+            Self { tracks: Vec::new(), clusters: Vec::new(), ts_scale: 1_000_000, duration: None, seg_unknown: false,
+            title: None,
+            tags: Vec::new(),
+        }
         }
 
         /// 加一条轨。`codec_id` 是 Matroska 的字符串（`V_VP9` / `A_OPUS`…）。
@@ -940,6 +1043,16 @@ mod tests {
             self
         }
 
+        fn title(mut self, t: &str) -> Self {
+            self.title = Some(t.to_string());
+            self
+        }
+
+        fn tag(mut self, name: &str, value: &str) -> Self {
+            self.tags.push((name.to_string(), value.to_string()));
+            self
+        }
+
         /// 一个 Cluster：时间戳（时基刻度）+ 若干块。
         fn cluster(mut self, ts: i64, blocks: &[Vec<u8>]) -> Self {
             let mut c = el(ID_CLUSTER_TS, &uint(ts as u64));
@@ -959,8 +1072,22 @@ mod tests {
             if let Some(d) = self.duration {
                 info.extend_from_slice(&el(ID_DURATION, &f64b(d)));
             }
+            if let Some(t) = &self.title {
+                info.extend_from_slice(&el(ID_TITLE, t.as_bytes()));
+            }
             let mut seg = el(ID_INFO, &info);
             seg.extend_from_slice(&el(ID_TRACKS, &self.tracks));
+            if !self.tags.is_empty() {
+                let mut tags = Vec::new();
+                for (k, v) in &self.tags {
+                    let mut simple = el(ID_TAG_NAME, k.as_bytes());
+                    simple.extend_from_slice(&el(ID_TAG_STRING, v.as_bytes()));
+                    let mut tag = el(ID_SIMPLE_TAG, &simple);
+                    tags.extend_from_slice(&el(ID_TAG, &tag));
+                    tag.clear();
+                }
+                seg.extend_from_slice(&el(ID_TAGS, &tags));
+            }
             seg.extend_from_slice(&self.clusters);
             out.extend_from_slice(&if self.seg_unknown {
                 el_unknown(ID_SEGMENT, &seg)
@@ -1096,15 +1223,60 @@ mod tests {
     }
 
     #[test]
-    fn subtitle_tracks_are_skipped_not_fatal() {
+    fn subtitle_tracks_are_kept_as_text() {
+        // 文本字幕轨要进轨道表（宿主靠它列"字幕"菜单），图形字幕仍然跳过：
+        // PGS / VobSub 是位图，需要另一条渲染链。
         let bytes = Builder::new()
             .track(1, 1, "V_VP9", &[])
-            .track(2, 17, "S_TEXT/UTF8", &[]) // 字幕
+            .track(2, 17, "S_TEXT/UTF8", &[])
+            .track(3, 17, "S_HDMV/PGS", &[])
             .cluster(0, &[block(1, 0, true, b"V")])
             .build();
         let d = open(bytes);
-        assert_eq!(d.info().tracks.len(), 1, "字幕轨不该进轨道表");
+        assert_eq!(d.info().tracks.len(), 2, "只留视频轨 + 文本字幕轨");
         assert_eq!(d.info().tracks[0].kind, MediaKind::Video);
+        assert_eq!(d.info().tracks[1].kind, MediaKind::Subtitle);
+        assert_eq!(d.info().tracks[1].codec, CodecId::SUBRIP);
+    }
+
+    #[test]
+    fn subtitle_blocks_come_out_as_packets() {
+        // 字幕包必须真的出得来：宿主靠 (pts, duration, text) 显示字幕，
+        // 轨道进了表但包被吞掉的话，界面上永远是一行都没有。
+        let bytes = Builder::new()
+            .track(1, 1, "V_VP9", &[])
+            .track(2, 17, "S_TEXT/UTF8", &[])
+            .cluster(0, &[
+                block(1, 0, true, b"V"),
+                block(2, 1000, false, "你好".as_bytes()),
+                block(2, 3000, false, "世界".as_bytes()),
+            ])
+            .build();
+        let mut d = open(bytes);
+        let packets = drain(&mut d);
+        let subs: Vec<_> = packets.iter().filter(|p| p.track_id == 2).collect();
+        assert_eq!(subs.len(), 2, "两条字幕都要出来");
+        assert_eq!(subs[0].data, "你好".as_bytes());
+        assert_eq!(subs[1].data, "世界".as_bytes());
+        assert_eq!(subs[0].pts, 1000, "时基 1ms，1000 = 1 秒");
+        // 时长由"同轨下一条"补出来：1 秒 → 3 秒 = 2000ms
+        assert_eq!(subs[0].duration, 2000);
+    }
+
+    #[test]
+    fn title_and_tags_are_read() {
+        let bytes = Builder::new()
+            .title("我的片子")
+            .tag("ARTIST", "某个歌手")
+            .tag("ALBUM", "某张专辑")
+            .track(1, 1, "V_VP9", &[])
+            .cluster(0, &[block(1, 0, true, b"V")])
+            .build();
+        let d = open(bytes);
+        let tags = d.tags();
+        assert_eq!(tags.title.as_deref(), Some("我的片子"));
+        assert_eq!(tags.artist.as_deref(), Some("某个歌手"));
+        assert_eq!(tags.album.as_deref(), Some("某张专辑"));
     }
 
     #[test]

@@ -1,0 +1,19 @@
+[package]
+name = "me-capi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "播放会话层：把解封装与解码包成嵌入式 C ABI，供桌面播放器进程内调用"
+
+[lib]
+name = "zuvsrc"
+crate-type = ["cdylib", "staticlib"]
+
+[dependencies]
+me-core = { workspace = true }
+me-container = { workspace = true }
+me-stream = { workspace = true }
+# 只取 `convert`（采样形态归一化），不要封装器
+me-mux = { workspace = true, default-features = false }
+me-decode = { workspace = true, default-features = false, features = ["audio", "video"] }
+tracing = { workspace = true }

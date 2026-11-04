@@ -168,6 +168,24 @@ fn parse_decode_mode(me_decode: Option<&str>, no_hw: bool) -> DecodeMode {
     }
 }
 
+/// 这台机器上某个编码有没有**平台硬解**。
+///
+/// 宿主用它如实显示"硬件解码"开关：能硬解才点亮，只能软解就置灰。
+/// 不要拿编码名字去猜 —— AV1 在 Intel Mac 上没有硬解，猜会把开关做成假的。
+pub fn hardware_decode_supported(codec: CodecId) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        macos::hardware_decode_available(&codec)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // 其它平台的探测还没接（VA-API / Media Foundation），保守回答"没有"，
+        // 免得 UI 显示硬解而实际在跑软解。真要接的时候按平台补实现。
+        let _ = codec;
+        false
+    }
+}
+
 /// 打开一个视频解码器（按 [`decode_mode`] 决定硬解 / 软解 / 自适应）。
 ///
 /// `config` 是该编码的**解码器初始化数据**（H.264 = `avcC`、AV1 = `av1C`），

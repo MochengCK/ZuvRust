@@ -33,7 +33,7 @@ pub mod time;
 pub use bits::{add_emulation_prevention, remove_emulation_prevention, BitReader};
 pub use bytes::{ByteReader, ByteWriter};
 pub use error::{MediaError, Result};
-pub use media::{CodecId, MediaInfo, MediaKind, Packet, Track};
+pub use media::{CodecId, MediaInfo, MediaKind, MediaTags, Packet, Track};
 pub use source::{ChainedSource, Cursor, FileSource, ReadAt};
 pub use time::{Rational, Timebase};
 

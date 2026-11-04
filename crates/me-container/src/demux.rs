@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use me_core::{MediaInfo, Packet, ReadAt, Result};
+use me_core::{MediaInfo, MediaTags, Packet, ReadAt, Result};
 
 use crate::probe::{sniff, ContainerFormat};
 
@@ -29,6 +29,12 @@ pub trait Demuxer {
 
     /// 容器名字（`"mpeg-ts"` / `"iso-bmff"` / `"mpeg-audio"`）。
     fn container(&self) -> &'static str;
+
+    /// 容器里的标签（标题 / 艺术家 / 专辑）。默认没有：只有真的解析了
+    /// 标签的容器（Matroska 的 Title、MP4 的 ilst）才覆盖它。
+    fn tags(&self) -> MediaTags {
+        MediaTags::default()
+    }
 }
 
 /// 按探测结果开一个解封装器。

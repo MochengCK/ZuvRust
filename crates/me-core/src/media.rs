@@ -59,7 +59,24 @@ pub enum CodecId {
     Unknown(u32),
 }
 
+/// 字幕编码用 `CodecId::Unknown(tag)` 承载，**不新增枚举分支**：
+/// 合并/封装链上有 360 多处 `match CodecId`，加变体会牵连一层壳子，
+/// 而字幕只走"解出来给宿主显示"这一条路，用 tag 足够表达。
+pub const SUBTITLE_SUBRIP: u32 = u32::from_be_bytes(*b"SRT ");
+pub const SUBTITLE_ASS: u32 = u32::from_be_bytes(*b"ASS ");
+pub const SUBTITLE_WEBVTT: u32 = u32::from_be_bytes(*b"WVTT");
+pub const SUBTITLE_MOVTEXT: u32 = u32::from_be_bytes(*b"TX3G");
+
 impl CodecId {
+    /// SubRip（`.srt` / Matroska `S_TEXT/UTF8`）
+    pub const SUBRIP: CodecId = CodecId::Unknown(SUBTITLE_SUBRIP);
+    /// ASS / SSA
+    pub const ASS: CodecId = CodecId::Unknown(SUBTITLE_ASS);
+    /// WebVTT
+    pub const WEBVTT: CodecId = CodecId::Unknown(SUBTITLE_WEBVTT);
+    /// MP4 的 `tx3g`（mov_text）
+    pub const MOVTEXT: CodecId = CodecId::Unknown(SUBTITLE_MOVTEXT);
+
     /// 简短名字（CLI / 日志）。
     pub fn name(&self) -> String {
         match self {
@@ -74,7 +91,13 @@ impl CodecId {
             CodecId::Flac => "flac".into(),
             CodecId::Ac3 => "ac3".into(),
             CodecId::Eac3 => "eac3".into(),
-            CodecId::Unknown(v) => format!("unknown({v})"),
+            CodecId::Unknown(v) => match *v {
+                SUBTITLE_SUBRIP => "srt".into(),
+                SUBTITLE_ASS => "ass".into(),
+                SUBTITLE_WEBVTT => "webvtt".into(),
+                SUBTITLE_MOVTEXT => "tx3g".into(),
+                other => format!("unknown({other})"),
+            },
         }
     }
 
@@ -206,6 +229,17 @@ impl Packet {
     pub fn end(&self) -> i64 {
         self.pts.saturating_add(self.duration as i64)
     }
+}
+
+/// 容器级标签（标题 / 艺术家 / 专辑）。
+///
+/// 单独一个结构体而不是塞进 [`MediaInfo`]：标签是"能拿到就显示"
+/// 的附属信息，缺失是常态；放在 MediaInfo 里会让 26 处构造点全部要写一遍。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct MediaTags {
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
 }
 
 /// 一份媒体的总体信息（探测结果的摘要）。

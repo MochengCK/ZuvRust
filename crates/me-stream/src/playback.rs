@@ -147,6 +147,11 @@ impl Player {
         self.demuxer.duration_us()
     }
 
+    /// 容器里的标签（标题 / 艺术家 / 专辑）。没解析到就是空的。
+    pub fn tags(&self) -> me_core::MediaTags {
+        self.demuxer.tags()
+    }
+
     /// 源的总字节数（未知返回 None；边下边播时可能是"下载引擎声明的最终大小"）。
     pub fn source_len(&self) -> Option<u64> {
         self.source.len()

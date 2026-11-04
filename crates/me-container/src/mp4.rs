@@ -35,8 +35,8 @@ use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, OnceLock};
 
 use me_core::{
-    BitReader, ByteReader, CodecId, MediaError, MediaInfo, MediaKind, Packet, ReadAt, Result,
-    Timebase, Track,
+    BitReader, ByteReader, CodecId, MediaError, MediaInfo, MediaKind, MediaTags, Packet, ReadAt,
+    Result, Timebase, Track,
 };
 
 use crate::codec;
@@ -1091,6 +1091,84 @@ fn parse_trex(p: &[u8]) -> Option<(u32, Trex)> {
     Some((track_id, Trex { default_sample_duration: duration, default_sample_size: size, default_sample_flags: flags }))
 }
 
+/// 解析 `moov/udta/meta/ilst` 里的标题 / 艺术家 / 专辑。
+///
+/// `ilst` 的条目名是元数据键（`©nam` / `©ART` / `©alb`），每个条目里装一个
+/// `data` 盒子：4 字节类型 + 4 字节 locale + 正文。类型 1 = UTF-8、2 = UTF-16BE。
+fn parse_moov_tags(src: &dyn ReadAt, moov: &BoxHeader) -> MediaTags {
+    let mut tags = MediaTags::default();
+    let Ok(moov_children) = children(src, moov.payload_start, moov.end) else {
+        return tags;
+    };
+    let Some(udta) = moov_children.into_iter().find(|b| &b.kind == b"udta") else {
+        return tags;
+    };
+    let Ok(udta_children) = children(src, udta.payload_start, udta.end) else {
+        return tags;
+    };
+    let Some(meta) = udta_children.into_iter().find(|b| &b.kind == b"meta") else {
+        return tags;
+    };
+    // `meta` 是 FullBox：payload 前 4 字节是 version/flags，子盒子从 +4 开始
+    let Ok(meta_children) = children(src, meta.payload_start + 4, meta.end) else {
+        return tags;
+    };
+    let Some(ilst) = meta_children.into_iter().find(|b| &b.kind == b"ilst") else {
+        return tags;
+    };
+    let Ok(entries) = children(src, ilst.payload_start, ilst.end) else {
+        return tags;
+    };
+    for entry in entries {
+        let Some(text) = ilst_text(src, &entry) else { continue };
+        let text = text.trim().to_string();
+        if text.is_empty() {
+            continue;
+        }
+        match &entry.kind {
+            b"\xA9nam" => {
+                if tags.title.is_none() {
+                    tags.title = Some(text);
+                }
+            }
+            b"\xA9ART" => {
+                if tags.artist.is_none() {
+                    tags.artist = Some(text);
+                }
+            }
+            b"\xA9alb" => {
+                if tags.album.is_none() {
+                    tags.album = Some(text);
+                }
+            }
+            _ => {}
+        }
+    }
+    tags
+}
+
+/// 取一个 `ilst` 条目的文本（里面的 `data` 盒子）。
+fn ilst_text(src: &dyn ReadAt, entry: &BoxHeader) -> Option<String> {
+    let kids = children(src, entry.payload_start, entry.end).ok()?;
+    let data = kids.into_iter().find(|b| &b.kind == b"data")?;
+    let payload = read_payload(src, &data).ok()?;
+    if payload.len() < 8 {
+        return None;
+    }
+    let kind = u32::from_be_bytes([payload[0], payload[1], payload[2], payload[3]]);
+    let body = &payload[8..];
+    Some(if kind == 2 {
+        // UTF-16BE
+        let units: Vec<u16> = body
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        String::from_utf16_lossy(&units)
+    } else {
+        String::from_utf8_lossy(body).into_owned()
+    })
+}
+
 fn handler_kind(h: &[u8; 4]) -> MediaKind {
     match h {
         b"vide" => MediaKind::Video,
@@ -1566,6 +1644,8 @@ pub struct Mp4Demuxer {
     finished: bool,
     /// seek 之后要丢掉"早于这个时间"的采样（微秒）—— 关键帧之前的 B 帧
     skip_before_us: Option<i64>,
+    /// seek 之后第一个分片：只从关键帧采样开始出包（见 `seek_fragmented`）
+    seek_fragment: Option<(u64, i64)>,
     /// 时长缓存（分片模式要扫一遍分片才知道，别每次都扫）
     duration_cache: OnceLock<Option<i64>>,
     /// 第一帧的媒体时间（微秒）。
@@ -1574,6 +1654,8 @@ pub struct Mp4Demuxer {
     /// 源的时间轴不一定从 0 开始（实测 Apple 的分片从 10 秒起），
     /// 报 0 会让上层的"起点归零"算错，表现是进度条长度不对、一开播就显示结束。
     first_media_cache: OnceLock<Option<i64>>,
+    /// 标题 / 艺术家 / 专辑（`ilst`）
+    tags: MediaTags,
 }
 
 impl Mp4Demuxer {
@@ -1594,6 +1676,7 @@ impl Mp4Demuxer {
                 "ISO BMFF 里找不到 moov：文件被截断，或者 moov 还没下到（边下边播时它是第一优先要的盒子）",
             ));
         };
+        let tags = parse_moov_tags(&*src, &moov);
         let m = parse_moov(&*src, &moov)?;
         if m.tracks.is_empty() {
             return Err(MediaError::container("moov 里没有任何可用轨道（trak 全被跳过）"));
@@ -1625,8 +1708,10 @@ impl Mp4Demuxer {
             next_box: 0,
             finished: false,
             skip_before_us: None,
+            seek_fragment: None,
             duration_cache: OnceLock::new(),
             first_media_cache: OnceLock::new(),
+            tags,
         })
     }
 
@@ -1875,7 +1960,20 @@ impl Mp4Demuxer {
             if &b.kind != b"moof" {
                 continue;
             }
-            let samples = parse_moof(&*self.src, &b, &self.tracks)?;
+            let mut samples = parse_moof(&*self.src, &b, &self.tracks)?;
+            // seek 落点所在的分片：只从关键帧开始出包。
+            // 视频必须整段往后放（B 帧的显示时间可能早于关键帧，但解码顺序在其后），
+            // 所以按**解码时间**切，而不是按显示时间。
+            if let Some((start, key_dts)) = self.seek_fragment {
+                if start == b.start {
+                    samples.retain(|s| {
+                        let is_video =
+                            matches!(self.tracks[s.track_index].kind, MediaKind::Video);
+                        !is_video || s.decode_time >= key_dts
+                    });
+                }
+                self.seek_fragment = None;
+            }
             if samples.is_empty() {
                 continue;
             }
@@ -1995,8 +2093,14 @@ impl Mp4Demuxer {
             return Ok(0);
         };
 
-        // 第一遍：顺着采样表找 `<= target` 的最后一个关键帧，同时记下它的下标
-        let mut landing: Option<(i64, u32)> = None; // (pts 刻度, 采样下标 0 基)
+        // 第一遍：找**距目标最近的关键帧**（前后各取一个比较）。
+        //
+        // 只取"目标之前那个"在关键帧稀疏时会差出半个 GOP（实测这条素材每 5 秒
+        // 一个关键帧：拖到 60s 落在 55.1s）。取最近的那个后，60s → 60.1s 几乎
+        // 零偏差，最坏也只有半个 GOP。
+        let mut prev_kf: Option<(i64, u32)> = None; // (pts 刻度, 采样下标 0 基)
+        let mut next_kf: Option<(i64, u32)> = None;
+        let target_ticks;
         {
             let t = &self.tracks[pi];
             let table = match t.stbl.as_ref() {
@@ -2007,6 +2111,7 @@ impl Mp4Demuxer {
                 }
             };
             let target = t.timebase().us_to_ticks(pts_us);
+            target_ticks = target;
             let is_video = matches!(t.kind, MediaKind::Video);
             let mut cur = SampleCursor::new(table);
             while cur.next <= table.sample_count {
@@ -2016,14 +2121,26 @@ impl Mp4Demuxer {
                 let here = cur.next - 1;
                 let Some(s) = cur.take(table) else { break };
                 let pts = s.2 + s.4 as i64;
-                if pts > target {
-                    break;
-                }
                 if !is_video || s.5 {
-                    landing = Some((pts, here));
+                    if pts <= target {
+                        prev_kf = Some((pts, here));
+                    } else {
+                        next_kf = Some((pts, here));
+                        break;
+                    }
                 }
             }
         }
+        let landing: Option<(i64, u32)> = match (prev_kf, next_kf) {
+            (Some(p), Some(n)) => {
+                if (n.0 - target_ticks).abs() < (target_ticks - p.0).abs() {
+                    Some(n)
+                } else {
+                    Some(p)
+                }
+            }
+            (a, b) => a.or(b),
+        };
 
         let Some((pts_ticks, key_index)) = landing else {
             // 找不到（目标在第一个关键帧之前）：回到开头 —— **开头是源的第一个
@@ -2124,7 +2241,11 @@ impl Mp4Demuxer {
     /// 没有视频轨时才退化成"按任意轨定位"。
     fn seek_fragmented(&mut self, pts_us: i64) -> Result<i64> {
         let has_video = self.tracks.iter().any(|t| matches!(t.kind, MediaKind::Video));
-        let mut best: Option<(u64, i64)> = None; // (moof 起点, 关键帧时间 us)
+        // (moof 起点, 关键帧解码时间, 关键帧显示时间 us)
+        let mut best: Option<(u64, i64, i64)> = None;
+        let mut best_dist = i64::MAX;
+        // 是否已经越过目标并评估过 —— 越过之后更远的分片不可能更近，可以停
+        let mut passed_target = false;
         let mut pos = 0u64;
         let mut scanned = 0u64;
         while scanned < MAX_TOP_LEVEL_SCAN {
@@ -2145,20 +2266,28 @@ impl Mp4Demuxer {
                     continue;
                 }
                 min_us = min_us.min(us);
-                if s.keyframe && us <= pts_us {
-                    let better = best.map(|(_, bp)| us > bp).unwrap_or(true);
-                    if better {
-                        best = Some((b.start, us));
+                if s.keyframe {
+                    // 取**最近**的关键帧，而不是"目标之前那个"。
+                    // 关键帧间隔 5 秒时（实测这条素材每 5.0s 一个），
+                    // 落点最多偏 5 秒 —— 拖到 60s 却从 55.1s 开始播，
+                    // 悬停预览也会显示 5 秒前的画面。选最近的那个后偏差 ≤2.5s，
+                    // 而 60 → 60.1 这种几乎零偏差，几乎不用再解码追赶。
+                    let dist = (us - pts_us).abs();
+                    if dist < best_dist {
+                        best = Some((b.start, s.decode_time, us));
+                        best_dist = dist;
+                    }
+                    if us > pts_us {
+                        passed_target = true;
                     }
                 }
             }
-            // 分片是按时间递增排的：这个分片的最早时间已经超过目标，后面不用看了
-            if min_us != i64::MAX && min_us > pts_us {
+            if passed_target {
                 break;
             }
         }
 
-        let Some((moof_start, landing)) = best else {
+        let Some((moof_start, key_dts, landing)) = best else {
             // 目标在第一个关键帧之前：从头开始（源的开头不一定是 0）
             self.reset_stream();
             return Ok(self.first_media_us().unwrap_or(0));
@@ -2166,6 +2295,11 @@ impl Mp4Demuxer {
         self.reset_stream();
         self.next_box = moof_start;
         self.skip_before_us = Some(landing);
+        // 分片里的**第一个采样不一定就是关键帧**（实测某些重封装的文件把
+        // 关键帧放在分片中间，分片开头是一串非关键帧）。从分片起点开始喂，
+        // 解码器拿不到参考帧，VideoToolbox 会安静地吐黑帧 —— 画面全黑但不报错。
+        // 所以记下关键帧的解码时间，泵这个分片时把更早的采样丢掉。
+        self.seek_fragment = Some((moof_start, key_dts));
         Ok(landing)
     }
 
@@ -2182,6 +2316,7 @@ impl Mp4Demuxer {
         self.next_box = 0;
         self.finished = false;
         self.skip_before_us = None;
+        self.seek_fragment = None;
     }
 }
 
@@ -2204,6 +2339,10 @@ impl Demuxer for Mp4Demuxer {
 
     fn container(&self) -> &'static str {
         ContainerFormat::IsoBmff.name()
+    }
+
+    fn tags(&self) -> MediaTags {
+        self.tags.clone()
     }
 }
 
@@ -2798,6 +2937,18 @@ mod tests {
 
     /// 造一个分片 fMP4：moov（空采样表 + mvex/trex）+ 三个分片。
     fn fragmented_mp4() -> Vec<u8> {
+        fragmented_mp4_impl(false)
+    }
+
+    /// 同上，但分片 0 的**第一条采样不是同步点**（关键帧在分片中间）。
+    ///
+    /// 真实素材里见过这种写法（重封装工具把关键帧放在分片中间），从分片起点
+    /// 开始喂解码器会得到一串黑帧 —— 引擎必须从关键帧开始出包。
+    fn fragmented_mp4_first_sample_not_sync() -> Vec<u8> {
+        fragmented_mp4_impl(true)
+    }
+
+    fn fragmented_mp4_impl(first_sample_not_sync: bool) -> Vec<u8> {
         let mut fb = FileBuilder::new();
         fb.head = ftyp();
 
@@ -2858,7 +3009,8 @@ mod tests {
                 s
             },
         ];
-        let m0 = moof(1, 0, &[(6, key_flags), (6, non_key)]);
+        let first_flags = if first_sample_not_sync { non_key } else { key_flags };
+        let m0 = moof(1, 0, &[(6, first_flags), (6, non_key)]);
         let mut v_payload = Vec::new();
         for s in &v0 {
             v_payload.extend_from_slice(s);
@@ -2927,8 +3079,9 @@ mod tests {
     #[test]
     fn fragmented_seek_moves_to_matching_fragment() {
         let mut d = demux(fragmented_mp4());
+        // 关键帧在 0ms 与 66.7ms：50ms 距后者更近（16.7ms vs 50ms）
         let landing = d.seek_us(50_000).unwrap();
-        assert_eq!(landing, 0, "50ms 落在第一个分片");
+        assert_eq!(landing, 66_666, "取最近的关键帧");
         assert!(d.next_packet().unwrap().is_some());
 
         let mut d2 = demux(fragmented_mp4());
@@ -2936,6 +3089,19 @@ mod tests {
         assert_eq!(landing2, 66_666, "80ms 应该落到第二个分片(2000 刻度 ≈ 66.6ms)");
         let p = d2.next_packet().unwrap().unwrap();
         assert_eq!(p.dts, 2000);
+    }
+
+    #[test]
+    fn fragmented_seek_starts_at_keyframe_inside_fragment() {
+        // 分片 0 = [非同步(0), 非同步(1000)]，其中第一条被标记为非同步；
+        // 最近的关键帧是分片 2（dts=2000）。seek 之后**不能**从分片 0 的第 1 条
+        // 采样开始出包 —— 没有参考帧，硬解只会吐黑帧（而且不报错）。
+        let mut d = demux(fragmented_mp4_first_sample_not_sync());
+        let landing = d.seek_us(0).unwrap();
+        assert_eq!(landing, 66_666, "关键帧在分片 2（dts=2000）");
+        let p = d.next_packet().unwrap().unwrap();
+        assert_eq!(p.dts, 2000);
+        assert!(p.keyframe, "第一包必须是关键帧");
     }
 
     // ── 编辑列表 ──────────────────────────────────────────────────────
