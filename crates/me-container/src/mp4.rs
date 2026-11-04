@@ -1682,6 +1682,11 @@ pub struct Mp4Demuxer {
     rotation: u16,
     /// 时长缓存（分片模式要扫一遍分片才知道，别每次都扫）
     duration_cache: OnceLock<Option<i64>>,
+    /// 分片模式的关键帧索引：(moof 起点, 关键帧 decode_time, 关键帧显示时间 us)
+    ///
+    /// 4K 长片有几万个 moof，每次 seek 都从头扫一遍（悬停预览会连续 seek）
+    /// 要几百毫秒。这里建一次，之后二分查找。
+    fragment_index: OnceLock<Vec<(u64, i64, i64)>>,
     /// 第一帧的媒体时间（微秒）。
     ///
     /// seek 的目标早于第一个关键帧时要**如实返回它**，而不是返回 0 ——
@@ -1752,6 +1757,7 @@ impl Mp4Demuxer {
             skip_before_us: None,
             seek_fragment: None,
             duration_cache: OnceLock::new(),
+            fragment_index: OnceLock::new(),
             first_media_cache: OnceLock::new(),
             rotation,
             tags,
@@ -2283,67 +2289,68 @@ impl Mp4Demuxer {
     /// 而实际吐出的第一条视频却在下一个分片 —— 实测差整整一个分片（2 秒）。
     /// 没有视频轨时才退化成"按任意轨定位"。
     fn seek_fragmented(&mut self, pts_us: i64) -> Result<i64> {
-        let has_video = self.tracks.iter().any(|t| matches!(t.kind, MediaKind::Video));
-        // (moof 起点, 关键帧解码时间, 关键帧显示时间 us)
-        let mut best: Option<(u64, i64, i64)> = None;
-        let mut best_dist = i64::MAX;
-        // 是否已经越过目标并评估过 —— 越过之后更远的分片不可能更近，可以停
-        let mut passed_target = false;
-        let mut pos = 0u64;
-        let mut scanned = 0u64;
-        while scanned < MAX_TOP_LEVEL_SCAN {
-            let Some(b) = next_top_level(&*self.src, pos)? else { break };
-            pos = b.end;
-            scanned += 1;
-            if &b.kind != b"moof" {
-                continue;
-            }
-            let samples = parse_moof(&*self.src, &b, &self.tracks)?;
-            let mut min_us = i64::MAX;
-            for s in &samples {
-                let Some(t) = self.tracks.get(s.track_index) else { continue };
-                let is_video = matches!(t.kind, MediaKind::Video);
-                let us = t.timebase().ticks_to_us(s.decode_time + s.composition_offset as i64 + t.edit_shift);
-                // 定位只看视频轨（见上面的说明）
-                if has_video && !is_video {
-                    continue;
-                }
-                min_us = min_us.min(us);
-                if s.keyframe {
-                    // 取**最近**的关键帧，而不是"目标之前那个"。
-                    // 关键帧间隔 5 秒时（实测这条素材每 5.0s 一个），
-                    // 落点最多偏 5 秒 —— 拖到 60s 却从 55.1s 开始播，
-                    // 悬停预览也会显示 5 秒前的画面。选最近的那个后偏差 ≤2.5s，
-                    // 而 60 → 60.1 这种几乎零偏差，几乎不用再解码追赶。
-                    let dist = (us - pts_us).abs();
-                    if dist < best_dist {
-                        best = Some((b.start, s.decode_time, us));
-                        best_dist = dist;
-                    }
-                    if us > pts_us {
-                        passed_target = true;
-                    }
-                }
-            }
-            if passed_target {
-                break;
-            }
-        }
-
-        let Some((moof_start, key_dts, landing)) = best else {
-            // 目标在第一个关键帧之前：从头开始（源的开头不一定是 0）
+        let index = self.fragment_keyframe_index();
+        if index.is_empty() {
             self.reset_stream();
             return Ok(self.first_media_us().unwrap_or(0));
+        }
+        // 二分找"显示时间最接近目标"的关键帧
+        let pos = index.partition_point(|e| e.2 < pts_us);
+        let best = if pos == 0 {
+            index[0]
+        } else if pos >= index.len() {
+            index[index.len() - 1]
+        } else {
+            let (before, after) = (index[pos - 1], index[pos]);
+            if (after.2 - pts_us).abs() < (pts_us - before.2).abs() {
+                after
+            } else {
+                before
+            }
         };
+
         self.reset_stream();
-        self.next_box = moof_start;
-        self.skip_before_us = Some(landing);
-        // 分片里的**第一个采样不一定就是关键帧**（实测某些重封装的文件把
-        // 关键帧放在分片中间，分片开头是一串非关键帧）。从分片起点开始喂，
-        // 解码器拿不到参考帧，VideoToolbox 会安静地吐黑帧 —— 画面全黑但不报错。
-        // 所以记下关键帧的解码时间，泵这个分片时把更早的采样丢掉。
-        self.seek_fragment = Some((moof_start, key_dts));
-        Ok(landing)
+        self.next_box = best.0;
+        self.skip_before_us = Some(best.2);
+        // 分片里的第一个采样不一定就是关键帧：记下 decode_time，泵这个分片时丢掉更早的
+        self.seek_fragment = Some((best.0, best.1));
+        Ok(best.2)
+    }
+
+    /// 建立（并缓存）分片关键帧索引。只扫顶层盒子头 + moof，不碰 mdat。
+    fn fragment_keyframe_index(&self) -> &Vec<(u64, i64, i64)> {
+        self.fragment_index.get_or_init(|| {
+            let has_video = self.tracks.iter().any(|t| matches!(t.kind, MediaKind::Video));
+            let mut out: Vec<(u64, i64, i64)> = Vec::new();
+            let mut pos = 0u64;
+            let mut scanned = 0u64;
+            while scanned < MAX_TOP_LEVEL_SCAN {
+                let Ok(Some(b)) = next_top_level(&*self.src, pos) else { break };
+                pos = b.end;
+                scanned += 1;
+                if &b.kind != b"moof" {
+                    continue;
+                }
+                let Ok(samples) = parse_moof(&*self.src, &b, &self.tracks) else { continue };
+                for s in &samples {
+                    let Some(t) = self.tracks.get(s.track_index) else { continue };
+                    let is_video = matches!(t.kind, MediaKind::Video);
+                    if has_video && !is_video {
+                        continue;
+                    }
+                    if !s.keyframe {
+                        continue;
+                    }
+                    let us = t
+                        .timebase()
+                        .ticks_to_us(s.decode_time + s.composition_offset as i64 + t.edit_shift);
+                    out.push((b.start, s.decode_time, us));
+                }
+            }
+            out.sort_by_key(|e| e.2);
+            out.dedup_by_key(|e| e.2);
+            out
+        })
     }
 
     /// 回到流的开头（保留轨道信息）。
