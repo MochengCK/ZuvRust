@@ -35,6 +35,14 @@ pub trait Demuxer {
     fn tags(&self) -> MediaTags {
         MediaTags::default()
     }
+
+    /// 视频的显示旋转（0/90/180/270）。
+    ///
+    /// 手机竖屏视频把画面"横着"编码，靠 `tkhd` 矩阵声明该转多少度。
+    /// 默认 0：不认识的容器宁可不动，也不要乱转。
+    fn video_rotation(&self) -> u16 {
+        0
+    }
 }
 
 /// 按探测结果开一个解封装器。

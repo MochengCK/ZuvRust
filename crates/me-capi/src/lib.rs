@@ -38,7 +38,7 @@ mod subtitle;
 
 use std::collections::VecDeque;
 use std::ffi::{c_char, c_int, CStr};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, AtomicI64, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -357,6 +357,8 @@ pub struct ZuvSource {
     sh: Arc<Shared>,
     /// 容器标签（打开时读一次，之后不变）
     tags: Mutex<me_core::MediaTags>,
+    /// 视频显示旋转（0/90/180/270），打开时读一次
+    rotation: AtomicU16,
     threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     defs: Mutex<Arc<Vec<TrackDef>>>,
     duration_us: AtomicI64,
@@ -1074,6 +1076,7 @@ pub extern "C" fn zuvsrc_create(out: *mut *mut ZuvSource) -> c_int {
     let src = Box::new(ZuvSource {
         sh: Arc::new(Shared::new()),
         tags: Mutex::new(me_core::MediaTags::default()),
+        rotation: AtomicU16::new(0),
         threads: Mutex::new(Vec::new()),
         defs: Mutex::new(Arc::new(Vec::new())),
         duration_us: AtomicI64::new(0),
@@ -1119,6 +1122,7 @@ pub unsafe extern "C" fn zuvsrc_open(
     let t_demux = t0.elapsed();
     let media = player.info();
     let tags = player.tags();
+    let rotation = player.video_rotation();
     let t_info = t0.elapsed();
     drop(player);
     if std::env::var_os("ZUV_TRACE").is_some() {
@@ -1131,6 +1135,7 @@ pub unsafe extern "C" fn zuvsrc_open(
     }
 
     *src.tags.lock().unwrap_or_else(|e| e.into_inner()) = tags;
+    src.rotation.store(rotation, Ordering::Relaxed);
 
     let mut defs: Vec<TrackDef> = Vec::new();
     let mut out_info = ZuvMediaInfo::default();
@@ -1590,6 +1595,18 @@ pub unsafe extern "C" fn zuvsrc_resync_video(p: *mut ZuvSource, pts_us: i64) -> 
     src.sh.cv.notify_all();
     src.sh.cv_v.notify_all();
     ZUV_OK
+}
+
+/// 视频的显示旋转（0 / 90 / 180 / 270）。
+///
+/// 手机竖屏视频把画面横着编码，靠 `tkhd` 矩阵声明该转多少度；宿主按这个值
+/// 旋转画面并交换宽高，否则竖屏片子会横着显示。
+#[no_mangle]
+pub unsafe extern "C" fn zuvsrc_video_rotation(p: *mut ZuvSource) -> c_int {
+    let Some(src) = as_source(p) else {
+        return 0;
+    };
+    src.rotation.load(Ordering::Relaxed) as c_int
 }
 
 /// 读容器标签（标题 / 艺术家 / 专辑），写进三个 UTF-8 缓冲。

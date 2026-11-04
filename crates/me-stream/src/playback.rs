@@ -152,6 +152,11 @@ impl Player {
         self.demuxer.tags()
     }
 
+    /// 视频的显示旋转（0/90/180/270）。
+    pub fn video_rotation(&self) -> u16 {
+        self.demuxer.video_rotation()
+    }
+
     /// 源的总字节数（未知返回 None；边下边播时可能是"下载引擎声明的最终大小"）。
     pub fn source_len(&self) -> Option<u64> {
         self.source.len()

@@ -448,6 +448,8 @@ struct Mp4Track {
     extradata: Vec<u8>,
     width: u32,
     height: u32,
+    /// `tkhd` 矩阵给的显示旋转（0/90/180/270）
+    rotation: u16,
     sample_rate: u32,
     channels: u16,
     language: Option<String>,
@@ -499,7 +501,7 @@ fn parse_mvhd(p: &[u8]) -> Result<(u32, Option<i64>)> {
     Ok((timescale, dur))
 }
 
-fn parse_tkhd(p: &[u8]) -> Option<(u32, u32, u32)> {
+fn parse_tkhd(p: &[u8]) -> Option<(u32, u32, u32, u16)> {
     let mut r = ByteReader::new(p);
     let version = r.u8().ok()?;
     r.skip(3).ok()?;
@@ -515,10 +517,37 @@ fn parse_tkhd(p: &[u8]) -> Option<(u32, u32, u32)> {
     } else {
         r.skip(4).ok()?;
     }
-    r.skip(8 + 2 + 2 + 2 + 2 + 36).ok()?; // reserved + layer + group + volume + reserved + matrix
+    r.skip(8 + 2 + 2 + 2 + 2).ok()?; // reserved + layer + group + volume + reserved
+    // 3×3 变换矩阵（16.16 定点）。手机竖屏视频就是靠它"躺在" 1920×1080 里的：
+    // 不读它，竖屏片子会横着显示。
+    let mut m = [0i32; 9];
+    for v in m.iter_mut() {
+        *v = r.u32_be().ok()? as i32;
+    }
     let w = r.u32_be().ok()? >> 16; // 16.16 定点
     let h = r.u32_be().ok()? >> 16;
-    Some((id, w, h))
+    Some((id, w, h, rotation_from_matrix(m[0], m[1])))
+}
+
+/// 从 `tkhd` 矩阵的 (a, b) 分量推旋转角（0/90/180/270）。
+///
+/// 矩阵把**媒体坐标**映射到**显示坐标**，所以 a=cosθ、b=sinθ。
+/// 只认四个正交值：带缩放的畸形矩阵宁可当 0，也不要乱转。
+fn rotation_from_matrix(a: i32, b: i32) -> u16 {
+    const ONE: i32 = 0x0001_0000;
+    const TOL: i32 = ONE / 8;
+    let near = |v: i32, t: i32| (v - t).abs() < TOL;
+    if near(a, ONE) && near(b, 0) {
+        0
+    } else if near(a, 0) && near(b, ONE) {
+        90
+    } else if near(a, -ONE) && near(b, 0) {
+        180
+    } else if near(a, 0) && near(b, -ONE) {
+        270
+    } else {
+        0
+    }
 }
 
 fn parse_mdhd(p: &[u8]) -> Result<(u32, Option<i64>, Option<String>)> {
@@ -1188,12 +1217,14 @@ fn parse_trak(
     let mut id = 0u32;
     let mut width = 0u32;
     let mut height = 0u32;
+    let mut rotation = 0u16;
     if let Some(b) = child_of(src, trak, b"tkhd")? {
         let p = read_payload(src, &b)?;
-        if let Some((i, w, h)) = parse_tkhd(&p) {
+        if let Some((i, w, h, rot)) = parse_tkhd(&p) {
             id = i;
             width = w;
             height = h;
+            rotation = rot;
         }
     }
     if id == 0 {
@@ -1316,6 +1347,7 @@ fn parse_trak(
         extradata,
         width,
         height,
+        rotation,
         sample_rate,
         channels,
         language,
@@ -1646,6 +1678,8 @@ pub struct Mp4Demuxer {
     skip_before_us: Option<i64>,
     /// seek 之后第一个分片：只从关键帧采样开始出包（见 `seek_fragmented`）
     seek_fragment: Option<(u64, i64)>,
+    /// 视频轨的显示旋转（0/90/180/270），没有视频轨就是 0
+    rotation: u16,
     /// 时长缓存（分片模式要扫一遍分片才知道，别每次都扫）
     duration_cache: OnceLock<Option<i64>>,
     /// 第一帧的媒体时间（微秒）。
@@ -1693,6 +1727,14 @@ impl Mp4Demuxer {
             }
         }
 
+        // 显示旋转取视频轨的（音频轨没有意义），必须在 tracks 被移进结构体之前算
+        let rotation = m
+            .tracks
+            .iter()
+            .find(|t| matches!(t.kind, MediaKind::Video))
+            .map(|t| t.rotation)
+            .unwrap_or(0);
+
         Ok(Self {
             src,
             source_name,
@@ -1711,6 +1753,7 @@ impl Mp4Demuxer {
             seek_fragment: None,
             duration_cache: OnceLock::new(),
             first_media_cache: OnceLock::new(),
+            rotation,
             tags,
         })
     }
@@ -2343,6 +2386,10 @@ impl Demuxer for Mp4Demuxer {
 
     fn tags(&self) -> MediaTags {
         self.tags.clone()
+    }
+
+    fn video_rotation(&self) -> u16 {
+        self.rotation
     }
 }
 
@@ -3033,6 +3080,45 @@ mod tests {
 
         fb.body = cat(&[frag0, frag1, frag2]);
         fb.build(Some(mvex))
+    }
+
+    /// 把 `tkhd` 的矩阵改写成指定旋转（0/90/180/270）。
+    ///
+    /// 手拼文件时不方便给每个构造器都加一个参数，直接在字节上改矩阵更简单，
+    /// 而且这正是手机/相机写出来的样子。
+    fn with_rotation(mut data: Vec<u8>, deg: u16) -> Vec<u8> {
+        let pos = data.windows(4).position(|w| w == b"tkhd").expect("有 tkhd");
+        // version/flags(4) + creation(4) + modification(4) + track_id(4)
+        // + reserved(4) + duration(4) + reserved(8) + layer/group/volume/reserved(8)
+        let matrix_at = pos + 4 + 4 + 20 + 16;
+        const ONE: i32 = 0x0001_0000;
+        let vals: [i32; 9] = match deg {
+            90 => [0, ONE, 0, -ONE, 0, 0, 0, 0, ONE],
+            180 => [-ONE, 0, 0, 0, -ONE, 0, 0, 0, ONE],
+            270 => [0, -ONE, 0, ONE, 0, 0, 0, 0, ONE],
+            _ => [ONE, 0, 0, 0, ONE, 0, 0, 0, ONE],
+        };
+        for (i, v) in vals.iter().enumerate() {
+            let at = matrix_at + i * 4;
+            data[at..at + 4].copy_from_slice(&(*v as u32).to_be_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn tkhd_rotation_is_read() {
+        // 手机竖屏视频：画面横着编码（1920×1080），靠矩阵声明要转 90°
+        let d = demux(with_rotation(progressive_mp4(3), 90));
+        assert_eq!(d.video_rotation(), 90);
+        let info = d.info();
+        assert_eq!(info.video().unwrap().width, 1920, "存储画幅不变");
+        assert_eq!(info.video().unwrap().height, 1080);
+
+        let d2 = demux(with_rotation(progressive_mp4(3), 270));
+        assert_eq!(d2.video_rotation(), 270);
+
+        let d3 = demux(progressive_mp4(3));
+        assert_eq!(d3.video_rotation(), 0, "普通矩阵不该被当成旋转");
     }
 
     #[test]
