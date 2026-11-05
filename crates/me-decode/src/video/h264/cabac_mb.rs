@@ -71,9 +71,9 @@ const NODE_AFTER_1: [usize; 8] = [1, 2, 3, 3, 4, 5, 6, 7];
 /// 解出 `level > 1` 之后节点怎么走。
 const NODE_AFTER_GT1: [usize; 8] = [4, 4, 4, 4, 5, 6, 7, 7];
 
-/// CABAC 目前**默认不开**：I 切片的 I16（DC）路径已逐样本对上 FFmpeg，但 4×4
-/// 残差还有偏差。半成品默认放出去会比"明确不支持"更糟（用户看到的是花屏而不是
-/// 报错），所以先用环境变量挡住，修好 4×4 之后把这段删掉。
+/// CABAC 目前**默认不开**：I 切片已经逐样本对上 FFmpeg，但 P 切片还有个别宏块
+/// 的偏差。真实素材必有 P/B 帧，半成品默认放出去用户看到的是局部花屏而不是报错，
+/// 所以先用环境变量挡住，P 修好之后把这段删掉。
 ///
 /// `JISHI_H264_CABAC=1` 可以强行启用（开发/验证用）。
 fn cabac_enabled() -> bool {
@@ -87,8 +87,8 @@ fn ensure_enabled() -> Result<()> {
         Ok(())
     } else {
         Err(MediaError::Unsupported(
-            "这条流用的是 CABAC。自研软解的 CABAC 仍在验证中（I16 的 DC 路径已逐样本对上，\
-             4×4 残差还有偏差）—— 设 JISHI_H264_CABAC=1 可强行启用"
+            "这条流用的是 CABAC。自研软解的 CABAC 仍在验证中（I 切片已逐样本对上，\
+             P 切片还有偏差）—— 设 JISHI_H264_CABAC=1 可强行启用"
                 .into(),
         ))
     }
@@ -140,34 +140,46 @@ fn top_of(info: &PictureInfo, addr: usize) -> Option<usize> {
     info.decoded[b].then_some(b)
 }
 
-/// 亮度 4×4 块（**全图坐标**，块单位）有没有系数。画面外 / 所属宏块没解过 → false。
-fn luma_nz(info: &PictureInfo, x4: i32, y4: i32) -> bool {
+/// 亮度 4×4 块（**全图坐标**，块单位）有没有系数。
+///
+/// ⚠️ **不可用（画面外 / 还没解到）按 1 算**。这条和 DC 块是同一个道理：实现里
+/// 邻居的 `non_zero_count` 用 `-1` 表示不可用，`!!(-1) = 1`。按 0 算的话第一个
+/// 宏块第一块的 `coded_block_flag` 上下文是 93，正确是 **96** —— 那一位错下去，
+/// 显著性图从第二个系数起就会歪（`-25, -2` 会被解成 `-1, -1`）。
+fn luma_nz(info: &PictureInfo, cur: usize, x4: i32, y4: i32) -> bool {
     if x4 < 0 || y4 < 0 {
-        return false;
+        return true;
     }
     let (x4, y4) = (x4 as usize, y4 as usize);
     let (mbx, mby) = (x4 / 4, y4 / 4);
     if mbx >= info.mb_cols || mby >= info.mb_rows {
-        return false;
+        return true;
     }
-    if !info.decoded[mby * info.mb_cols + mbx] {
-        return false;
+    let a = mby * info.mb_cols + mbx;
+    // ⚠️ **当前宏块自己还没标 decoded**（要整块解完才标），不能把它当成"不可用"：
+    // 同一宏块内的邻居直接读 `tc` 网格（按块顺序逐块写好），只有"别的宏块且还没解到"
+    // 才回退成 1。写成 `!decoded[a] → true` 会让宏块内所有邻居恒为 1，
+    // 第 4 个块（blk3）的上下文从 95 变成 96，从那里开始整片错。
+    if a != cur && !info.decoded[a] {
+        return true;
     }
     info.tc.luma_get(x4, y4) > 0
 }
 
 /// 色度 4×4 块（块单位，色度网格）有没有系数。`plane` 0=Cb、1=Cr。
-fn chroma_nz(info: &PictureInfo, plane: usize, x4: i32, y4: i32) -> bool {
+/// 不可用同样按 1 算（与亮度一致）。
+fn chroma_nz(info: &PictureInfo, cur: usize, plane: usize, x4: i32, y4: i32) -> bool {
     if x4 < 0 || y4 < 0 {
-        return false;
+        return true;
     }
     let (x4, y4) = (x4 as usize, y4 as usize);
     let (mbx, mby) = (x4 / 2, y4 / 2);
     if mbx >= info.mb_cols || mby >= info.mb_rows {
-        return false;
+        return true;
     }
-    if !info.decoded[mby * info.mb_cols + mbx] {
-        return false;
+    let a = mby * info.mb_cols + mbx;
+    if a != cur && !info.decoded[a] {
+        return true;
     }
     info.tc.chroma_get(plane, x4, y4) > 0
 }
@@ -342,8 +354,8 @@ fn residual_cabac(
                 s,
                 CAT_LUMA8,
                 64,
-                luma_nz(info, bx - 1, by),
-                luma_nz(info, bx, by - 1),
+                luma_nz(info, addr, bx - 1, by),
+                luma_nz(info, addr, bx, by - 1),
             )?;
             coeffs.luma8[i8x8] = b.levels;
             // 8×8 块的四块 4×4 共享一个"非零个数"（§9.3.2.3 的 NOTE）
@@ -363,13 +375,9 @@ fn residual_cabac(
                 } else {
                     (CAT_LUMA4, 16)
                 };
-                let b = decode_block(
-                    s,
-                    cat,
-                    max,
-                    luma_nz(info, bx as i32 - 1, by as i32),
-                    luma_nz(info, bx as i32, by as i32 - 1),
-                )?;
+                let nza = luma_nz(info, addr, bx as i32 - 1, by as i32);
+                let nzb = luma_nz(info, addr, bx as i32, by as i32 - 1);
+                let b = decode_block(s, cat, max, nza, nzb)?;
                 if is_i16 {
                     // AC：15 个，槽位 0..14 对应扫描位置 1..15
                     coeffs.luma4[idx][..15].copy_from_slice(&b.levels[..15]);
@@ -418,8 +426,8 @@ fn residual_cabac(
                 s,
                 CAT_CHROMA_AC,
                 15,
-                chroma_nz(info, plane, bx as i32 - 1, by as i32),
-                chroma_nz(info, plane, bx as i32, by as i32 - 1),
+                chroma_nz(info, addr, plane, bx as i32 - 1, by as i32),
+                chroma_nz(info, addr, plane, bx as i32, by as i32 - 1),
             )?;
             let mut blk = [0i32; 16];
             blk[..15].copy_from_slice(&b.levels[..15]);
@@ -1051,14 +1059,14 @@ pub fn decode_i_slice(
         if done >= max_mb {
             break;
         }
-        if s.c.terminate() {
+        // `end_of_slice_flag` 在**图的最后一个宏块**之后允许缺省：x264 有些配置
+        // 在画满整帧时不再写这一位，FFmpeg 也按 `eos || mb_y >= mb_height` 处理。
+        let eos = s.c.terminate();
+        if eos || addr + 1 >= total {
             break;
         }
         addr += 1;
         if addr >= total {
-            if std::env::var("H264_CABAC_ALLOW_MISSING_END").is_ok_and(|v| v != "0") {
-                break;
-            }
             return Err(MediaError::Bitstream(format!(
                 "CABAC 的宏块还没解完就到了图末尾（已解 {addr} 个，图里只有 {total} 个）"
             )));
@@ -1092,20 +1100,21 @@ pub fn decode_p_slice(
         )));
     }
     if mb::trace_mb() {
-        eprintln!("CABAC P 切片起点 first_mb={addr} 共 {total} 个宏块");
+        eprintln!(
+            "CABAC P 切片起点 first_mb={addr} 共 {total} 个宏块，num_ref_l0={} cabac_init_idc={}",
+            header.num_ref_idx_l0_active, header.cabac_init_idc
+        );
     }
     loop {
         p_mb(&mut s, header, sps, pps, info, addr)
             .map_err(|e| MediaError::Bitstream(format!("P 切片(CABAC, MB {addr}): {e}")))?;
         info.decoded[addr] = true;
-        if s.c.terminate() {
+        let eos = s.c.terminate();
+        if eos || addr + 1 >= total {
             break;
         }
         addr += 1;
         if addr >= total {
-            if std::env::var("H264_CABAC_ALLOW_MISSING_END").is_ok_and(|v| v != "0") {
-                break;
-            }
             return Err(MediaError::Bitstream(format!(
                 "CABAC 的宏块还没解完就到了图末尾（已解 {addr} 个，图里只有 {total} 个）"
             )));
