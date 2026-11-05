@@ -387,6 +387,19 @@ impl H264Decoder {
                 )));
             }
         }
+        if std::env::var("H264_TRACE_MB").is_ok_and(|v| v != "0") {
+            for s in slices {
+                eprintln!(
+                    "切片: first_mb={} type={} qp_delta={} deblock={} offset={} 字节={}",
+                    s.header.first_mb_in_slice,
+                    s.header.slice_type,
+                    s.header.slice_qp_delta,
+                    s.header.disable_deblocking_filter_idc,
+                    s.header.slice_data_bit_offset,
+                    s.raw.len()
+                );
+            }
+        }
         let mut info = mb::PictureInfo::new(
             sps.coded_width() as usize / 16,
             sps.coded_height() as usize / 16,

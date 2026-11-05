@@ -833,7 +833,7 @@ fn macroblock_intra(
         let nz = |b: &[i32; 16]| b.iter().filter(|&&v| v != 0).count();
         let c = &info.coeffs[addr];
         let nz_ac: usize = (0..16).map(|i| nz(&c.luma4[i])).sum();
-        tracing::info!(
+        eprintln!(
             "MB {addr}: type={mb_type} pred={:?} mode16={} chroma={} cbp=({:x},{}) t8={} qp={qp_y} \
              dc_nz={} ac_nz={nz_ac}",
             mb.intra_pred,
