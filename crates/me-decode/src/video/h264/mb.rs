@@ -334,8 +334,14 @@ pub fn decode_i_slice(
     }
     // §7.3.4：`QPY` 在切片内**累加**（`mb_qp_delta` 是相对上一个宏块的增量）
     let mut qp_y = 26 + pps.pic_init_qp_minus26 + header.slice_qp_delta;
+    if trace_mb() {
+        eprintln!("I 切片起点 first_mb={} 共 {total_mb} 个宏块", header.first_mb_in_slice);
+    }
+    let mut mb_count = 0usize;
     loop {
-        qp_y = macroblock_layer(&mut c, sps, pps, info, addr, qp_y)?;
+        qp_y = macroblock_layer(&mut c, sps, pps, info, addr, qp_y)
+            .map_err(|e| MediaError::Bitstream(format!("I 切片(MB {addr}): {e}")))?;
+        mb_count += 1;
         if !c.more_rbsp_data() {
             break;
         }
@@ -415,7 +421,8 @@ pub fn decode_p_slice(
                 "宏块还没解完就到了图末尾（已解 {addr} 个，图里只有 {total_mb} 个）—— 多半是语法错位"
             )));
         }
-        qp_y = macroblock_layer_p(&mut c, header, sps, pps, info, addr, qp_y)?;
+        qp_y = macroblock_layer_p(&mut c, header, sps, pps, info, addr, qp_y)
+            .map_err(|e| MediaError::Bitstream(format!("P 切片(MB {addr}): {e}")))?;
         addr += 1;
     }
     if trace_mb() {
