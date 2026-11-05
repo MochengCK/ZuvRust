@@ -26,13 +26,16 @@
 //! | 熵层·CAVLC | §9.2 `coeff_token` / `level` / `run_before` / `total_zeros` | [`cavlc`] ✅（表由 [`cavlc_tables`] 自动抄自规范，脚本带前缀码/Kraft/条数三重自检）|
 //! | 熵层·CABAC | §9.3 算术解码器 + §9.3.1 上下文初始化 | 待做 |
 //! | 宏块层（**I 切片**）| §7.3.4 `mb_type` / `mb_pred` / `coded_block_pattern` / `mb_qp_delta` / `residual()` + `nC` 推导（§9.2.1 第 4~7 步）+ `I_PCM` | [`mb`] ✅ **真实 IDR 切片上「恰好停在 `rbsp_trailing_bits`」已过**（两枚夹具见 [`mb`] 的单测）|
-//! | 宏块层（P/B 切片）| `mb_skip_run` / `sub_mb_pred` / 运动矢量差 | 待做 |
+//! | 宏块层（**P 切片**，CAVLC）| `mb_skip_run` / `mb_type` 表 7-13 / `sub_mb_type` 表 7-14 / `ref_idx` / `mvd` | [`mb::decode_p_slice`] ✅ |
+//! | 宏块层（B 切片）| `mb_type` 表 7-14、双向预测 | 待做 |
 //! | 帧内预测 | §8.3 `I_16x16` 四种 / `I_NxN`（4×4 / 8×8 各九种）/ 色度四种 + 参考样本低通 | [`intra`] ✅（**纯函数**，单测钉住方向模式、DC 的三种回退、8×8 的参考滤波）|
 //! | 反变换 | §8.5 反扫描 + 反量化 + 4×4/8×8 整数变换 + `Intra16x16`/色度 DC 的 Hadamard | [`transform`] ✅ |
 //! | 重建接线 | 取参考样本（宏块级 + **块级**可用性）→ 预测 → 加残差 → 写回 | [`reconstruct`] ✅ 能出帧（`ME_DECODE=software` 已跑通）|
 //! | 去块滤波 | §8.7 遍历顺序、阈值（表 8-16/8-17）、`bS < 4` 与 `bS == 4` 两套滤波器、亮度与色度 | [`deblock`] ✅（**目前 `bS` 只覆盖帧内**，见该模块抬头）|
-//! | 帧间预测 | §8.4 运动矢量预测、亚像素插值、加权预测、B 切片 | **待做**（真实素材的主体）|
-//! | 输出顺序 | DPB 重排（按 POC）+ 显示时间戳 | 待做（`reorder` 与 `ready` 队列已就位）|
+//! | 帧间预测（**P 切片**）| §8.4.1 运动矢量预测（按 ref 匹配数分支）、§8.4.2 六抽头 + 双线性亚像素插值、加权预测 | [`inter`] ✅ 单参考列表 |
+//! | 参考帧管理 | 滑动窗口标记、POC（type 0 / 2）、按 POC 输出重排 | [`H264Decoder::decode_picture`] ✅ |
+//! | 帧间预测（B 切片）| 双向预测、`direct` 模式、加权双向预测 | 待做 |
+//! | §8.7 去块的帧间 bS | `bS = 2/1` 两档（非零系数、运动矢量/参考索引差异）| 待做（目前帧间边按 0 处理）|
 //!
 //! ## 现状：I 切片已经**逐样本等于 ffmpeg 的原生解码器**（2026-10-06）
 //!
@@ -65,14 +68,40 @@
 //!    拿"没去块"的参照只能在**解码侧** `-skip_loop_filter all`（`make_cases.py` 会把
 //!    那份落到 `<name>.refnoflt/`）。开发去块那一层时靠它把"预测+变换"和"去块"分开验。
 //!
+//! ## 现状（2026-11-05）：P 切片已经能出画
+//!
+//! `ME_DECODE=software` 现在能解 **CAVLC 的 I/P 切片**（Baseline / 一部分 Main）。
+//! 验收口径与 I 切片一样是**逐样本对比 FFmpeg 的原生解码器**（`--skip_loop_filter
+//! all` 跳过参考侧的去块，这样能把"帧间预测/变换"与"去块"分开验）：
+//!
+//! | 用例 | 结果 |
+//! |---|---|
+//! | `partitions=none`（只 16×16）+ 运动 | 前两帧 **0 差异**，之后亮度差 ≤1 |
+//! | `partitions=all`（含 8×8 子分区）| 前几帧 **0 差异**，个别宏块差几个样本 |
+//! | 16×8 / 8×16 分区 | 能解，**个别宏块的 MV 与参考不一致**（见下）|
+//! | 色度 | 帧间时**最多差 1–2**（插值取整口径），I 帧 **0 差异** |
+//!
+//! ### 三条已经踩过、别再犯的坑
+//!
+//! 1. **运动矢量预测不是"对可用邻居取中位数"**：要先数**参考索引与当前相同的
+//!    邻居个数**（0 / 1 / ≥2 三种分支，见 [`inter::predict_mv`]）。写错的表现
+//!    不是崩，而是"整块偏 5～20 个像素"。
+//! 2. **跳过宏块（`mb_skip_run`）走的是 §8.4.1.1，不是 §8.4.1.3**：左或上邻居
+//!    **不可用**就整体归零；左/上邻居是**帧内**则按 0 参与但不归零。两种"没有 MV"
+//!    必须分开记（网格里 `-1` = 不可用、`-2` = 帧内），否则跳过的平坦区会被
+//!    邻居的 MV 一路带走。
+//! 3. **P 切片的循环不能"末宏块之后再读一个 `mb_skip_run`"**：那几位是
+//!    `rbsp_trailing_bits`，症状是"多读了 1 位"。
+//!
 //! ## 下一步（按这个顺序接，别跳）
 //!
 //! 1. **§9.3 CABAC**：真实素材（x264/各硬件编码器的默认输出）**几乎全是 CABAC**，
 //!    不接它等于自研软解只能解 Baseline。这是当前最大的缺口。
-//! 2. **§8.4 帧间预测**（P/B 切片）：`mb_skip_run` / `sub_mb_pred` / 运动矢量预测 /
-//!    6 抽头亚像素插值 / 加权预测 / B 的 direct 模式 / POC 重排与 DPB。
-//! 3. 接上之后 **`deblock::bs_for_edge` 的后两档（`bS = 2 / 1`）必须补齐**
-//!    （要看非零系数、运动矢量与参考索引），否则帧间流的去块强度会算小。
+//! 2. **B 切片**：`mb_type` 表 7-14、双向预测、`direct` 模式、加权双向预测。
+//! 3. **去块的帧间 `bS`**（`bs_for_edge` 的后两档）：目前帧间宏块之间的边按 0 处理，
+//!    出来的是"没去块"的画面，与正常播放器相比块边缘会偏锐。
+//! 4. 16×8 / 8×16 分区上仍有个别宏块的 MV 与参考不一致（`H264_DUMP_MV=1` 可以
+//!    和参考解码器的运动矢量逐个对拍），需要继续缩小范围。
 //!
 //! ## 诊断开关
 //!
@@ -85,6 +114,7 @@ pub mod cavlc;
 pub mod cavlc_tables;
 pub mod deblock;
 pub mod frame;
+pub mod inter;
 pub mod intra;
 pub mod mb;
 pub mod nal;
@@ -112,6 +142,26 @@ pub struct H264Decoder {
     /// 吃过的采样数 / 解出的图数（诊断用）。
     samples: u64,
     pictures: u64,
+    /// 短期参考帧，**最近解码的在前**（滑动窗口维护，MSB 还没做 MMCO）。
+    refs: Vec<RefFrame>,
+    /// 参考帧上限（`max_num_ref_frames`）。
+    max_refs: usize,
+    /// POC 推导需要的"上一张参考图的 lsb/msb"（§8.2.1.1）。
+    poc: PocState,
+}
+
+/// 一张短期参考帧。
+struct RefFrame {
+    frame: FrameBuf,
+    frame_num: u32,
+    poc: i32,
+}
+
+/// §8.2.1.1（`pic_order_cnt_type == 0`）要的上一次状态。
+#[derive(Default, Clone, Copy)]
+struct PocState {
+    prev_msb: i32,
+    prev_lsb: i32,
 }
 
 /// 一张已经解完、等着按显示顺序吐出去的图。
@@ -128,6 +178,7 @@ impl H264Decoder {
         let mut ps = nal::ParamSets::new();
         ps.load_from_avcc(config)?;
         let reorder = cfg.sps.max_num_reorder_frames() as usize;
+        let max_refs = cfg.sps.max_num_ref_frames.max(1) as usize;
         tracing::info!(
             "H.264 自研软解：{}×{}（编码 {}×{}）、重排深度 {}、{}",
             cfg.sps.width(),
@@ -144,6 +195,9 @@ impl H264Decoder {
             reorder,
             samples: 0,
             pictures: 0,
+            refs: Vec::new(),
+            max_refs,
+            poc: PocState::default(),
         })
     }
 
@@ -161,7 +215,6 @@ impl H264Decoder {
     /// 按显示顺序吐出已经能确定的图（POC 最小的先出）。
     ///
     /// 现在还没被调用：调用点在 [`Self::decode_picture`] 重建完之后（见抬头那张表）。
-    #[allow(dead_code, reason = "重建那一层接上之后由 decode_picture 调用")]
     fn take_ready(&mut self) -> Vec<VideoFrame> {
         let mut out = Vec::new();
         while self.ready.len() > self.reorder {
@@ -315,7 +368,7 @@ fn slice_trace() -> bool {
 impl H264Decoder {
     /// 解一张图（一个访问单元里的全部切片）。
     fn decode_picture(&mut self, slices: &[Slice], pts_us: i64) -> Result<Vec<VideoFrame>> {
-        let first = &slices[0].header;
+        let first = slices[0].header.clone();
         let sps = &slices[0].sps;
         // 一张图的所有切片必须同属一帧
         for s in slices {
@@ -330,24 +383,112 @@ impl H264Decoder {
             sps.coded_width() as usize / 16,
             sps.coded_height() as usize / 16,
         );
+        info.pic_index = self.pictures;
         for s in slices {
-            mb::decode_i_slice(&s.header, &s.sps, &s.pps, &s.raw, &mut info)?;
+            if s.header.is_i() {
+                mb::decode_i_slice(&s.header, &s.sps, &s.pps, &s.raw, &mut info)?;
+            } else if s.header.is_p() {
+                mb::decode_p_slice(&s.header, &s.sps, &s.pps, &s.raw, &mut info)?;
+            } else {
+                return Err(MediaError::Unsupported(format!(
+                    "B 切片还没接（slice_type = {}）。P 切片已经能解，见 h264/mod.rs 抬头那张表",
+                    s.header.slice_type
+                )));
+            }
         }
-        // 走到这里说明**语法层全通了**（`decode_i_slice` 末尾的
-        // `check_rbsp_trailing` 是这条绝对判据）。接着重建像素。
+
+        // 诊断：把每个 4×4 块的 MV 打出来（与参考解码器的运动矢量对拍）
+        if std::env::var("H264_DUMP_MV").is_ok_and(|v| v != "0") {
+            let pic = self.pictures;
+            for addr in 0..info.mb.len() {
+                let mb = &info.mb[addr];
+                if let Some(it) = &mb.inter {
+                    for y4 in 0..4 {
+                        for x4 in 0..4 {
+                            let e = it.mv[y4][x4];
+                            eprintln!(
+                                "MV {pic} {} {} {} {} {} {}",
+                                addr,
+                                x4,
+                                y4,
+                                e.mv.x,
+                                e.mv.y,
+                                e.ref_idx
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        let poc = self.compute_poc(&first, sps);
+        let ref_list: Vec<&FrameBuf> = self.refs.iter().map(|r| &r.frame).collect();
         let mut frame = FrameBuf::for_sps(sps);
-        reconstruct::reconstruct_picture(&mut frame, &mut info, sps, &slices[0].pps)?;
-        // ⚠️ 去块滤波（§8.7）还没做 —— 输出的是"去块之前"的构造样本。
-        // 与参考解码器对拍时要把编码器的去块关掉（`x264opts deblock=0:0`），
-        // 否则差的是"去块还没做"而不是预测/变换错。
-        // §8.7：去块滤波在**整张图重建完成之后**做（所以帧内预测读的是去块前样本）
-        deblock::deblock_picture(&mut frame, &mut info, &slices[0].pps, first)?;
-        Ok(vec![VideoFrame {
-            width: frame.disp_w as u32,
-            height: frame.disp_h as u32,
+        reconstruct::reconstruct_picture(&mut frame, &mut info, sps, &slices[0].pps, &ref_list, &first)?;
+        // §8.7：去块滤波在整张图重建完成之后做（所以帧内预测读的是去块前样本）
+        deblock::deblock_picture(&mut frame, &mut info, &slices[0].pps, &first)?;
+
+        // 参考帧管理：滑动窗口（没有 MMCO 的那一档，参数集层已经拒掉了 MMCO）
+        if first.is_reference() {
+            if first.idr {
+                self.refs.clear();
+            }
+            self.refs.insert(
+                0,
+                RefFrame {
+                    frame: frame.clone(),
+                    frame_num: first.frame_num,
+                    poc,
+                },
+            );
+            while self.refs.len() > self.max_refs {
+                self.refs.pop();
+            }
+        }
+
+        // 显示顺序：POC 小的先出。没有 B 帧时 reorder = 0，这里就是"解一张出一张"。
+        self.ready.push(ReadyPic {
+            frame,
+            poc,
             pts_us,
-            nv12: frame.to_nv12(),
-        }])
+        });
+        Ok(self.take_ready())
+    }
+
+    /// §8.2.1 的 POC 推导。
+    ///
+    /// 只实现到了 `pic_order_cnt_type` 0 与 2 —— 这是现实里几乎全部素材的形态
+    /// （x264 默认 type 0，关掉 B 帧后常见 type 2）。type 1 需要
+    /// `offset_for_ref_frame[]` 的累计，等真碰到再补。
+    fn compute_poc(&mut self, h: &SliceHeader, sps: &Sps) -> i32 {
+        if h.idr {
+            self.poc = PocState::default();
+            return 0;
+        }
+        match sps.pic_order_cnt_type {
+            0 => {
+                let max_lsb = 1i32 << sps.log2_max_pic_order_cnt_lsb;
+                let lsb = h.pic_order_cnt_lsb as i32;
+                let (prev_msb, prev_lsb) = (self.poc.prev_msb, self.poc.prev_lsb);
+                let mut msb = prev_msb;
+                if lsb < prev_lsb && prev_lsb - lsb >= max_lsb / 2 {
+                    msb = prev_msb + max_lsb;
+                } else if lsb > prev_lsb && lsb - prev_lsb > max_lsb / 2 {
+                    msb = prev_msb - max_lsb;
+                }
+                if h.is_reference() {
+                    self.poc.prev_msb = msb;
+                    self.poc.prev_lsb = lsb;
+                }
+                msb + lsb
+            }
+            // 帧编码：`PicOrderCnt = 2 * frame_num`（§8.2.1.2 的化简）
+            2 => 2 * h.frame_num as i32,
+            other => {
+                let _ = other;
+                2 * h.frame_num as i32
+            }
+        }
     }
 }
 

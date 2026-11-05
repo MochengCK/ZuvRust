@@ -29,6 +29,7 @@ use me_core::{MediaError, Result};
 
 use super::cavlc::Cavlc;
 use super::cavlc_tables::{CODED_BLOCK_PATTERN_INTRA, CODED_BLOCK_PATTERN_INTER};
+use super::inter::{self, Mv, MvInfo};
 use crate::h264::{Pps, SliceHeader, Sps};
 
 /// `mb_type == 0`（I 切片）：`I_NxN`（帧内 4×4 或 8×8）。
@@ -99,6 +100,22 @@ pub struct MbInfo {
     pub qp_y: i32,
     /// `I_PCM`：去块滤波时它的 `QPY` 要**当 0 用**（表 8-16 那一节的口径）
     pub is_pcm: bool,
+    /// 帧间预测信息；`None` = 帧内宏块
+    ///
+    /// 只存"这个宏块用了什么"，**不存分区形状** —— 重建那一层按 4×4 网格逐块
+    /// 做运动补偿（同一个分区里 4 个 4×4 的 MV 相同），去块滤波也按 4×4 取，
+    /// 少一层"分区索引 ↔ 像素坐标"的换算就少一类错位。
+    pub inter: Option<InterMb>,
+}
+
+/// 一个帧间宏块的运动信息。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct InterMb {
+    /// 16 个 4×4 亮度块的 MV / 参考索引，按 **`[y4][x4]`** 排
+    pub mv: [[MvInfo; 4]; 4],
+    /// 这个宏块有几个"分区"（`P_8x8` 的四个子宏块各算一个）——
+    /// 目前只有诊断与去块滤波的 `partition` 判断会用
+    pub parts: u8,
 }
 
 impl Default for MbInfo {
@@ -117,6 +134,7 @@ impl Default for MbInfo {
             transform_8x8: false,
             qp_y: 26,
             is_pcm: false,
+            inter: None,
         }
     }
 }
@@ -125,12 +143,8 @@ impl MbInfo {
     /// 这个宏块是不是帧内（去块滤波的 bS 推导要看）。
     ///
     /// 现在 I 切片里必然全是帧内；帧间那一层接上后要按 `intra_pred` 判。
-    #[allow(dead_code, reason = "去块滤波那一层才用得到")]
     pub fn is_intra(&self) -> bool {
-        matches!(
-            self.intra_pred,
-            IntraPred::NxN4x4 | IntraPred::NxN8x8 | IntraPred::I16x16 | IntraPred::Pcm
-        )
+        self.inter.is_none()
     }
 }
 
@@ -241,6 +255,12 @@ pub struct PictureInfo {
     pub mb: Vec<MbInfo>,
     pub coeffs: Vec<MbCoeffs>,
     pub tc: TcMap,
+    /// 每个 4×4 亮度块的帧间信息（L0）。`ref_idx < 0` = 不可用（帧内宏块、
+    /// 或还没解到的邻居）。运动矢量预测（§8.4.1.3）与去块滤波的 `bS` 都读它。
+    mv_l0: Vec<MvInfo>,
+    mv_cols4: usize,
+    /// 诊断用：这张图是解码器解的第几张（与参考解码器对齐时要用）
+    pub pic_index: u64,
 }
 
 impl PictureInfo {
@@ -251,7 +271,28 @@ impl PictureInfo {
             mb: vec![MbInfo::default(); mb_cols * mb_rows],
             coeffs: vec![MbCoeffs::default(); mb_cols * mb_rows],
             tc: TcMap::new(mb_cols, mb_rows),
+            mv_l0: vec![MvInfo::default(); mb_cols * 4 * mb_rows * 4],
+            mv_cols4: mb_cols * 4,
+            pic_index: 0,
         }
+    }
+
+    /// 取 4×4 网格上的 MV 信息；画面外返回 `None`（= 不可用）。
+    #[inline]
+    pub fn mv_get(&self, x4: i32, y4: i32) -> Option<MvInfo> {
+        if x4 < 0 || y4 < 0 || x4 as usize >= self.mv_cols4 || y4 as usize >= self.mv_l0.len() / self.mv_cols4 {
+            return None;
+        }
+        let m = self.mv_l0[y4 as usize * self.mv_cols4 + x4 as usize];
+        // `-1` = 真的没有（画面外/还没解到）；`-2` = 有宏块但它是帧内的（要走
+        // 不同的推导分支），所以不能一律按"没有"处理
+        (m.ref_idx != -1).then_some(m)
+    }
+
+    #[inline]
+    fn mv_set(&mut self, x4: usize, y4: usize, v: MvInfo) {
+        let cols = self.mv_cols4;
+        self.mv_l0[y4 * cols + x4] = v;
     }
 
     #[inline]
@@ -305,20 +346,343 @@ pub fn decode_i_slice(
             )));
         }
     }
-    c.check_rbsp_trailing()?;
+    c.check_rbsp_trailing()
+        .map_err(|e| MediaError::Bitstream(format!("I 切片（first_mb={}）：{e}", header.first_mb_in_slice)))?;
     Ok(())
 }
 
-/// §7.3.5 `macroblock_layer()`；返回这个宏块之后的 `QPY`。
+/// 解一条 **P 切片**的数据部分（CAVLC）。
+///
+/// 与 [`decode_i_slice`] 同一套骨架，差别只在"每个宏块之前先读 `mb_skip_run`"、
+/// 以及 `mb_type` 的表从 7-11 换成 7-13。
+pub fn decode_p_slice(
+    header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    raw: &[u8],
+    info: &mut PictureInfo,
+) -> Result<()> {
+    if !header.is_p() {
+        return Err(MediaError::Unsupported(format!(
+            "decode_p_slice 只接 P 切片（这条是 slice_type = {}）",
+            header.slice_type
+        )));
+    }
+    if pps.entropy_coding_mode_flag {
+        return Err(MediaError::Unsupported(
+            "这条流用的是 CABAC（entropy_coding_mode_flag = 1），自研软解还没接".into(),
+        ));
+    }
+    let mut c = Cavlc::new(raw, header.slice_data_bit_offset)?;
+    let total_mb = info.mb_cols * info.mb_rows;
+    let mut addr = header.first_mb_in_slice as usize;
+    if addr >= total_mb {
+        return Err(MediaError::Bitstream(format!(
+            "first_mb_in_slice = {} 超过了这张图的宏块数 {total_mb}",
+            header.first_mb_in_slice
+        )));
+    }
+    let mut qp_y = 26 + pps.pic_init_qp_minus26 + header.slice_qp_delta;
+    if trace_mb() {
+        eprintln!("P 切片起点 first_mb={} 共 {total_mb} 个宏块", header.first_mb_in_slice);
+    }
+    loop {
+        // 图里的宏块解完了就收工：不能回头再读一个 `mb_skip_run` ——
+        // `rbsp_trailing_bits` 里那几位会被当成语法读进来，症状是
+        // "多读了 1 位"（踩过：末宏块之后多解一个 skip_run）
+        if addr >= total_mb {
+            break;
+        }
+        // §7.3.4：P/B 切片里**每个宏块之前**都有一个 `mb_skip_run`
+        let skip_run = c.ue()? as usize;
+        if trace_mb() {
+            eprintln!("  mb_skip_run={skip_run} @addr={addr} 位={}", c.position_bits());
+        }
+        for _ in 0..skip_run {
+            if addr >= total_mb {
+                return Err(MediaError::Bitstream(format!(
+                    "mb_skip_run 越过了图末尾（addr = {addr}，图里只有 {total_mb} 个宏块）"
+                )));
+            }
+            skip_macroblock(info, addr);
+            addr += 1;
+        }
+        if !c.more_rbsp_data() {
+            break;
+        }
+        if addr >= total_mb {
+            return Err(MediaError::Bitstream(format!(
+                "宏块还没解完就到了图末尾（已解 {addr} 个，图里只有 {total_mb} 个）—— 多半是语法错位"
+            )));
+        }
+        qp_y = macroblock_layer_p(&mut c, header, sps, pps, info, addr, qp_y)?;
+        addr += 1;
+    }
+    if trace_mb() {
+        eprintln!(
+            "P 切片解完：first_mb={} 到 addr={addr}（图共 {total_mb} 个宏块），位位置 {}",
+            header.first_mb_in_slice,
+            c.position_bits()
+        );
+    }
+    c.check_rbsp_trailing()
+        .map_err(|e| MediaError::Bitstream(format!("P 切片（first_mb={}）：{e}", header.first_mb_in_slice)))?;
+    Ok(())
+}
+
+/// 一个**被跳过**的宏块（`mb_skip_run` 里的那些）。
+///
+/// 跳过的宏块等价于 `P_L0_16x16` + `ref_idx = 0` + **残差全零**，
+/// 运动矢量取预测值（§8.4.1.1）。
+fn skip_macroblock(info: &mut PictureInfo, addr: usize) {
+    let (mbx, mby) = (addr % info.mb_cols, addr / info.mb_cols);
+    let mvp = pskip_mv(info, mbx * 4, mby * 4);
+    if trace_mb() {
+        eprintln!(
+            "MB[pic={}] {addr}: 跳过 mv={:?} 左={:?} 上={:?}",
+            info.pic_index,
+            mvp,
+            info.mv_get(mbx as i32 * 4 - 1, mby as i32 * 4).map(|m| (m.mv, m.ref_idx)),
+            info.mv_get(mbx as i32 * 4, mby as i32 * 4 - 1).map(|m| (m.mv, m.ref_idx))
+        );
+    }
+    let mut inter = InterMb {
+        parts: 1,
+        ..InterMb::default()
+    };
+    let slot = MvInfo {
+        mv: mvp,
+        ref_idx: 0,
+    };
+    for row in inter.mv.iter_mut() {
+        *row = [slot; 4];
+    }
+    for dy in 0..4 {
+        for dx in 0..4 {
+            info.mv_set(mbx * 4 + dx, mby * 4 + dy, slot);
+        }
+    }
+    let mut mb = MbInfo {
+        mb_type: 0,
+        inter: Some(inter),
+        ..MbInfo::default()
+    };
+    mb.cbp_luma = 0;
+    mb.cbp_chroma = 0;
+    let (slot_mb, _) = info.mb_at(addr);
+    *slot_mb = mb;
+}
+
+/// **跳过宏块**的运动矢量（§8.4.1.1，与普通分区不是同一条规则）。
+///
+/// 三条硬规则，缺一条就会"整帧缓慢漂"：
+///
+/// 1. **左或上邻居不可用**（在画面外 / 还没解到）→ 整个宏块 MV = 0；
+/// 2. 左或上邻居**存在但是帧内** → 它的 MV 按 0 参与，但**不**触发归零；
+/// 3. 左或上邻居 ref=0 且 MV=(0,0) → 直接归零（否则跳过的平坦区会被
+///    邻居的 MV 一路带走，画面越拖越偏）。
+fn pskip_mv(info: &PictureInfo, x4: usize, y4: usize) -> Mv {
+    let (xi, yi) = (x4 as i32, y4 as i32);
+    let left = info.mv_get(xi - 1, yi);
+    let top = info.mv_get(xi, yi - 1);
+    let c = info
+        .mv_get(xi + 4, yi - 1)
+        .or_else(|| info.mv_get(xi - 1, yi - 1));
+    if left.is_none() || top.is_none() {
+        return Mv::ZERO;
+    }
+    let is_zero_ref = |m: &Option<MvInfo>| {
+        m.is_some_and(|v| v.ref_idx == 0 && v.mv == Mv::ZERO)
+    };
+    if is_zero_ref(&left) || is_zero_ref(&top) {
+        return Mv::ZERO;
+    }
+    inter::predict_mv(0, left, top, c)
+}
+
+/// §8.4.1.3 的邻居选择：A（左）、B（上）、C（右上，不可用则退到左上 D）。
+fn predict_partition_mv(info: &PictureInfo, x4: usize, y4: usize, w4: usize, ref_idx: i8) -> Mv {
+    let (x4, y4) = (x4 as i32, y4 as i32);
+    let a = info.mv_get(x4 - 1, y4);
+    let b = info.mv_get(x4, y4 - 1);
+    let c = info
+        .mv_get(x4 + w4 as i32, y4 - 1)
+        .or_else(|| info.mv_get(x4 - 1, y4 - 1));
+    inter::predict_mv(ref_idx, a, b, c)
+}
+
+/// P 切片的宏块层（表 7-13）；返回这个宏块之后的 `QPY`。
+fn macroblock_layer_p(
+    c: &mut Cavlc<'_>,
+    header: &SliceHeader,
+    sps: &Sps,
+    pps: &Pps,
+    info: &mut PictureInfo,
+    addr: usize,
+    qp_y: i32,
+) -> Result<i32> {
+    let mb_type = c.ue()?;
+    // 表 7-13：0..4 是帧间，>= 5 是帧内（编号减 5 后就是表 7-11）
+    if mb_type >= 5 {
+        return macroblock_intra(c, sps, pps, info, addr, qp_y, mb_type - 5);
+    }
+    let (mbx, mby) = (addr % info.mb_cols, addr / info.mb_cols);
+
+    // ── 分区表 ────────────────────────────────────────────────────────────
+    // `(x, y, w, h)`（宏块内像素）。`P_8x8` 要先读四个 `sub_mb_type` 再展开。
+    let mut parts: Vec<(usize, usize, usize, usize)> = Vec::new();
+    match mb_type {
+        0 => parts.push((0, 0, 16, 16)),
+        1 => {
+            parts.push((0, 0, 16, 8));
+            parts.push((0, 8, 16, 8));
+        }
+        2 => {
+            parts.push((0, 0, 8, 16));
+            parts.push((8, 0, 8, 16));
+        }
+        _ => {
+            // 3 = P_8x8、4 = P_8x8ref0（后者 ref_idx 恒为 0，不读）
+            for q in 0..4usize {
+                let st = c.ue()?;
+                let (qx, qy) = ((q % 2) * 8, (q / 2) * 8);
+                match st {
+                    0 => parts.push((qx, qy, 8, 8)),
+                    // 表 7-14：sub_mb_type 1 = 两个 8×4 上下叠（**不是** 8 宽 16 高）
+                    1 => {
+                        parts.push((qx, qy, 8, 4));
+                        parts.push((qx, qy + 4, 8, 4));
+                    }
+                    // 2 = 两个 4×8 左右并排
+                    2 => {
+                        parts.push((qx, qy, 4, 8));
+                        parts.push((qx + 4, qy, 4, 8));
+                    }
+                    3 => {
+                        for k in 0..4 {
+                            parts.push((qx + (k % 2) * 4, qy + (k / 2) * 4, 4, 4));
+                        }
+                    }
+                    other => {
+                        return Err(MediaError::Unsupported(format!(
+                            "P 切片的 sub_mb_type = {other}（4..12 是子宏块帧内预测，还没接）"
+                        )))
+                    }
+                }
+            }
+        }
+    }
+
+    // ── ref_idx 与 mvd ────────────────────────────────────────────────────
+    let nref = header.num_ref_idx_l0_active;
+    let mut inter = InterMb {
+        parts: parts.len() as u8,
+        ..InterMb::default()
+    };
+    for &(px, py, pw, ph) in &parts {
+        let ref_idx: i8 = if mb_type != 4 && nref > 1 {
+            c.ue()? as i8
+        } else {
+            0
+        };
+        if ref_idx as u32 >= nref {
+            return Err(MediaError::Bitstream(format!(
+                "ref_idx_l0 = {ref_idx} 越界（只有 {nref} 个参考帧）"
+            )));
+        }
+        let mvd = Mv::new(c.se()?, c.se()?);
+        let (x4, y4) = (mbx * 4 + px / 4, mby * 4 + py / 4);
+        let mvp = predict_partition_mv(info, x4, y4, pw / 4, ref_idx);
+        let mv = Mv::new(mvp.x + mvd.x, mvp.y + mvd.y);
+        if trace_mvp() {
+            let a = info.mv_get(x4 as i32 - 1, y4 as i32).map(|m| m.mv);
+            let bb = info.mv_get(x4 as i32, y4 as i32 - 1).map(|m| m.mv);
+            let cc = info
+                .mv_get(x4 as i32 + (pw / 4) as i32, y4 as i32 - 1)
+                .or_else(|| info.mv_get(x4 as i32 - 1, y4 as i32 - 1))
+                .map(|m| m.mv);
+            eprintln!(
+                "  MVP[pic={}] MB{addr} part=({px},{py},{pw},{ph}) x4={x4} y4={y4} A={a:?} B={bb:?} C={cc:?} mvp={mvp:?} mvd={mvd:?} → {mv:?}",
+                info.pic_index
+            );
+        }
+        let slot = MvInfo { mv, ref_idx };
+        for dy in 0..ph / 4 {
+            for dx in 0..pw / 4 {
+                info.mv_set(x4 + dx, y4 + dy, slot);
+                inter.mv[py / 4 + dy][px / 4 + dx] = slot;
+            }
+        }
+    }
+
+    // ── 残差 ──────────────────────────────────────────────────────────────
+    let mut mb = MbInfo {
+        mb_type,
+        inter: Some(inter),
+        qp_y,
+        ..MbInfo::default()
+    };
+    let code_num = c.ue()? as usize;
+    if code_num >= 48 {
+        return Err(MediaError::Bitstream(format!(
+            "coded_block_pattern 的 codeNum = {code_num} 越界（0..47）"
+        )));
+    }
+    let cbp = CODED_BLOCK_PATTERN_INTER[code_num];
+    mb.cbp_luma = (cbp % 16) as u32;
+    mb.cbp_chroma = (cbp / 16) as u32;
+
+    let mut qp_y = qp_y;
+    if mb.cbp_luma > 0 || mb.cbp_chroma > 0 {
+        qp_y += c.se()?;
+        if !(0..=51).contains(&qp_y) {
+            return Err(MediaError::Bitstream(format!(
+                "这个宏块的 QPY = {qp_y} 越界（0..51）—— 多半是语法错位"
+            )));
+        }
+        mb.qp_y = qp_y;
+        residual(c, sps, pps, info, addr, &mb)?;
+    }
+    if trace_mb() {
+        eprintln!(
+            "MB {addr}: type={mb_type} 帧间 分区={} cbp=({:x},{}) qp={qp_y} mv={:?}",
+            mb.inter.as_ref().map(|i| i.parts).unwrap_or(0),
+            mb.cbp_luma,
+            mb.cbp_chroma,
+            mb.inter.as_ref().map(|i| i.mv[0][0].mv),
+        );
+    }
+    let (slot_mb, _) = info.mb_at(addr);
+    *slot_mb = mb;
+    Ok(qp_y)
+}
+
+/// §7.3.5 `macroblock_layer()`（**I 切片**）；返回这个宏块之后的 `QPY`。
 fn macroblock_layer(
     c: &mut Cavlc<'_>,
     sps: &Sps,
     pps: &Pps,
     info: &mut PictureInfo,
     addr: usize,
-    mut qp_y: i32,
+    qp_y: i32,
 ) -> Result<i32> {
     let mb_type = c.ue()?;
+    macroblock_intra(c, sps, pps, info, addr, qp_y, mb_type)
+}
+
+/// 宏块层里**帧内**那一段（I 切片的全部、P/B 切片里 `mb_type >= 5` 的那些）。
+///
+/// `mb_type` 用的是**表 7-11 的 I 切片编号**（0..25）。P/B 切片里的帧内宏块
+/// 在码流里是 `mb_type - 5`，调用方先减掉再进来 —— 语法体完全一样。
+fn macroblock_intra(
+    c: &mut Cavlc<'_>,
+    sps: &Sps,
+    pps: &Pps,
+    info: &mut PictureInfo,
+    addr: usize,
+    mut qp_y: i32,
+    mb_type: u32,
+) -> Result<i32> {
     let (mbx, mby) = (addr % info.mb_cols, addr / info.mb_cols);
     let (x4_0, y4_0) = (mbx * 4, mby * 4);
 
@@ -474,6 +838,16 @@ fn macroblock_layer(
             nz(&c.luma_dc),
         );
     }
+    // 帧内宏块也要"占住" MV 网格：邻居读到这里要能区分"帧内"与"不可用" ——
+    // 跳过宏块的推导里两者待遇完全不同（帧内按 0 参与，不可用直接整体归零）。
+    for dy in 0..4 {
+        for dx in 0..4 {
+            info.mv_set(x4_0 + dx, y4_0 + dy, MvInfo {
+                mv: Mv::ZERO,
+                ref_idx: -2,
+            });
+        }
+    }
     let (mb_slot, _) = info.mb_at(addr);
     *mb_slot = mb;
     Ok(qp_y)
@@ -505,7 +879,7 @@ fn residual(
     //    读完再按 `level8x8[i8x8][4*i + i4x4] = level4x4[...][i]` 反交错进 8×8 数组。
     //    只有 CABAC 才走 `maxNumCoeff = 64` 那一支 —— 那一支连 `total_zeros`
     //    的表都只到 `tzVlcIndex = 15`，所以按 64 去读必然撞墙。
-    let is_i16 = mb.intra_pred == IntraPred::I16x16;
+    let is_i16 = mb.inter.is_none() && mb.intra_pred == IntraPred::I16x16;
     if is_i16 {
         // `Intra16x16DCLevel`：nC 按 `luma4x4BlkIdx = 0` 的邻居算（NOTE 2）
         let n_c = info.tc.luma_nc(x4_0, y4_0);
@@ -632,6 +1006,12 @@ fn residual(
 }
 
 /// `H264_TRACE_MB=1` 时逐宏块打摘要（热路径上每次都读环境变量太贵，缓存一次）。
+fn trace_mvp() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("H264_TRACE_MVP").is_ok_and(|v| v != "0"))
+}
+
 fn trace_mb() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
@@ -748,7 +1128,16 @@ mod tests {
                 PictureInfo::new(sps.coded_width() as usize / 16, sps.coded_height() as usize / 16);
             decode_i_slice(&header, &sps, &pps, &raw, &mut info)?;
             let mut frame = crate::video::h264::frame::FrameBuf::for_sps(&sps);
-            crate::video::h264::reconstruct::reconstruct_picture(&mut frame, &mut info, &sps, &pps)?;
+            // I 切片没有参考帧，传空列表即可
+            let no_refs: [&crate::video::h264::frame::FrameBuf; 0] = [];
+            crate::video::h264::reconstruct::reconstruct_picture(
+                &mut frame,
+                &mut info,
+                &sps,
+                &pps,
+                &no_refs,
+                &header,
+            )?;
             // §8.7：去块在整图重建之后做，参考帧也是**含去块**的
             crate::video::h264::deblock::deblock_picture(&mut frame, &mut info, &pps, &header)?;
             return Ok(frame.to_nv12());

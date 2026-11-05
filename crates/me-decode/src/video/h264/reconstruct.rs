@@ -29,11 +29,12 @@
 
 use me_core::{MediaError, Result};
 
-use super::frame::FrameBuf;
+use super::frame::{FrameBuf, Plane};
+use super::inter;
 use super::intra::{self, Refs4, Refs8};
 use super::mb::{IntraPred, MbCoeffs, MbInfo, PictureInfo};
 use super::transform::{self, WeightScale};
-use crate::h264::{Pps, Sps};
+use crate::h264::{Pps, SliceHeader, Sps};
 
 /// `luma4x4BlkIdx` → 宏块内的像素偏移（图 6-10 的象限序）。
 #[inline]
@@ -80,10 +81,14 @@ pub fn reconstruct_picture(
     info: &mut PictureInfo,
     sps: &Sps,
     pps: &Pps,
+    refs: &[&FrameBuf],
+    sh: &SliceHeader,
 ) -> Result<()> {
     let mut r = Recon {
         frame,
         info,
+        refs,
+        sh,
         ws: WeightScale::new(sps, pps),
         constrained: pps.constrained_intra_pred_flag,
         chroma_off: [pps.chroma_qp_index_offset, pps.second_chroma_qp_index_offset],
@@ -102,6 +107,10 @@ pub fn reconstruct_picture(
 struct Recon<'a> {
     frame: &'a mut FrameBuf,
     info: &'a mut PictureInfo,
+    /// L0 参考帧（按参考帧列表顺序）。帧间宏块按 `ref_idx` 取。
+    refs: &'a [&'a FrameBuf],
+    /// 当前切片头：加权预测参数（`pred_weight_table`）在里面
+    sh: &'a SliceHeader,
     ws: WeightScale,
     constrained: bool,
     /// `chroma_qp_index_offset` / `second_chroma_qp_index_offset`（PPS 给的色度 QP 偏移）
@@ -198,6 +207,10 @@ impl Recon<'_> {
             return Ok(());
         }
 
+        if mb.inter.is_some() {
+            return self.mb_inter(addr, &mb, pps);
+        }
+
         match mb.intra_pred {
             IntraPred::I16x16 => self.mb_intra16x16(addr, &mb, x0, y0)?,
             IntraPred::NxN4x4 => self.mb_intra4x4(addr, &mb, x0, y0)?,
@@ -284,6 +297,165 @@ impl Recon<'_> {
                 for j in 0..4usize {
                     let v = pred[i * 4 + j] + res[i * 4 + j];
                     self.frame.y.set(x0 + bx + j, y0 + by + i, clip8(v));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    // ── 帧间（P/B 切片） ───────────────────────────────────────────────────
+
+    /// 帧间宏块：逐 4×4 做运动补偿，加残差，再补色度。
+    ///
+    /// 按 4×4 逐块做而不是按分区做：同一个分区里 4×4 的 MV 相同，逐块做只是
+    /// 多做几次同样的插值；换来的是**不需要**在重建这一层再维护一套"分区 →
+    /// 像素"的映射（那套映射错一格，症状和"插值抽头错了"一模一样，很难分）。
+    fn mb_inter(&mut self, addr: usize, mb: &MbInfo, _pps: &Pps) -> Result<()> {
+        let coeffs = self.info.coeffs[addr].clone();
+        let qp = mb.qp_y;
+        let ws = self.ws.clone();
+        let refs = self.refs;
+        let inter = mb.inter.as_ref().expect("调用点已经判过 is_some");
+        let (mbx, mby) = (addr % self.info.mb_cols, addr / self.info.mb_cols);
+        let (x0, y0) = (mbx * 16, mby * 16);
+
+        if mb.transform_8x8 {
+            for blk8 in 0..4usize {
+                let (bx, by) = blk8_xy(blk8);
+                let e = inter.mv[by / 4][bx / 4];
+                let refp = luma_ref(refs, e.ref_idx)?;
+                let mut pred = [0u8; 64];
+                inter::predict_luma_w(
+                    refp,
+                    (x0 + bx) as i32,
+                    (y0 + by) as i32,
+                    e.mv,
+                    8,
+                    8,
+                    &mut pred,
+                    luma_weight(self.sh, e.ref_idx),
+                );
+                let c = transform::scan_8x8(&coeffs.luma8[blk8]);
+                let d = transform::dequant_8x8(&c, qp, &ws, 1);
+                let res = transform::inverse_8x8(&d);
+                for i in 0..8usize {
+                    for j in 0..8usize {
+                        let v = clip8(pred[i * 8 + j] as i32 + res[i * 8 + j]);
+                        self.frame.y.set(x0 + bx + j, y0 + by + i, v);
+                    }
+                }
+            }
+        } else {
+            for blk in 0..16usize {
+                let (bx, by) = blk4_xy(blk);
+                let e = inter.mv[by / 4][bx / 4];
+                let refp = luma_ref(refs, e.ref_idx)?;
+                let mut pred = [0u8; 16];
+                inter::predict_luma_w(
+                    refp,
+                    (x0 + bx) as i32,
+                    (y0 + by) as i32,
+                    e.mv,
+                    4,
+                    4,
+                    &mut pred,
+                    luma_weight(self.sh, e.ref_idx),
+                );
+                let c = transform::scan_4x4(&coeffs.luma4[blk], false);
+                let d = transform::dequant_4x4(&c, qp, &ws, 1, false);
+                let res = transform::inverse_4x4(&d);
+                for i in 0..4usize {
+                    for j in 0..4usize {
+                        let v = clip8(pred[i * 4 + j] as i32 + res[i * 4 + j]);
+                        self.frame.y.set(x0 + bx + j, y0 + by + i, v);
+                    }
+                }
+            }
+        }
+        self.inter_chroma(addr, mb, &coeffs, &ws)?;
+        Ok(())
+    }
+
+    /// 帧间的色度重建：预测按 **2×2** 一块（对应一个亮度 4×4 块）做，
+    /// 残差仍按 4×4 色度块加。
+    fn inter_chroma(
+        &mut self,
+        addr: usize,
+        mb: &MbInfo,
+        coeffs: &MbCoeffs,
+        ws: &transform::WeightScale,
+    ) -> Result<()> {
+        let (mbx, mby) = (addr % self.info.mb_cols, addr / self.info.mb_cols);
+        let (cx, cy) = ((mbx * 8) as i32, (mby * 8) as i32);
+        let qp_y = mb.qp_y;
+        let qp_cb = transform::chroma_qp(qp_y + self.chroma_off[0]);
+        let qp_cr = transform::chroma_qp(qp_y + self.chroma_off[1]);
+        let refs = self.refs;
+        let inter = mb.inter.as_ref().expect("帧间宏块");
+
+        for (is_cb, qp) in [(true, qp_cb), (false, qp_cr)] {
+            // ── 预测 ──
+            let mut pred = [0u8; 64];
+            for cblk in 0..4usize {
+                let (bx, by) = ((cblk % 2) * 4, (cblk / 2) * 4);
+                for qy in 0..2usize {
+                    for qx in 0..2usize {
+                        // 一个色度 4×4 块 = 亮度 8×8 = 2×2 个亮度 4×4 块
+                        let lx = (cblk % 2) * 2 + qx;
+                        let ly = (cblk / 2) * 2 + qy;
+                        let e = inter.mv[ly][lx];
+                        let plane = chroma_ref(refs, e.ref_idx, is_cb)?;
+                        let mut tmp = [0u8; 4];
+                        inter::predict_chroma_w(
+                            plane,
+                            cx + (bx + qx * 2) as i32,
+                            cy + (by + qy * 2) as i32,
+                            e.mv,
+                            2,
+                            2,
+                            &mut tmp,
+                            chroma_weight(self.sh, e.ref_idx, is_cb),
+                        );
+                        for y in 0..2usize {
+                            for x in 0..2usize {
+                                pred[(by + qy * 2 + y) * 8 + bx + qx * 2 + x] = tmp[y * 2 + x];
+                            }
+                        }
+                    }
+                }
+            }
+            // ── 残差 ──
+            let (dc_vals, ac) = if is_cb {
+                (coeffs.cb_dc, coeffs.cb4)
+            } else {
+                (coeffs.cr_dc, coeffs.cr4)
+            };
+            let dcc = transform::chroma_dc_2x2(&dc_vals, qp);
+            let mut res = [0i32; 64];
+            for blk in 0..4usize {
+                let a: [i32; 15] = ac[blk][..15].try_into().unwrap();
+                let mut c = transform::scan_4x4(&a, true);
+                c[0] = dcc[blk];
+                let d = transform::dequant_4x4(&c, qp, ws, if is_cb { 1 } else { 2 }, true);
+                let r = transform::inverse_4x4(&d);
+                let bx = (blk % 2) * 4;
+                let by = (blk / 2) * 4;
+                for i in 0..4usize {
+                    for j in 0..4usize {
+                        res[(by + i) * 8 + bx + j] = r[i * 4 + j];
+                    }
+                }
+            }
+            for y in 0..8usize {
+                for x in 0..8usize {
+                    let v = clip8(pred[y * 8 + x] as i32 + res[y * 8 + x]);
+                    let xs = (cx + x as i32) as usize;
+                    let ys = (cy + y as i32) as usize;
+                    if is_cb {
+                        self.frame.u.set(xs, ys, v);
+                    } else {
+                        self.frame.v.set(xs, ys, v);
+                    }
                 }
             }
         }
@@ -626,7 +798,7 @@ impl Recon<'_> {
         }
         for y in 0..8usize {
             for x in 0..8usize {
-                let v = clip8(pred[y * 8 + x] + res[y * 8 + x]);
+                let v = clip8(pred[y * 8 + x] as i32 + res[y * 8 + x]);
                 let xs = (cx + x as i32) as usize;
                 let ys = (cy + y as i32) as usize;
                 if is_cb {
@@ -639,6 +811,64 @@ impl Recon<'_> {
         let _ = addr;
         Ok(())
     }
+}
+
+/// 某个参考帧的亮度权重（没开加权预测时是恒等）。
+fn luma_weight(sh: &SliceHeader, idx: i8) -> inter::Weight {
+    let Some(pw) = &sh.pred_weight else {
+        return inter::Weight::identity();
+    };
+    let log = pw.luma_log2_weight_denom;
+    let (w, o) = pw
+        .l0
+        .get(idx.max(0) as usize)
+        .and_then(|e| e.luma)
+        .unwrap_or((1 << log, 0));
+    inter::Weight { w, o, log_wd: log }
+}
+
+/// 某个参考帧的色度权重（Cb / Cr 各一组）。
+fn chroma_weight(sh: &SliceHeader, idx: i8, is_cb: bool) -> inter::Weight {
+    let Some(pw) = &sh.pred_weight else {
+        return inter::Weight::identity();
+    };
+    let log = pw.chroma_log2_weight_denom;
+    let (w, o) = pw
+        .l0
+        .get(idx.max(0) as usize)
+        .and_then(|e| e.chroma)
+        .map(|c| c[if is_cb { 0 } else { 1 }])
+        .unwrap_or((1 << log, 0));
+    inter::Weight { w, o, log_wd: log }
+}
+
+/// 按 `ref_idx` 取参考帧的亮度面。
+fn luma_ref<'a>(refs: &[&'a FrameBuf], idx: i8) -> Result<&'a Plane> {
+    if idx < 0 {
+        return Err(MediaError::Bitstream(
+            "帧间宏块的 ref_idx < 0（帧内信息被当成帧间用了）".into(),
+        ));
+    }
+    refs.get(idx as usize).map(|f| &f.y).ok_or_else(|| {
+        MediaError::Bitstream(format!(
+            "ref_idx = {idx} 超出参考帧列表（只有 {} 个）",
+            refs.len()
+        ))
+    })
+}
+
+/// 按 `ref_idx` 取参考帧的色度面（`is_cb` 选 Cb/Cr）。
+fn chroma_ref<'a>(refs: &[&'a FrameBuf], idx: i8, is_cb: bool) -> Result<&'a Plane> {
+    if idx < 0 {
+        return Err(MediaError::Bitstream("帧间宏块的 ref_idx < 0".into()));
+    }
+    let f = refs.get(idx as usize).ok_or_else(|| {
+        MediaError::Bitstream(format!(
+            "ref_idx = {idx} 超出参考帧列表（只有 {} 个）",
+            refs.len()
+        ))
+    })?;
+    Ok(if is_cb { &f.u } else { &f.v })
 }
 
 #[inline]

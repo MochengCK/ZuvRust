@@ -79,6 +79,10 @@ pub fn deblock_picture(
     if sh.disable_deblocking_filter_idc == 1 {
         return Ok(());
     }
+    // 诊断开关：分两层验证"帧间预测"与"去块"（对应参考解码器的 -skip_loop_filter all）
+    if std::env::var("H264_NO_DEBLOCK").is_ok_and(|v| v != "0") {
+        return Ok(());
+    }
     // §8.7.2：filterOffsetA / filterOffsetB 是**偏移量 ×2**
     let off_a = sh.slice_alpha_c0_offset_div2 * 2;
     let off_b = sh.slice_beta_offset_div2 * 2;
