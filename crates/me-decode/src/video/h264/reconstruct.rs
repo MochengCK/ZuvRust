@@ -710,23 +710,48 @@ impl Recon<'_> {
         // ⚠️ **两个分量要各自取自己的参考样本**。之前这里只读 U 平面，
         // 于是 Cr 的预测是按 Cb 的邻居算的 —— 而所有"R=G=B"的测试内容
         // 恰好 Cb ≡ Cr，把这个错误完全遮住了（色度"全对"其实是对了一半）。
-        let mut refs = [([0i32; 8], [0i32; 8]); 2];
-        let mut top_avail = [false; 8];
-        let mut left_avail = [false; 8];
+        //
+        // 数组布局见 [`intra::CHROMA_EXT`]：`0..4` 是块左侧/上方的扩展样本
+        // （平面模式要用），`4..12` 才是 p[0..8]。
+        const O: usize = intra::CHROMA_EXT;
+        let mut refs = [([0i32; intra::CHROMA_REF_LEN], [0i32; intra::CHROMA_REF_LEN]); 2];
+        let mut top_avail = [false; intra::CHROMA_REF_LEN];
+        let mut left_avail = [false; intra::CHROMA_REF_LEN];
         for i in 0..8i32 {
-            top_avail[i as usize] = self.avail_chroma(cx + i, cy - 1, addr);
-            left_avail[i as usize] = self.avail_chroma(cx - 1, cy + i, addr);
-            if top_avail[i as usize] {
-                refs[0].0[i as usize] =
-                    self.frame.u.get((cx + i) as usize, (cy - 1) as usize) as i32;
-                refs[1].0[i as usize] =
-                    self.frame.v.get((cx + i) as usize, (cy - 1) as usize) as i32;
+            let k = O + i as usize;
+            top_avail[k] = self.avail_chroma(cx + i, cy - 1, addr);
+            left_avail[k] = self.avail_chroma(cx - 1, cy + i, addr);
+            if top_avail[k] {
+                refs[0].0[k] = self.frame.u.get((cx + i) as usize, (cy - 1) as usize) as i32;
+                refs[1].0[k] = self.frame.v.get((cx + i) as usize, (cy - 1) as usize) as i32;
             }
-            if left_avail[i as usize] {
-                refs[0].1[i as usize] =
-                    self.frame.u.get((cx - 1) as usize, (cy + i) as usize) as i32;
-                refs[1].1[i as usize] =
-                    self.frame.v.get((cx - 1) as usize, (cy + i) as usize) as i32;
+            if left_avail[k] {
+                refs[0].1[k] = self.frame.u.get((cx - 1) as usize, (cy + i) as usize) as i32;
+                refs[1].1[k] = self.frame.v.get((cx - 1) as usize, (cy + i) as usize) as i32;
+            }
+        }
+        // 扩展样本：不可用时按规范用 p[0,-1] / p[-1,0] 顶替（画面外只剩这一种情况）
+        for k in 0..O {
+            let idx = O - 1 - k;
+            let x = cx - 1 - k as i32;
+            let y = cy - 1 - k as i32;
+            if self.avail_chroma(x, cy - 1, addr) {
+                refs[0].0[idx] = self.frame.u.get(x as usize, (cy - 1) as usize) as i32;
+                refs[1].0[idx] = self.frame.v.get(x as usize, (cy - 1) as usize) as i32;
+                top_avail[idx] = true;
+            } else {
+                refs[0].0[idx] = refs[0].0[O];
+                refs[1].0[idx] = refs[1].0[O];
+                top_avail[idx] = top_avail[O];
+            }
+            if self.avail_chroma(cx - 1, y, addr) {
+                refs[0].1[idx] = self.frame.u.get((cx - 1) as usize, y as usize) as i32;
+                refs[1].1[idx] = self.frame.v.get((cx - 1) as usize, y as usize) as i32;
+                left_avail[idx] = true;
+            } else {
+                refs[0].1[idx] = refs[0].1[O];
+                refs[1].1[idx] = refs[1].1[O];
+                left_avail[idx] = left_avail[O];
             }
         }
         let mode = mb.intra_chroma_pred_mode;
@@ -765,10 +790,10 @@ impl Recon<'_> {
         is_cb: bool,
         addr: usize,
         mode: u8,
-        top: &[i32; 8],
-        left: &[i32; 8],
-        top_avail: [bool; 8],
-        left_avail: [bool; 8],
+        top: &[i32; intra::CHROMA_REF_LEN],
+        left: &[i32; intra::CHROMA_REF_LEN],
+        top_avail: [bool; intra::CHROMA_REF_LEN],
+        left_avail: [bool; intra::CHROMA_REF_LEN],
         coeffs: &MbCoeffs,
         qp: i32,
         cx: i32,

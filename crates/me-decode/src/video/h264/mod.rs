@@ -24,7 +24,7 @@
 //! | 参数集 / 切片头 | §7.3.2 / §7.3.3 全字段 + §8.2.1 POC + §8.2.4/8.2.5 参考帧列表 | [`crate::h264`] ✅（硬解共用的那份）|
 //! | 像素容器 | 三平面（紧 stride）+ 裁剪 + 紧凑 NV12 输出 | [`frame`] ✅ |
 //! | 熵层·CAVLC | §9.2 `coeff_token` / `level` / `run_before` / `total_zeros` | [`cavlc`] ✅（表由 [`cavlc_tables`] 自动抄自规范，脚本带前缀码/Kraft/条数三重自检）|
-//! | 熵层·CABAC | §9.3 算术解码器 + §9.3.1 上下文初始化 | 待做 |
+//! | 熵层·CABAC | §9.3 算术解码器 + §9.3.1 上下文初始化 + 残差/宏块层 | [`cabac`] / [`cabac_mb`] ⚠️ 见下 |
 //! | 宏块层（**I 切片**）| §7.3.4 `mb_type` / `mb_pred` / `coded_block_pattern` / `mb_qp_delta` / `residual()` + `nC` 推导（§9.2.1 第 4~7 步）+ `I_PCM` | [`mb`] ✅ **真实 IDR 切片上「恰好停在 `rbsp_trailing_bits`」已过**（两枚夹具见 [`mb`] 的单测）|
 //! | 宏块层（**P 切片**，CAVLC）| `mb_skip_run` / `mb_type` 表 7-13 / `sub_mb_type` 表 7-14 / `ref_idx` / `mvd` | [`mb::decode_p_slice`] ✅ |
 //! | 宏块层（B 切片）| `mb_type` 表 7-14、双向预测 | 待做 |
@@ -68,6 +68,39 @@
 //!    拿"没去块"的参照只能在**解码侧** `-skip_loop_filter all`（`make_cases.py` 会把
 //!    那份落到 `<name>.refnoflt/`）。开发去块那一层时靠它把"预测+变换"和"去块"分开验。
 //!
+//! ## CABAC（2026-11-06）：算术层与 I16 已经对上，4×4 残差还有偏差
+//!
+//! | 层 | 状态 |
+//! |---|---|
+//! | §9.3.1 算术解码器（`decode_decision` / `bypass` / `terminate`）| ✅ 与 FFmpeg 的 C 实现**逐 bin 一致**（用它当参照跑同一段码流对拍）|
+//! | §9.3.1.1 上下文初始化 | ✅ 表按规范生成；公式是 `((m * SliceQPY) >> 4) + n` |
+//! | 宏块层（I 切片：mb_type / 帧内模式 / cbp / qp_delta）| ✅ 与 CAVLC 解码同一内容的语法逐项一致 |
+//! | **I16 的 DC 残差** | ✅ **逐样本等于 FFmpeg**（16×16、32×32 平坦帧全对）|
+//! | 4×4 亮度残差 | ❌ 显著性图从第 2 个系数起就偏（`cbp` 之后立刻分叉）|
+//!
+//! 因此 [`cabac_mb`] **默认关闭**（`JISHI_H264_CABAC=1` 才启用）：半成品放出去
+//! 用户看到的是花屏，比"明确报不支持"糟得多。默认仍然走"硬解优先、软解只接
+//! CAVLC"的老路。
+//!
+//! ### 已经踩过、值得记下来的四个坑
+//!
+//! 1. **上下文初值公式**：是 `((m * SliceQPY) >> 4) + n`，**不是**
+//!    `((m * (SliceQPY − 26)) >> 8) + n`。后者在 QP=26 附近才碰巧接近，别的 QP 上
+//!    整组上下文都错，症状是"前几个 bin 看着对，越往后越错，最后读不到
+//!    `end_of_slice_flag`"。
+//! 2. **`condTermFlag` 的"未加权"那几处**：`mb_type` / `mb_skip_flag` /
+//!    `intra_chroma_pred_mode` / `transform_size_8x8_flag` 的左邻与上邻**各算 1**；
+//!    `coded_block_pattern` / `cbf` / `ref_idx` 才是 `A + 2B`。写成 2 倍会让
+//!    第二行第一个宏块开始错位。
+//! 3. **邻居不可用时的默认值不是 0**：DC 块的 `cbf` 按 `b_intra`（=1）算；
+//!    亮度 `coded_block_pattern` 按 `0xF`（四位全 1）算 —— 对应实现里邻居 cbp
+//!    记成 `-1` 的那套写法。按 0 算，第一个宏块的上下文就偏 3。
+//! 4. **`I_PCM` 之后算术解码器要重启**（对齐 → 原始样本 → `codIRange = 510`），
+//!    不是继续用旧状态。
+//!
+//! 剩下的 4×4 残差问题，下一步的抓手是：用 `H264_CABAC_TRACE=1` 看 `ctx=134`
+//! 之后的显著性 bin 序列，与"同一内容 CAVLC 编出来的系数"对照（注意：两种熵编码
+//! 的 RD 量化可能选不同的系数，不能直接比数值，只能比"是否在合理位置"）。
 //! ## 现状（2026-11-05）：P 切片已经能出画
 //!
 //! `ME_DECODE=software` 现在能解 **CAVLC 的 I/P 切片**（Baseline / 一部分 Main）。
@@ -118,6 +151,9 @@
 //! | `H264_TRACE_FRAME=1` | 每帧一行：`poc / frame_num / 切片数 / MB 数 / 是否有残差` |
 //! | `H264_TRACE_MB=1` | 逐宏块：`addr / mb_type / qp / cbp / 预测模式` |
 
+pub mod cabac;
+pub mod cabac_mb;
+pub mod cabac_tables;
 pub mod cavlc;
 pub mod cavlc_tables;
 pub mod deblock;
@@ -406,10 +442,19 @@ impl H264Decoder {
         );
         info.pic_index = self.pictures;
         for s in slices {
+            let cabac = s.pps.entropy_coding_mode_flag;
             if s.header.is_i() {
-                mb::decode_i_slice(&s.header, &s.sps, &s.pps, &s.raw, &mut info)?;
+                if cabac {
+                    cabac_mb::decode_i_slice(&s.header, &s.sps, &s.pps, &s.raw, &mut info)?;
+                } else {
+                    mb::decode_i_slice(&s.header, &s.sps, &s.pps, &s.raw, &mut info)?;
+                }
             } else if s.header.is_p() {
-                mb::decode_p_slice(&s.header, &s.sps, &s.pps, &s.raw, &mut info)?;
+                if cabac {
+                    cabac_mb::decode_p_slice(&s.header, &s.sps, &s.pps, &s.raw, &mut info)?;
+                } else {
+                    mb::decode_p_slice(&s.header, &s.sps, &s.pps, &s.raw, &mut info)?;
+                }
             } else {
                 return Err(MediaError::Unsupported(format!(
                     "B 切片还没接（slice_type = {}）。P 切片已经能解，见 h264/mod.rs 抬头那张表",

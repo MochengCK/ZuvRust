@@ -491,29 +491,53 @@ pub fn predict_16x16(
 
 /// 色度预测（§8.3.4.1 ~ §8.3.4.4），输出 `8×8`（4:2:0 的 `MbWidthC`×`MbHeightC`）。
 ///
-/// `top` / `left` 各 8 个，`top_ok` / `left_ok` 是**整行/整列**的可用性
-/// （DC 模式还要按 4×4 子块细分，见 [`crate::video::h264::reconstruct`]）。
+/// ## 参考样本为什么是 12 个而不是 8 个
+///
+/// `Intra_8x8_Chroma` 的平面（Plane）模式要算
+///
+/// ```text
+/// H = Σ_{x'=0..3} (x'+1) * ( p[-1+x', -1] - p[-1-x', -1] )
+/// ```
+///
+/// 也就是**块左边那 4 个样本**（`p[-4..-1]`）也要用。只给 8 个样本时这一项没处取，
+/// 早期版本因此在这条分支上直接越界 panic —— 只是 CAVLC 那批用例恰好没走到
+/// 色度平面模式，才一直没暴露。
+///
+/// 现在的布局：
+///
+/// | 下标 | 样本 |
+/// |---|---|
+/// | `0..4` | `p[-4..-1]`（同一行，块左侧）|
+/// | `4..12` | `p[0..8]` |
+///
+/// `left` 同理（`0..4` 是块上方同一列的 `p[-1,-4..-1]`）。
+pub const CHROMA_EXT: usize = 4;
+
+/// 色度参考样本数组的长度（4 个扩展 + 8 个本体）。
+pub const CHROMA_REF_LEN: usize = 12;
+
 pub fn predict_chroma(
     mode: u8,
-    top: &[i32; 8],
-    left: &[i32; 8],
-    top_avail: [bool; 8],
-    left_avail: [bool; 8],
+    top: &[i32; CHROMA_REF_LEN],
+    left: &[i32; CHROMA_REF_LEN],
+    top_avail: [bool; CHROMA_REF_LEN],
+    left_avail: [bool; CHROMA_REF_LEN],
     bit_depth: u8,
 ) -> [i32; 64] {
     let mut p = [0i32; 64];
+    let o = CHROMA_EXT;
     match mode {
         1 => {
             for y in 0..8 {
                 for x in 0..8 {
-                    p[y * 8 + x] = left[y];
+                    p[y * 8 + x] = left[o + y];
                 }
             }
         }
         2 => {
             for y in 0..8 {
                 for x in 0..8 {
-                    p[y * 8 + x] = top[x];
+                    p[y * 8 + x] = top[o + x];
                 }
             }
         }
@@ -521,13 +545,14 @@ pub fn predict_chroma(
             // 式 8-144 ~ 8-149：4:2:0 时 xCF = 0、yCF = 0
             let mut h = 0i32;
             for x in 0..4i32 {
-                h += (x + 1) * (top[(4 + x) as usize] - top[(2 - x) as usize]);
+                h += (x + 1) * (top[(o as i32 - 1 + x) as usize] - top[(o as i32 - 1 - x) as usize]);
             }
             let mut v = 0i32;
             for y in 0..4i32 {
-                v += (y + 1) * (left[(4 + y) as usize] - left[(2 - y) as usize]);
+                v += (y + 1) * (left[(o as i32 - 1 + y) as usize] - left[(o as i32 - 1 - y) as usize]);
             }
-            let a = 16 * (left[7] + top[7]);
+            // p[-1,7] 与 p[7,-1]
+            let a = 16 * (left[o + 7] + top[o + 7]);
             let b = (34 * h + 32) >> 6;
             let c = (34 * v + 32) >> 6;
             for y in 0..8i32 {
@@ -542,8 +567,8 @@ pub fn predict_chroma(
             // 的**优先级**写得不一样（后者先看上、前者先看左），照着写。
             for by in 0..2usize {
                 for bx in 0..2usize {
-                    let x0 = bx * 4;
-                    let y0 = by * 4;
+                    let x0 = o + bx * 4;
+                    let y0 = o + by * 4;
                     let t = top_avail[x0..x0 + 4].iter().all(|&a| a);
                     let l = left_avail[y0..y0 + 4].iter().all(|&a| a);
                     let sum_t: i32 = top[x0..x0 + 4].iter().sum();
@@ -574,8 +599,8 @@ pub fn predict_chroma(
                             1 << (bit_depth - 1)
                         }
                     };
-                    for y in y0..y0 + 4 {
-                        for x in x0..x0 + 4 {
+                    for y in by * 4..by * 4 + 4 {
+                        for x in bx * 4..bx * 4 + 4 {
                             p[y * 8 + x] = v;
                         }
                     }
@@ -699,20 +724,52 @@ mod tests {
     /// 色度 V/H 就是照抄；色度 DC 在四边都可用时是 4×4 子块的 `(上四+左四+4)>>3`。
     #[test]
     fn chroma_modes_copy_and_dc() {
-        let top = [10i32, 20, 30, 40, 50, 60, 70, 80];
-        let left = [1i32, 2, 3, 4, 5, 6, 7, 8];
-        let v = predict_chroma(2, &top, &left, [true; 8], [true; 8], 8);
+        // 布局见 [`CHROMA_EXT`]：0..4 是块左侧/上方的扩展样本，4..12 才是 p[0..8]
+        let top = [0i32, 0, 0, 0, 10, 20, 30, 40, 50, 60, 70, 80];
+        let left = [0i32, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8];
+        let avail = [true; CHROMA_REF_LEN];
+        let v = predict_chroma(2, &top, &left, avail, avail, 8);
         assert_eq!(&v[..8], &[10, 20, 30, 40, 50, 60, 70, 80]);
-        let h = predict_chroma(1, &top, &left, [true; 8], [true; 8], 8);
+        let h = predict_chroma(1, &top, &left, avail, avail, 8);
         assert!(h[..8].iter().all(|&x| x == 1));
-        let dc = predict_chroma(0, &top, &left, [true; 8], [true; 8], 8);
+        let dc = predict_chroma(0, &top, &left, avail, avail, 8);
         // ⚠️ 三种位置的**优先级不一样**（§8.3.4.1）：
         //   子块 (4,0)（`bx>0, by==0`）**先看上**：上可用就只用上
         assert_eq!(dc[4], (50 + 60 + 70 + 80 + 2) >> 2);
         //   子块 (0,4)（`bx==0, by>0`）**先看左**：左可用就只用左
         assert_eq!(dc[4 * 8], (5 + 6 + 7 + 8 + 2) >> 2);
         //   子块 (4,4)（两边都 >0）才是"上下都算"的全平均
-        let all = predict_chroma(0, &top, &left, [true; 8], [true; 8], 8);
+        let all = predict_chroma(0, &top, &left, avail, avail, 8);
         assert_eq!(all[4 * 8 + 4], (50 + 60 + 70 + 80 + 5 + 6 + 7 + 8 + 4) >> 3);
+    }
+
+    /// 色度平面模式要用块左侧/上方那 4 个扩展样本（式 8-144 ~ 8-149）。
+    ///
+    /// 常数斜坡：`p[-1-x']` 一路递增，`H` 才有非零值；只用本体 8 个样本的旧实现
+    /// 在这里会越界（历史 bug），现在用 12 个槽位就不该 panic，且结果等于手算。
+    #[test]
+    fn chroma_plane_uses_the_four_extended_samples() {
+        // top:  p[-4..-1] = 6,7,8,9 ；p[0..8] = 10..17
+        let top = [6i32, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17];
+        let left = [2i32, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13];
+        let avail = [true; CHROMA_REF_LEN];
+        let p = predict_chroma(3, &top, &left, avail, avail, 8);
+        // 手算一遍：H = Σ(x'+1)*(top[3+x'] - top[3-x'])
+        let mut h = 0i32;
+        for x in 0..4i32 {
+            h += (x + 1) * (top[(3 + x) as usize] - top[(3 - x) as usize]);
+        }
+        let mut v = 0i32;
+        for y in 0..4i32 {
+            v += (y + 1) * (left[(3 + y) as usize] - left[(3 - y) as usize]);
+        }
+        let a = 16 * (left[11] + top[11]);
+        let b = (34 * h + 32) >> 6;
+        let c = (34 * v + 32) >> 6;
+        for y in 0..8i32 {
+            for x in 0..8i32 {
+                assert_eq!(p[(y * 8 + x) as usize], (a + b * (x - 3) + c * (y - 3) + 16) >> 5);
+            }
+        }
     }
 }

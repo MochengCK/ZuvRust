@@ -100,6 +100,9 @@ pub struct MbInfo {
     pub qp_y: i32,
     /// `I_PCM`：去块滤波时它的 `QPY` 要**当 0 用**（表 8-16 那一节的口径）
     pub is_pcm: bool,
+    /// 这个宏块是"跳过"（`mb_skip_run` / `mb_skip_flag`）而不是显式编码的。
+    /// `mb_type` 与 `P_L0_16x16` 撞号，CABAC 的 `mb_skip_flag` 上下文要区分它们。
+    pub skipped: bool,
     /// 帧间预测信息；`None` = 帧内宏块
     ///
     /// 只存"这个宏块用了什么"，**不存分区形状** —— 重建那一层按 4×4 网格逐块
@@ -134,6 +137,7 @@ impl Default for MbInfo {
             transform_8x8: false,
             qp_y: 26,
             is_pcm: false,
+            skipped: false,
             inter: None,
         }
     }
@@ -207,8 +211,14 @@ impl TcMap {
     }
 
     #[inline]
-    fn luma_set(&mut self, x4: usize, y4: usize, v: u8) {
+    pub(super) fn luma_set(&mut self, x4: usize, y4: usize, v: u8) {
         self.luma[y4 * self.cols4 + x4] = v;
+    }
+
+    /// 亮度 4×4 块自己的非零个数（CABAC 的 `coded_block_flag` 上下文要读邻居的）。
+    #[inline]
+    pub fn luma_get(&self, x4: usize, y4: usize) -> u8 {
+        self.luma[y4 * self.cols4 + x4]
     }
 
     /// 亮度 4×4 块 `(x4, y4)` 的 `nC`：左邻与上邻都**只在画面内**才算可用。
@@ -221,6 +231,27 @@ impl TcMap {
     #[inline]
     fn chroma_set(v: &mut [u8], cols: usize, x4: usize, y4: usize, n: u8) {
         v[y4 * cols + x4] = n;
+    }
+
+    /// 色度 4×4 块自己的非零个数。
+    #[inline]
+    pub fn chroma_get(&self, plane: usize, x4: usize, y4: usize) -> u8 {
+        let (v, cols) = if plane == 0 {
+            (&self.cb, self.cols4 / 2)
+        } else {
+            (&self.cr, self.cols4 / 2)
+        };
+        v[y4 * cols + x4]
+    }
+
+    /// 色度 4×4 块的非零个数写回（平面 0 = Cb、1 = Cr）。
+    pub fn chroma_put(&mut self, plane: usize, x4: usize, y4: usize, n: u8) {
+        let cols = self.cols4 / 2;
+        if plane == 0 {
+            Self::chroma_set(&mut self.cb, cols, x4, y4, n);
+        } else {
+            Self::chroma_set(&mut self.cr, cols, x4, y4, n);
+        }
     }
 
     fn chroma_nc(v: &[u8], cols: usize, x4: usize, y4: usize) -> i32 {
@@ -258,6 +289,12 @@ pub struct PictureInfo {
     /// 每个 4×4 亮度块的帧间信息（L0）。`ref_idx < 0` = 不可用（帧内宏块、
     /// 或还没解到的邻居）。运动矢量预测（§8.4.1.3）与去块滤波的 `bS` 都读它。
     mv_l0: Vec<MvInfo>,
+    /// 每个 4×4 亮度块的 **|mvd|**（CABAC 的 `mvd` 上下文要用）。
+    /// CAVLC 不读它；CABAC 每解一个分区就往这格里按 4×4 铺一份。
+    mvd_abs: Vec<[i32; 2]>,
+    /// 哪些宏块已经解过（CABAC 的"邻居可用性"与 `nC` 都靠它）。
+    /// 切片可以从图中间开始，所以不能用"地址 < 当前"来判断。
+    pub decoded: Vec<bool>,
     mv_cols4: usize,
     /// 诊断用：这张图是解码器解的第几张（与参考解码器对齐时要用）
     pub pic_index: u64,
@@ -272,9 +309,34 @@ impl PictureInfo {
             coeffs: vec![MbCoeffs::default(); mb_cols * mb_rows],
             tc: TcMap::new(mb_cols, mb_rows),
             mv_l0: vec![MvInfo::default(); mb_cols * 4 * mb_rows * 4],
+            mvd_abs: vec![[0; 2]; mb_cols * 4 * mb_rows * 4],
+            decoded: vec![false; mb_cols * mb_rows],
             mv_cols4: mb_cols * 4,
             pic_index: 0,
         }
+    }
+
+    /// 取 4×4 亮度块的 `|mvd|`；不可用（画面外 / 没解到）按 0 算 —— §9.3.3.1.1.7
+    /// 的 `condTermFlag` 就是"不可用 → 0"。
+    pub fn mvd_abs_get(&self, x4: i32, y4: i32) -> [i32; 2] {
+        if x4 < 0 || y4 < 0 || x4 as usize >= self.mv_cols4 {
+            return [0; 2];
+        }
+        let rows = self.mvd_abs.len() / self.mv_cols4;
+        if y4 as usize >= rows {
+            return [0; 2];
+        }
+        let mbx = x4 as usize / 4;
+        let mby = y4 as usize / 4;
+        if !self.decoded[mby * self.mb_cols + mbx] {
+            return [0; 2];
+        }
+        self.mvd_abs[y4 as usize * self.mv_cols4 + x4 as usize]
+    }
+
+    pub fn mvd_abs_set(&mut self, x4: usize, y4: usize, v: [i32; 2]) {
+        let cols = self.mv_cols4;
+        self.mvd_abs[y4 * cols + x4] = v;
     }
 
     /// 取 4×4 网格上的 MV 信息；画面外返回 `None`（= 不可用）。
@@ -290,13 +352,13 @@ impl PictureInfo {
     }
 
     #[inline]
-    fn mv_set(&mut self, x4: usize, y4: usize, v: MvInfo) {
+    pub(super) fn mv_set(&mut self, x4: usize, y4: usize, v: MvInfo) {
         let cols = self.mv_cols4;
         self.mv_l0[y4 * cols + x4] = v;
     }
 
     #[inline]
-    fn mb_at(&mut self, addr: usize) -> (&mut MbInfo, &mut MbCoeffs) {
+    pub(super) fn mb_at(&mut self, addr: usize) -> (&mut MbInfo, &mut MbCoeffs) {
         (&mut self.mb[addr], &mut self.coeffs[addr])
     }
 }
@@ -341,6 +403,7 @@ pub fn decode_i_slice(
     loop {
         qp_y = macroblock_layer(&mut c, sps, pps, info, addr, qp_y)
             .map_err(|e| MediaError::Bitstream(format!("I 切片(MB {addr}): {e}")))?;
+        info.decoded[addr] = true;
         mb_count += 1;
         if !c.more_rbsp_data() {
             break;
@@ -423,6 +486,7 @@ pub fn decode_p_slice(
         }
         qp_y = macroblock_layer_p(&mut c, header, sps, pps, info, addr, qp_y)
             .map_err(|e| MediaError::Bitstream(format!("P 切片(MB {addr}): {e}")))?;
+        info.decoded[addr] = true;
         addr += 1;
     }
     if trace_mb() {
@@ -441,7 +505,7 @@ pub fn decode_p_slice(
 ///
 /// 跳过的宏块等价于 `P_L0_16x16` + `ref_idx = 0` + **残差全零**，
 /// 运动矢量取预测值（§8.4.1.1）。
-fn skip_macroblock(info: &mut PictureInfo, addr: usize) {
+pub(super) fn skip_macroblock(info: &mut PictureInfo, addr: usize) {
     let (mbx, mby) = (addr % info.mb_cols, addr / info.mb_cols);
     let mvp = pskip_mv(info, mbx * 4, mby * 4);
     if trace_mb() {
@@ -471,6 +535,7 @@ fn skip_macroblock(info: &mut PictureInfo, addr: usize) {
     }
     let mut mb = MbInfo {
         mb_type: 0,
+        skipped: true,
         inter: Some(inter),
         ..MbInfo::default()
     };
@@ -478,6 +543,7 @@ fn skip_macroblock(info: &mut PictureInfo, addr: usize) {
     mb.cbp_chroma = 0;
     let (slot_mb, _) = info.mb_at(addr);
     *slot_mb = mb;
+    info.decoded[addr] = true;
 }
 
 /// **跳过宏块**的运动矢量（§8.4.1.1，与普通分区不是同一条规则）。
@@ -508,7 +574,7 @@ fn pskip_mv(info: &PictureInfo, x4: usize, y4: usize) -> Mv {
 }
 
 /// §8.4.1.3 的邻居选择：A（左）、B（上）、C（右上，不可用则退到左上 D）。
-fn predict_partition_mv(info: &PictureInfo, x4: usize, y4: usize, w4: usize, ref_idx: i8) -> Mv {
+pub(super) fn predict_partition_mv(info: &PictureInfo, x4: usize, y4: usize, w4: usize, ref_idx: i8) -> Mv {
     let (x4, y4) = (x4 as i32, y4 as i32);
     let a = info.mv_get(x4 - 1, y4);
     let b = info.mv_get(x4, y4 - 1);
@@ -1019,7 +1085,7 @@ fn trace_mvp() -> bool {
     *ON.get_or_init(|| std::env::var("H264_TRACE_MVP").is_ok_and(|v| v != "0"))
 }
 
-fn trace_mb() -> bool {
+pub(super) fn trace_mb() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(|| std::env::var("H264_TRACE_MB").is_ok_and(|v| v != "0"))
