@@ -637,12 +637,25 @@ fn video_loop(path: String, defs: Arc<Vec<TrackDef>>, sh: Arc<Shared>) {
             return;
         }
 
-        // 不在播放、且已经没有"要出一帧预览"的任务：挂起（暂停时 CPU 归零）
+        // 不在播放：先把队列垫满再挂起（不再"一暂停就停止解码"）。
+        //
+        // 以前暂停会立刻停解码，队列里只剩 1-2 帧，宿主做"逐帧步进"时每按一次
+        // 都要重新 seek、从关键帧解过来（关键帧 5 秒一个时非常慢）。现在暂停后
+        // 继续解到队列满再阻塞：步进直接从队列取，按一次立即出图；队列被取走一帧
+        // 就补一帧，空闲时仍然阻塞在条件变量上，不烧 CPU。
         if !playing && !need_prime {
-            if wait_ctrl(&sh, seq) {
+            let half = (sh.vq_cap.load(Ordering::Relaxed) as usize).max(2) / 2;
+            let mut q = sh.vq.lock().unwrap_or_else(|p| p.into_inner());
+            while q.frames.len() >= half && q.seq == seq && !q.closed {
+                let (g, _) = sh
+                    .cv_v
+                    .wait_timeout(q, Duration::from_millis(100))
+                    .unwrap_or_else(|p| p.into_inner());
+                q = g;
+            }
+            if q.closed || q.seq != seq {
                 continue;
             }
-            return;
         }
 
         // 队列满：阻塞在条件变量上，让解码与显示同速

@@ -2180,15 +2180,12 @@ impl Mp4Demuxer {
                 }
             }
         }
+        // 一律取目标**之前**的关键帧（见 seek_fragmented 的说明）：
+        // 取最近的会落到目标之后，画面直接跳过一段。
+        let _ = next_kf;
         let landing: Option<(i64, u32)> = match (prev_kf, next_kf) {
-            (Some(p), Some(n)) => {
-                if (n.0 - target_ticks).abs() < (target_ticks - p.0).abs() {
-                    Some(n)
-                } else {
-                    Some(p)
-                }
-            }
-            (a, b) => a.or(b),
+            (Some(p), _) => Some(p),
+            (None, n) => n,
         };
 
         let Some((pts_ticks, key_index)) = landing else {
@@ -2294,25 +2291,22 @@ impl Mp4Demuxer {
             self.reset_stream();
             return Ok(self.first_media_us().unwrap_or(0));
         }
-        // 二分找"显示时间最接近目标"的关键帧
-        let pos = index.partition_point(|e| e.2 < pts_us);
+        // 取**目标之前最接近的关键帧**，而不是"最近的关键帧"。
+        //
+        // 取最近会因为"后一个关键帧更近"而落到目标**之后**（实测拖到 12.9s
+        // 却从 15.1s 开始播，凭空跳掉 2.2 秒）。落在目标之前，再由 capi 层
+        // 跳过着陆点到目标之间的帧（display_from），画面才是准的。
+        // 代价是要多解最多一个 GOP —— 这是精确寻址必须付的钱。
+        let pos = index.partition_point(|e| e.2 <= pts_us);
         let best = if pos == 0 {
-            index[0]
-        } else if pos >= index.len() {
-            index[index.len() - 1]
+            index[0] // 目标在第一个关键帧之前：只能从它开始
         } else {
-            let (before, after) = (index[pos - 1], index[pos]);
-            if (after.2 - pts_us).abs() < (pts_us - before.2).abs() {
-                after
-            } else {
-                before
-            }
+            index[pos - 1]
         };
 
         self.reset_stream();
         self.next_box = best.0;
         self.skip_before_us = Some(best.2);
-        // 分片里的第一个采样不一定就是关键帧：记下 decode_time，泵这个分片时丢掉更早的
         self.seek_fragment = Some((best.0, best.1));
         Ok(best.2)
     }
@@ -3172,9 +3166,10 @@ mod tests {
     #[test]
     fn fragmented_seek_moves_to_matching_fragment() {
         let mut d = demux(fragmented_mp4());
-        // 关键帧在 0ms 与 66.7ms：50ms 距后者更近（16.7ms vs 50ms）
+        // 关键帧在 0ms 与 66.7ms：一律取**目标之前**的那个（0ms），
+        // 落点到目标之间由 capi 层解码后跳过；取最近的会落到目标之后、跳过内容
         let landing = d.seek_us(50_000).unwrap();
-        assert_eq!(landing, 66_666, "取最近的关键帧");
+        assert_eq!(landing, 0, "取目标之前的关键帧");
         assert!(d.next_packet().unwrap().is_some());
 
         let mut d2 = demux(fragmented_mp4());
@@ -3191,7 +3186,9 @@ mod tests {
         // 采样开始出包 —— 没有参考帧，硬解只会吐黑帧（而且不报错）。
         let mut d = demux(fragmented_mp4_first_sample_not_sync());
         let landing = d.seek_us(0).unwrap();
-        assert_eq!(landing, 66_666, "关键帧在分片 2（dts=2000）");
+        // 这段素材里唯一的同步点就是分片 2 的 dts=2000（66.7ms），目标 0 之前
+        // 没有关键帧，所以只能落在它上面 —— 落点会比目标晚，但那是唯一能解的起点
+        assert_eq!(landing, 66_666, "没有更早的关键帧时落在第一个");
         let p = d.next_packet().unwrap().unwrap();
         assert_eq!(p.dts, 2000);
         assert!(p.keyframe, "第一包必须是关键帧");
