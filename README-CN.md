@@ -97,7 +97,7 @@ ADTS、MPEG 音频。
 
 | 扩展名 | 容器 | 装得下的编码 |
 | --- | --- | --- |
-| `.mp4` `.m4s` `.mov` `.m4a` | 分片 fMP4 | H.264 / H.265 / AV1 / VP9 + AAC / MP3 / FLAC / Opus / AC-3 |
+| `.mp4` `.m4s` `.mov` `.m4a` | 渐进式 MP4（`moov` 前置 / faststart） | H.264 / H.265 / AV1 / VP9 + AAC / MP3 / FLAC / Opus / AC-3 |
 | `.mkv` `.mka` | Matroska | 上面全部 |
 | `.webm` | WebM 子集 | VP8 / VP9 / AV1 + Opus |
 | `.ts` `.m2ts` | MPEG-TS | H.264 / H.265 + AAC / MP3 / AC-3 |

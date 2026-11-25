@@ -1,10 +1,14 @@
-//! 分片 fMP4 封装（`ftyp + moov(mvex) + [sidx + moof + mdat]*`）。
+//! MP4 封装：分片 fMP4（默认）与渐进式（普通）MP4（`set_progressive`）。
 //!
-//! ## 为什么产出分片形态而不是普通 MP4
+//! ## 两种形态，各管一段
 //!
-//! - 分片是 HLS/DASH 与"边下边播"要的形态：一个分片一到就能播，不用等整片写完；
-//! - 普通 MP4 要把所有采样的索引（`stbl`）攒在 `moov` 里，**必须等全部写完
-//!   才能落盘**，中途断电就是一个废文件。
+//! - **分片 fMP4**：`ftyp + moov(mvex) + [sidx + moof + mdat]*`。HLS/DASH 与
+//!   "边下边播"要的形态 —— 一个分片一到就能播，不用等整片写完，可以边写边落盘。
+//!   `stream`（喂 MSE）走这条。
+//! - **渐进式（普通）MP4**：`ftyp + moov + mdat`，完整采样表写进 `stbl`、`moov`
+//!   前置（faststart）。`mux` 的落盘产物走这条 —— 播放器/系统预览读一次 `moov`
+//!   就能建索引（issue #14：分片形态要扫全 `moof`，表现为"打开慢、无缩略图"）。
+//!   代价是采样索引必须等全部写完才能定稿：载荷先落临时文件，收尾再组装。
 //!
 //! ## 几个必须做对、错了就"能生成但播不了"的点
 //!
@@ -37,7 +41,7 @@
 //!    读一段就能建索引。它是**在 moof 之前**写的，所以流式直写（管道）也支持 ——
 //!    前提是分片在内存里先组好、字节数已知（本文件就是这么做的）。
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use me_core::{ByteWriter, CodecId, MediaError, MediaKind, Packet, Result, Timebase, Track};
 
@@ -57,6 +61,86 @@ struct Sample {
     keyframe: bool,
 }
 
+/// 渐进式 MP4 里的一条采样元数据（数据本身已经写进暂存的 mdat 载荷）。
+#[derive(Debug, Clone)]
+struct ProgSample {
+    /// mdat 载荷内的偏移（不含 box 头）。
+    offset: u64,
+    size: u32,
+    duration: u32,
+    cts: i32,
+    keyframe: bool,
+    dts: i64,
+}
+
+/// 渐进式 MP4 的 mdat 载荷暂存。
+///
+/// 为什么不能直接写进产物：渐进式 MP4 的 `moov`（采样表）必须**前置**，而
+/// 采样表的大小要等全部采样写完才知道；`mdat` 的 32/64 位长度头也同理。
+/// 所以先把载荷顺序写进一个临时文件，收尾时按 `ftyp + moov + mdat` 组装。
+/// 内存里只留每条采样的元数据（约 32 字节），与产物大小无关。
+struct ProgPayload {
+    file: std::fs::File,
+    path: std::path::PathBuf,
+    len: u64,
+}
+
+impl ProgPayload {
+    fn create(dir: Option<&std::path::Path>) -> Result<Self> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let mut path = match dir {
+            Some(d) => d.to_path_buf(),
+            None => std::env::temp_dir(),
+        };
+        path.push(format!(
+            "zuvrust-mux-{}-{}.tmp",
+            std::process::id(),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(&path)
+            .map_err(|e| MediaError::Io(format!("创建 mux 临时文件失败：{e}")))?;
+        Ok(Self { file, path, len: 0 })
+    }
+
+    fn write(&mut self, bytes: &[u8]) -> Result<()> {
+        self.file
+            .write_all(bytes)
+            .map_err(|e| MediaError::Io(format!("写 mux 临时文件失败：{e}")))?;
+        self.len += bytes.len() as u64;
+        Ok(())
+    }
+
+    /// 收尾组装时把载荷按块拷进产物（内存占用固定 1 MiB）。
+    fn copy_to(&mut self, sink: &mut Sink) -> Result<()> {
+        self.file
+            .flush()
+            .map_err(|e| MediaError::Io(format!("刷新 mux 临时文件失败：{e}")))?;
+        let mut src = std::fs::File::open(&self.path)
+            .map_err(|e| MediaError::Io(format!("打开 mux 临时文件失败：{e}")))?;
+        let mut buf = vec![0u8; 1 << 20];
+        loop {
+            let n = src
+                .read(&mut buf)
+                .map_err(|e| MediaError::Io(format!("读 mux 临时文件失败：{e}")))?;
+            if n == 0 {
+                break;
+            }
+            sink.write_all(&buf[..n])?;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for ProgPayload {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 /// 一条轨道的封装状态。
 #[derive(Debug)]
 struct EsTrack {
@@ -67,6 +151,8 @@ struct EsTrack {
     samples: Vec<Sample>,
     /// 与 `samples` 一一对应的 dts（补时长要用）。
     sample_dts: Vec<i64>,
+    /// 渐进式模式下攒的全部采样元数据（数据在暂存文件里）。
+    prog_samples: Vec<ProgSample>,
     /// 本分片第一条采样的 dts（写 `tfdt` 用）。
     frag_start_dts: Option<i64>,
     /// 本分片最后一条采样的结束时间（刻度）。分片边界按它算。
@@ -85,6 +171,7 @@ struct EsTrack {
     /// 这就是"帧级裁剪"在只搬字节（不重编码）前提下的实现方式。
     edit_onset_ticks: i64,
 }
+
 
 impl EsTrack {
     fn is_video(&self) -> bool {
@@ -139,9 +226,49 @@ impl EsTrack {
             self.last_duration = self.samples[i].duration;
         }
     }
+
+    /// 渐进式模式：补齐整条轨的采样时长（`stts` 必须逐条给时长）。
+    fn infer_prog_durations(&mut self) {
+        let mut last = 0u32;
+        let n = self.prog_samples.len();
+        for i in 0..n {
+            if self.prog_samples[i].duration != 0 {
+                last = self.prog_samples[i].duration;
+                continue;
+            }
+            // 视频采样常常没有时长：先用"下一条 dts − 这一条 dts"
+            if i + 1 < n {
+                let d = self.prog_samples[i + 1].dts - self.prog_samples[i].dts;
+                if d > 0 {
+                    self.prog_samples[i].duration = d as u32;
+                    last = self.prog_samples[i].duration;
+                    continue;
+                }
+            }
+            // 最后一条：沿用上一条；一条参考都没有时给 1 个刻度（0 会把时间轴压成 0）
+            self.prog_samples[i].duration = if last > 0 { last } else { 1 };
+            last = self.prog_samples[i].duration;
+        }
+    }
+
+    /// 渐进式模式：轨道媒体总长（最后一个采样的结束时刻，本轨刻度）。
+    fn prog_media_end_ticks(&self) -> i64 {
+        self.prog_samples
+            .last()
+            .map(|s| s.dts + s.duration as i64)
+            .unwrap_or(0)
+    }
 }
 
-/// 分片 fMP4 封装器。
+
+/// MP4 封装器。
+///
+/// 两种产物形态：
+/// - **分片 fMP4**（默认）：`ftyp + moov(mvex) + [sidx + moof/mdat]*`，供
+///   `stream`（MSE）与"边下边播"使用 —— 每个分片自包含，可以边写边落盘；
+/// - **渐进式（普通）MP4**（[`Mp4Muxer::set_progressive`]）：`ftyp + moov + mdat`，
+///   采样表完整写进 `stbl`、`moov` 前置（faststart）。`mux` 的落盘产物走这条 ——
+///   播放器与系统缩略图读一次 `moov` 就能建索引，不用扫全文件。
 pub struct Mp4Muxer {
     tracks: Vec<EsTrack>,
     /// 产物落点：内存（测试）或直写目标（生产）。
@@ -160,11 +287,20 @@ pub struct Mp4Muxer {
     ///   **绝对时间轴**（seek 到 300 秒之后，片段的时间戳就该从 300 秒开始，
     ///   否则播放器的进度条与 `currentTime` 全是错的）。
     base_us: Option<i64>,
-    /// `ftyp + moov` 是否已经写出。
+    /// `ftyp`（分片形态则是 `ftyp + moov`）是否已经写出。
     header_written: bool,
     packets_written: u64,
     /// 编辑列表的呈现起点（微秒）：0 = 不写 `edts`（见 [`Mp4Muxer::set_edit_onset_us`]）。
     edit_onset_us: i64,
+    /// 渐进式（普通）MP4 模式：采样表进 `stbl`、`moov` 前置。
+    progressive: bool,
+    /// 渐进式模式的 mdat 载荷暂存（第一条采样时才创建）。
+    prog_payload: Option<ProgPayload>,
+    /// 渐进式暂存文件所在目录（默认系统临时目录）。
+    ///
+    /// 生产路径由调用方指到**产物所在目录**：系统临时目录在 Linux 上常是
+    /// tmpfs，几个 GB 的合并会把内存/交换区打满；同目录也能保证收尾拷贝不跨盘。
+    temp_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Mp4Muxer {
@@ -197,10 +333,36 @@ impl Mp4Muxer {
             header_written: false,
             packets_written: 0,
             edit_onset_us: 0,
+            progressive: false,
+            prog_payload: None,
+            temp_dir: None,
         }
     }
 
-    /// 设置分片目标时长（微秒）。
+    /// 切换为渐进式（普通）MP4：完整 `stbl` 采样表 + `moov` 前置（faststart）。
+    ///
+    /// 必须在 `set_tracks` **之前**调用。分片模式（默认）用于 `stream`（MSE）——
+    /// 两种模式的产物布局不同，不能中途切换。
+    ///
+    /// 代价：采样元数据（约 32 字节/条）会留在内存里，载荷先落到临时文件，
+    /// 收尾时按 `ftyp + moov + mdat` 组装（一次顺序拷贝）。所以内存占用只与
+    /// 采样条数有关，与产物字节数无关。
+    pub fn set_progressive(&mut self, enabled: bool) -> Result<()> {
+        if self.header_written {
+            return Err(MediaError::Container(
+                "set_progressive 必须在 set_tracks 之前调用（ftyp 已经写出）".into(),
+            ));
+        }
+        self.progressive = enabled;
+        Ok(())
+    }
+
+    /// 渐进式暂存文件的目录（默认系统临时目录；生产建议指到产物所在目录）。
+    pub fn set_temp_dir(&mut self, dir: impl Into<std::path::PathBuf>) {
+        self.temp_dir = Some(dir.into());
+    }
+
+    /// 设置分片目标时长（微秒）。渐进式模式下无效（没有分片）。
     pub fn set_fragment_duration_us(&mut self, us: i64) {
         self.fragment_us = us.max(1);
     }
@@ -268,6 +430,7 @@ impl Mp4Muxer {
                 nal_len,
                 samples: Vec::new(),
                 sample_dts: Vec::new(),
+                prog_samples: Vec::new(),
                 frag_start_dts: None,
                 frag_end_dts: 0,
                 next_dts: None,
@@ -327,6 +490,33 @@ impl Mp4Muxer {
 
         let data = self.convert_sample(idx, p)?;
         let cts = (pts - dts).clamp(i32::MIN as i64, i32::MAX as i64) as i32;
+
+        // 渐进式：数据顺序写进暂存的 mdat 载荷，只在内存里留元数据。
+        // 采样表要等全部采样写完才能定稿（`moov` 前置），所以不能像分片那样边写边定稿。
+        if self.progressive {
+            if self.prog_payload.is_none() {
+                self.prog_payload = Some(ProgPayload::create(self.temp_dir.as_deref())?);
+            }
+            let payload = self.prog_payload.as_mut().expect("刚创建");
+            let offset = payload.len;
+            payload.write(&data)?;
+            let t = &mut self.tracks[idx];
+            t.prog_samples.push(ProgSample {
+                offset,
+                size: data.len() as u32,
+                duration: p.duration,
+                cts,
+                keyframe: p.keyframe,
+                dts,
+            });
+            let end = dts + p.duration as i64;
+            t.frag_end_dts = t.frag_end_dts.max(end).max(dts);
+            t.next_dts = Some(end);
+            t.last_dts = Some(dts);
+            self.packets_written += 1;
+            return Ok(());
+        }
+
         let t = &mut self.tracks[idx];
         if t.frag_start_dts.is_none() {
             t.frag_start_dts = Some(dts);
@@ -365,14 +555,170 @@ impl Mp4Muxer {
     /// [`Mp4Muxer::bytes_written`] 取总量。返回 `Result` 是因为落盘可能失败，
     /// 而"写不进去"绝不能当成成功（否则用户拿到一个截断的文件却以为合并好了）。
     pub fn finish(&mut self) -> Result<Vec<u8>> {
-        self.flush_fragment()?;
+        if self.progressive {
+            self.finish_progressive()?;
+        } else {
+            self.flush_fragment()?;
+        }
         self.sink.flush()?;
         Ok(self.sink.take_bytes())
     }
 
     /// 已经写出的字节数（进度上报用）。
+    ///
+    /// 渐进式模式下产物要等收尾才组装，写到一半时用"暂存载荷 + 已写头部"近似，
+    /// 收尾后载荷已并入 `sink`，不能再重复计。
     pub fn bytes_written(&self) -> u64 {
-        self.sink.bytes_written()
+        let staged = self.prog_payload.as_ref().map_or(0, |p| p.len);
+        self.sink.bytes_written() + staged
+    }
+
+    /// 渐进式收尾：`ftyp` 已在 `set_tracks` 写出，这里补 `moov + mdat`。
+    ///
+    /// 采样表要两次拼装：第一次拿到 `moov` 的字节数，第二次用真实 chunk 偏移
+    /// （绝对偏移 = moov 起点 + moov 长度 + mdat 头 + 载荷内偏移）。盒子大小与
+    /// 偏移数值无关（stco 定长 4 字节、co64 定长 8 字节），所以第二次长度不变。
+    fn finish_progressive(&mut self) -> Result<()> {
+        for t in &mut self.tracks {
+            t.infer_prog_durations();
+        }
+
+        let payload_len = self.prog_payload.as_ref().map_or(0, |p| p.len);
+        let mdat_header = mdat_header_len(payload_len);
+        let moov_base = self.sink.bytes_written();
+
+        // 先按"不含 moov"的粗略上界判断是否必须用 co64，再用真实 moov 长度复核
+        //（stco 只有 32 位，产物越过 4 GiB 时必须换 co64）。
+        let mut co64 = moov_base + mdat_header + payload_len > u32::MAX as u64;
+        let mut moov_len = self.build_progressive_moov(co64, 0)?.len();
+        if !co64 && moov_base + moov_len as u64 + mdat_header + payload_len > u32::MAX as u64 {
+            co64 = true;
+            moov_len = self.build_progressive_moov(true, 0)?.len();
+        }
+
+        let chunk_base = moov_base + moov_len as u64 + mdat_header;
+        let moov = self.build_progressive_moov(co64, chunk_base)?;
+        if moov.len() != moov_len {
+            // stco/co64 都是定长表项，换数值不该改变盒子长度；变了说明某个字段
+            // 被写成了变长 —— 宁可不写，也不产出一个索引错位的文件。
+            return Err(MediaError::Container(format!(
+                "渐进式 MP4 的 moov 长度不稳定（{} / {}）",
+                moov_len,
+                moov.len()
+            )));
+        }
+
+        self.sink.write_all(&moov)?;
+        let mut header = ByteWriter::with_capacity(16);
+        write_mdat_header(&mut header, payload_len);
+        self.sink.write_all(&header.into_vec())?;
+        if let Some(mut payload) = self.prog_payload.take() {
+            payload.copy_to(&mut self.sink)?;
+        }
+        Ok(())
+    }
+
+    /// 拼渐进式 MP4 的 `moov`：完整 `stbl` 采样表 + 真实时长。
+    ///
+    /// `chunk_base` 是 mdat 载荷第一个字节的绝对文件偏移；每条采样各自成一个
+    /// chunk（交织后的同轨采样通常不连续，按采样建 chunk 是唯一不会写错的形态）。
+    fn build_progressive_moov(&self, co64: bool, chunk_base: u64) -> Result<Vec<u8>> {
+        let movie_ts = 1000u32;
+        let durations: Vec<(i64, i64)> = self
+            .tracks
+            .iter()
+            .map(|t| {
+                let media_end = t.prog_media_end_ticks();
+                let presented = (media_end - t.edit_onset_ticks).max(0);
+                let movie = ticks_to_movie(t.track.timebase, presented, movie_ts);
+                (media_end, movie)
+            })
+            .collect();
+        let movie_duration = durations.iter().map(|(_, m)| *m).max().unwrap_or(0);
+
+        let mut w = ByteWriter::with_capacity(
+            1024 + self.tracks.iter().map(|t| t.prog_samples.len()).sum::<usize>() * 24,
+        );
+        let moov_at = box_open(&mut w, b"moov");
+        write_mvhd_progressive(&mut w, movie_ts, movie_duration);
+        for (i, t) in self.tracks.iter().enumerate() {
+            let track_id = (i + 1) as u32;
+            let (media_end, movie_duration) = durations[i];
+            self.write_trak_progressive(&mut w, t, track_id, media_end, movie_duration, co64, chunk_base)?;
+        }
+        box_close(&mut w, moov_at);
+        Ok(w.into_vec())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn write_trak_progressive(
+        &self,
+        w: &mut ByteWriter,
+        t: &EsTrack,
+        track_id: u32,
+        media_end_ticks: i64,
+        presented_movie_ticks: i64,
+        co64: bool,
+        chunk_base: u64,
+    ) -> Result<()> {
+        let trak_at = box_open(w, b"trak");
+        write_tkhd_progressive(w, t, track_id, presented_movie_ticks);
+        if t.edit_onset_ticks > 0 {
+            let edts_at = box_open(w, b"edts");
+            let big = presented_movie_ticks > u32::MAX as i64;
+            let elst_at = full_box_open(w, b"elst", if big { 1 } else { 0 }, 0);
+            w.u32_be(1);
+            if big {
+                w.u64_be(presented_movie_ticks as u64);
+                w.u64_be(t.edit_onset_ticks as u64);
+            } else {
+                w.u32_be(presented_movie_ticks.max(0) as u32);
+                w.u32_be(t.edit_onset_ticks as u32);
+            }
+            w.u16_be(1);
+            w.u16_be(0);
+            box_close(w, elst_at);
+            box_close(w, edts_at);
+        }
+        let mdia_at = box_open(w, b"mdia");
+        write_mdhd_progressive(w, t, media_end_ticks);
+        write_hdlr(w, t);
+        let minf_at = box_open(w, b"minf");
+        match t.track.kind {
+            MediaKind::Video => {
+                let at = full_box_open(w, b"vmhd", 0, 1);
+                w.u16_be(0);
+                w.u16_be(0);
+                w.u16_be(0);
+                w.u16_be(0);
+                box_close(w, at);
+            }
+            MediaKind::Audio => {
+                let at = full_box_open(w, b"smhd", 0, 0);
+                w.u16_be(0);
+                w.u16_be(0);
+                box_close(w, at);
+            }
+            _ => {
+                let at = full_box_open(w, b"nmhd", 0, 0);
+                box_close(w, at);
+            }
+        }
+        let dinf_at = box_open(w, b"dinf");
+        let dref_at = full_box_open(w, b"dref", 0, 0);
+        w.u32_be(1);
+        let url_at = full_box_open(w, b"url ", 0, 1);
+        box_close(w, url_at);
+        box_close(w, dref_at);
+        box_close(w, dinf_at);
+        let stbl_at = box_open(w, b"stbl");
+        write_stsd(w, t)?;
+        write_stbl_progressive(w, t, co64, chunk_base);
+        box_close(w, stbl_at);
+        box_close(w, minf_at);
+        box_close(w, mdia_at);
+        box_close(w, trak_at);
+        Ok(())
     }
 
     pub fn packets_written(&self) -> u64 {
@@ -407,35 +753,44 @@ impl Mp4Muxer {
         }
     }
 
-    /// 写出 `ftyp + moov`。
+    /// 写出 `ftyp`（分片形态再写出 `moov`；渐进式的 `moov` 要等收尾才能定稿）。
     fn write_header(&mut self) -> Result<()> {
         let mut w = ByteWriter::with_capacity(2048);
         // ftyp
         let at = box_open(&mut w, b"ftyp");
-        w.bytes(b"iso5"); // major_brand：分片 MP4
-        w.u32_be(512);
-        w.bytes(b"iso5iso6mp41");
+        if self.progressive {
+            // 普通 MP4：isom 系品牌，播放器/系统预览按渐进式索引来读
+            w.bytes(b"isom");
+            w.u32_be(512);
+            w.bytes(b"isomiso2mp41");
+        } else {
+            w.bytes(b"iso5"); // major_brand：分片 MP4
+            w.u32_be(512);
+            w.bytes(b"iso5iso6mp41");
+        }
         box_close(&mut w, at);
 
-        // moov
-        let moov_at = box_open(&mut w, b"moov");
-        write_mvhd(&mut w);
-        for (i, t) in self.tracks.iter().enumerate() {
-            write_trak(&mut w, t, (i + 1) as u32)?;
+        if !self.progressive {
+            // moov
+            let moov_at = box_open(&mut w, b"moov");
+            write_mvhd(&mut w);
+            for (i, t) in self.tracks.iter().enumerate() {
+                write_trak(&mut w, t, (i + 1) as u32)?;
+            }
+            // mvex/trex：分片模式必须要有，否则播放器不知道分片里采样描述的下标
+            let mvex_at = box_open(&mut w, b"mvex");
+            for i in 0..self.tracks.len() {
+                let trex_at = full_box_open(&mut w, b"trex", 0, 0);
+                w.u32_be((i + 1) as u32); // track_ID
+                w.u32_be(1); // default_sample_description_index
+                w.u32_be(0); // default_sample_duration（分片里逐条写，这里给 0）
+                w.u32_be(0); // default_sample_size
+                w.u32_be(0); // default_sample_flags
+                box_close(&mut w, trex_at);
+            }
+            box_close(&mut w, mvex_at);
+            box_close(&mut w, moov_at);
         }
-        // mvex/trex：分片模式必须要有，否则播放器不知道分片里采样描述的下标
-        let mvex_at = box_open(&mut w, b"mvex");
-        for i in 0..self.tracks.len() {
-            let trex_at = full_box_open(&mut w, b"trex", 0, 0);
-            w.u32_be((i + 1) as u32); // track_ID
-            w.u32_be(1); // default_sample_description_index
-            w.u32_be(0); // default_sample_duration（分片里逐条写，这里给 0）
-            w.u32_be(0); // default_sample_size
-            w.u32_be(0); // default_sample_flags
-            box_close(&mut w, trex_at);
-        }
-        box_close(&mut w, mvex_at);
-        box_close(&mut w, moov_at);
 
         self.sink.write_all(&w.into_vec())?;
         self.header_written = true;
@@ -750,20 +1105,215 @@ fn write_mdhd(w: &mut ByteWriter, t: &EsTrack) {
     w.u32_be(0);
     w.u32_be(t.timescale);
     w.u32_be(0); // duration：分片文件里为 0
-    // 语言：3 个 5 位字母，各 -0x60
-    let lang = t.track.language.as_deref().unwrap_or("und");
-    let b = lang.as_bytes();
-    let packed: u16 = if b.len() == 3 {
+    w.u16_be(pack_language(t.track.language.as_deref()));
+    w.u16_be(0); // pre_defined
+    box_close(w, at);
+}
+
+/// 语言：3 个 5 位字母，各 -0x60；缺省 `und`。
+fn pack_language(lang: Option<&str>) -> u16 {
+    let b = lang.unwrap_or("und").as_bytes();
+    if b.len() == 3 {
         (((b[0].saturating_sub(0x60)) as u16) << 10)
             | (((b[1].saturating_sub(0x60)) as u16) << 5)
             | ((b[2].saturating_sub(0x60)) as u16)
     } else {
-        // "und"
-        (21 << 10) | (14 << 5) | 4
-    };
-    w.u16_be(packed);
+        (21 << 10) | (14 << 5) | 4 // "und"
+    }
+}
+
+/// 本轨刻度 → 电影层刻度（`mvhd`/`tkhd`/`elst` 用）。
+fn ticks_to_movie(tb: Timebase, ticks: i64, movie_ts: u32) -> i64 {
+    let us = tb.ticks_to_us(ticks.max(0));
+    ((us as i128 * movie_ts as i128) / 1_000_000) as i64
+}
+
+/// 渐进式 `mvhd`：真实总时长（分片形态这里是 0，靠每段 `sidx` 补）。
+fn write_mvhd_progressive(w: &mut ByteWriter, timescale: u32, duration: i64) {
+    let big = duration > u32::MAX as i64;
+    let at = full_box_open(w, b"mvhd", if big { 1 } else { 0 }, 0);
+    if big {
+        w.u64_be(0); // creation_time
+        w.u64_be(0); // modification_time
+        w.u32_be(timescale);
+        w.u64_be(duration.max(0) as u64);
+    } else {
+        w.u32_be(0);
+        w.u32_be(0);
+        w.u32_be(timescale);
+        w.u32_be(duration.max(0) as u32);
+    }
+    w.u32_be(0x0001_0000); // rate = 1.0
+    w.u16_be(0x0100); // volume = 1.0
+    w.u16_be(0);
+    w.u32_be(0);
+    w.u32_be(0);
+    for v in UNITY_MATRIX {
+        w.u32_be(v);
+    }
+    for _ in 0..6 {
+        w.u32_be(0);
+    }
+    w.u32_be(0xFFFF_FFFF); // next_track_ID
+    box_close(w, at);
+}
+
+fn write_tkhd_progressive(w: &mut ByteWriter, t: &EsTrack, track_id: u32, duration: i64) {
+    let big = duration > u32::MAX as i64;
+    let at = full_box_open(w, b"tkhd", if big { 1 } else { 0 }, 0x7); // enabled | in_movie | in_preview
+    if big {
+        w.u64_be(0); // creation_time
+        w.u64_be(0); // modification_time
+        w.u32_be(track_id);
+        w.u32_be(0); // reserved
+        w.u64_be(duration.max(0) as u64);
+        w.u64_be(0); // reserved
+    } else {
+        w.u32_be(0);
+        w.u32_be(0);
+        w.u32_be(track_id);
+        w.u32_be(0); // reserved
+        w.u32_be(duration.max(0) as u32);
+        w.u32_be(0);
+        w.u32_be(0);
+    }
+    w.u16_be(0); // layer
+    w.u16_be(0); // alternate_group
+    w.u16_be(if matches!(t.track.kind, MediaKind::Audio) { 0x0100 } else { 0 });
+    w.u16_be(0); // reserved
+    for v in UNITY_MATRIX {
+        w.u32_be(v);
+    }
+    w.u32_be(t.track.width << 16);
+    w.u32_be(t.track.height << 16);
+    box_close(w, at);
+}
+
+fn write_mdhd_progressive(w: &mut ByteWriter, t: &EsTrack, duration_ticks: i64) {
+    let big = duration_ticks > u32::MAX as i64;
+    let at = full_box_open(w, b"mdhd", if big { 1 } else { 0 }, 0);
+    if big {
+        w.u64_be(0);
+        w.u64_be(0);
+        w.u32_be(t.timescale);
+        w.u64_be(duration_ticks.max(0) as u64);
+    } else {
+        w.u32_be(0);
+        w.u32_be(0);
+        w.u32_be(t.timescale);
+        w.u32_be(duration_ticks.max(0) as u32);
+    }
+    w.u16_be(pack_language(t.track.language.as_deref()));
     w.u16_be(0); // pre_defined
     box_close(w, at);
+}
+
+/// 渐进式 `stbl`：`stts / ctts / stsc / stsz / stco|co64 / stss`。
+///
+/// 每条采样各自成一个 chunk（交织后的同轨采样通常不连续）；`stsc` 因此只有
+/// 一条记录（1 chunk = 1 sample）。`stss` 只在视频轨且确实存在非关键帧时才写
+/// （规范里"没有 stss"= 全部都是同步点）。
+fn write_stbl_progressive(w: &mut ByteWriter, t: &EsTrack, co64: bool, chunk_base: u64) {
+    // stts：时长游程
+    let at = full_box_open(w, b"stts", 0, 0);
+    let mut runs: Vec<(u32, u32)> = Vec::new();
+    for s in &t.prog_samples {
+        match runs.last_mut() {
+            Some((n, d)) if *d == s.duration => *n += 1,
+            _ => runs.push((1, s.duration)),
+        }
+    }
+    w.u32_be(runs.len() as u32);
+    for (n, d) in runs {
+        w.u32_be(n);
+        w.u32_be(d);
+    }
+    box_close(w, at);
+
+    // ctts：只有存在合成偏移（B 帧）时才写；负偏移需要 version 1
+    if t.prog_samples.iter().any(|s| s.cts != 0) {
+        let signed = t.prog_samples.iter().any(|s| s.cts < 0);
+        let at = full_box_open(w, b"ctts", if signed { 1 } else { 0 }, 0);
+        let mut runs: Vec<(u32, i32)> = Vec::new();
+        for s in &t.prog_samples {
+            match runs.last_mut() {
+                Some((n, c)) if *c == s.cts => *n += 1,
+                _ => runs.push((1, s.cts)),
+            }
+        }
+        w.u32_be(runs.len() as u32);
+        for (n, c) in runs {
+            w.u32_be(n);
+            w.u32_be(c as u32);
+        }
+        box_close(w, at);
+    }
+
+    let chunks = t.prog_samples.len() as u32;
+    // stsc：1 chunk = 1 sample
+    let at = full_box_open(w, b"stsc", 0, 0);
+    w.u32_be(if chunks > 0 { 1 } else { 0 });
+    if chunks > 0 {
+        w.u32_be(1); // first_chunk
+        w.u32_be(1); // samples_per_chunk
+        w.u32_be(1); // sample_description_index
+    }
+    box_close(w, at);
+
+    // stsz
+    let at = full_box_open(w, b"stsz", 0, 0);
+    w.u32_be(0); // sample_size = 0 → 逐条给
+    w.u32_be(chunks);
+    for s in &t.prog_samples {
+        w.u32_be(s.size);
+    }
+    box_close(w, at);
+
+    // stco / co64：绝对文件偏移
+    let at = full_box_open(w, if co64 { b"co64" } else { b"stco" }, 0, 0);
+    w.u32_be(chunks);
+    for s in &t.prog_samples {
+        let off = chunk_base + s.offset;
+        if co64 {
+            w.u64_be(off);
+        } else {
+            w.u32_be(off as u32);
+        }
+    }
+    box_close(w, at);
+
+    // stss：视频轨的关键帧表
+    if t.is_video() && t.prog_samples.iter().any(|s| !s.keyframe) {
+        let keys: Vec<u32> = t
+            .prog_samples
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| s.keyframe)
+            .map(|(i, _)| (i + 1) as u32)
+            .collect();
+        let at = full_box_open(w, b"stss", 0, 0);
+        w.u32_be(keys.len() as u32);
+        for k in keys {
+            w.u32_be(k);
+        }
+        box_close(w, at);
+    }
+}
+
+/// `mdat` 头长度：载荷超过 4 GiB 时用 64 位长度（size=1 + largesize）。
+fn mdat_header_len(payload: u64) -> u64 {
+    if payload + 8 <= u32::MAX as u64 { 8 } else { 16 }
+}
+
+fn write_mdat_header(w: &mut ByteWriter, payload: u64) {
+    if payload + 8 <= u32::MAX as u64 {
+        w.u32_be((payload + 8) as u32);
+        w.bytes(b"mdat");
+    } else {
+        w.u32_be(1);
+        w.bytes(b"mdat");
+        w.u64_be(payload + 16);
+    }
 }
 
 fn write_hdlr(w: &mut ByteWriter, t: &EsTrack) {
@@ -1577,6 +2127,190 @@ mod tests {
         let e = m2.set_tracks(&[a]);
         assert!(e.is_err());
         assert!(e.unwrap_err().to_string().contains("AudioSpecificConfig"));
+    }
+
+    // ── 渐进式（普通）MP4：issue #14 的产物形态 ─────────────────────────────
+
+    /// 顶层 box 列表（kind + 起点）。
+    fn top_level_boxes(data: &[u8]) -> Vec<([u8; 4], usize)> {
+        let mut out = Vec::new();
+        let mut off = 0usize;
+        while off + 8 <= data.len() {
+            let size = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+            assert!(size >= 8 && off + size <= data.len(), "box 尺寸不合法（{size}）");
+            let mut kind = [0u8; 4];
+            kind.copy_from_slice(&data[off + 4..off + 8]);
+            out.push((kind, off));
+            off += size;
+        }
+        out
+    }
+
+    /// `moov` 里某个表的字节范围（找不到返回 None）。
+    fn moov_box<'a>(data: &'a [u8], kind: &[u8; 4]) -> Option<&'a [u8]> {
+        let moov = top_level_boxes(data).into_iter().find(|(k, _)| k == b"moov")?;
+        let size = u32::from_be_bytes(data[moov.1..moov.1 + 4].try_into().unwrap()) as usize;
+        let body = &data[moov.1 + 8..moov.1 + size];
+        body.windows(4)
+            .position(|w| w == kind)
+            .map(|p| &body[p - 4..])
+    }
+
+    fn mux_av_progressive(fragments: usize) -> Vec<u8> {
+        let mut m = Mp4Muxer::new();
+        m.set_progressive(true).unwrap();
+        m.set_tracks(&[video_track(), audio_track()]).unwrap();
+        for f in 0..fragments {
+            for i in 0..30 {
+                let dts = (f * 30 + i) as i64 * 1000;
+                m.write_packet(&video_packet(dts, i == 0)).unwrap();
+            }
+            for i in 0..43 {
+                let dts = (f * 43 + i) as i64 * 1024;
+                m.write_packet(&audio_packet(dts)).unwrap();
+            }
+        }
+        m.finish().unwrap()
+    }
+
+    #[test]
+    fn progressive_output_is_faststart_with_full_sample_tables() {
+        let data = mux_av_progressive(3);
+        let boxes = top_level_boxes(&data);
+        let kinds: Vec<[u8; 4]> = boxes.iter().map(|(k, _)| *k).collect();
+        assert_eq!(kinds.first(), Some(b"ftyp"), "第一个 box 必须是 ftyp");
+        assert_eq!(kinds.get(1), Some(b"moov"), "moov 必须前置（faststart）");
+        assert_eq!(kinds.get(2), Some(b"mdat"), "mdat 跟在 moov 之后");
+        assert!(!kinds.iter().any(|k| k == b"moof"), "渐进式产物里不能有 moof");
+        assert!(!kinds.iter().any(|k| k == b"mvex"), "渐进式产物里不能有 mvex");
+
+        // 采样表必须真的写出来了：stts / stsc / stsz / stco / stss
+        for kind in [b"stts", b"stsc", b"stsz", b"stco", b"stss"] {
+            assert!(moov_box(&data, kind).is_some(), "缺少采样表 {kind:?}");
+        }
+
+        // 采样表里每条采样一个 chunk：stco 的 entry_count 必须等于采样数
+        let stco = moov_box(&data, b"stco").unwrap();
+        // size(4) + type(4) + version/flags(4) + entry_count(4)
+        let count = u32::from_be_bytes(stco[12..16].try_into().unwrap());
+        assert_eq!(count as usize, 90, "第一条（视频）轨的 chunk 数 = 视频采样数");
+        let moov_size = {
+            let (_, at) = top_level_boxes(&data).into_iter().find(|(k, _)| k == b"moov").unwrap();
+            u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize
+        };
+        let moov_at = top_level_boxes(&data)
+            .into_iter()
+            .find(|(k, _)| k == b"moov")
+            .unwrap()
+            .1;
+        let moov_bytes = &data[moov_at..moov_at + moov_size];
+        assert_eq!(
+            moov_bytes.windows(4).filter(|w| *w == b"stco").count(),
+            2,
+            "两条轨各一张 stco"
+        );
+
+        let src: Arc<dyn ReadAt> = Arc::new(Cursor::new(data));
+        let mut d = Mp4Demuxer::new(src, "mem").unwrap();
+        assert!(!d.is_fragmented(), "渐进式产物不能被判成分片");
+        let info = d.info();
+        let v = info.video().expect("要有视频轨");
+        assert_eq!(v.codec, CodecId::H264);
+        assert_eq!((v.width, v.height), (1920, 1080));
+        let a = info.audio().expect("要有音频轨");
+        assert_eq!(a.codec, CodecId::Aac);
+
+        let mut video_dts = Vec::new();
+        let mut audio_dts = Vec::new();
+        let mut video_data = Vec::new();
+        while let Some(p) = d.next_packet().unwrap() {
+            if p.track_id == 1 {
+                video_dts.push(p.dts);
+                video_data.push(p.data.clone());
+                assert!(p.keyframe == (p.dts % 30_000 == 0), "关键帧标志必须还原");
+                assert_eq!(p.duration, 1000, "stts 的时长必须还原");
+            } else {
+                audio_dts.push(p.dts);
+                assert_eq!(p.duration, 1024);
+            }
+        }
+        assert_eq!(video_dts.len(), 90);
+        assert_eq!(audio_dts.len(), 129);
+        for (i, d) in video_dts.iter().enumerate() {
+            assert_eq!(*d, i as i64 * 1000, "第 {i} 条视频采样的 dts 不对");
+        }
+        for (i, d) in audio_dts.iter().enumerate() {
+            assert_eq!(*d, i as i64 * 1024, "第 {i} 条音频采样的 dts 不对");
+        }
+        assert_eq!(&video_data[0][..4], &[0, 0, 0, 1]);
+        assert_eq!(video_data[0][4], 0x65);
+        assert_eq!(video_data[1][4], 0x41);
+    }
+
+    #[test]
+    fn progressive_omits_ctts_unless_composition_offsets_exist() {
+        // 没有 B 帧：不该写 ctts（多余的表会让某些老播放器误判重排）
+        let plain = {
+            let mut m = Mp4Muxer::new();
+            m.set_progressive(true).unwrap();
+            m.set_tracks(&[video_track()]).unwrap();
+            for i in 0..5 {
+                m.write_packet(&video_packet(i * 1000, i == 0)).unwrap();
+            }
+            m.finish().unwrap()
+        };
+        assert!(moov_box(&plain, b"ctts").is_none(), "无 B 帧时不该写 ctts");
+
+        // 有合成偏移（pts = dts + 2 帧）：必须写 ctts，且解回来 pts 正确
+        let mut m = Mp4Muxer::new();
+        m.set_progressive(true).unwrap();
+        m.set_tracks(&[video_track()]).unwrap();
+        for i in 0..5 {
+            let dts = i * 1000;
+            let mut p = video_packet(dts, i == 0);
+            p.pts = dts + 2000;
+            m.write_packet(&p).unwrap();
+        }
+        let data = m.finish().unwrap();
+        assert!(moov_box(&data, b"ctts").is_some(), "有 B 帧时必须写 ctts");
+        let src: Arc<dyn ReadAt> = Arc::new(Cursor::new(data));
+        let mut d = Mp4Demuxer::new(src, "mem").unwrap();
+        let p = d.next_packet().unwrap().unwrap();
+        assert_eq!(p.pts, 2000, "ctts 的合成偏移必须还原");
+    }
+
+    #[test]
+    fn progressive_empty_muxer_still_declares_tracks() {
+        let mut m = Mp4Muxer::new();
+        m.set_progressive(true).unwrap();
+        m.set_tracks(&[video_track()]).unwrap();
+        let data = m.finish().unwrap();
+        let boxes = top_level_boxes(&data);
+        assert!(boxes.iter().any(|(k, _)| k == b"mdat"), "空产物也要有 mdat");
+        let src: Arc<dyn ReadAt> = Arc::new(Cursor::new(data));
+        let d = Mp4Demuxer::new(src, "mem").unwrap();
+        assert!(!d.is_fragmented());
+        assert_eq!(d.info().tracks.len(), 1);
+    }
+
+    #[test]
+    fn progressive_edit_list_moves_presentation_start() {
+        let mut m = Mp4Muxer::new();
+        m.set_progressive(true).unwrap();
+        m.set_edit_onset_us(1_000_000); // 1 秒
+        m.set_tracks(&[video_track()]).unwrap();
+        for i in 0..90 {
+            m.write_packet(&video_packet(i * 1000, i == 0)).unwrap();
+        }
+        let data = m.finish().unwrap();
+        let elst = moov_box(&data, b"elst").expect("裁剪必须写编辑列表");
+        // size(4) + type(4) + version/flags(4) + entry_count(4)
+        let entry_count = u32::from_be_bytes(elst[12..16].try_into().unwrap());
+        assert_eq!(entry_count, 1);
+        let segment = u32::from_be_bytes(elst[16..20].try_into().unwrap());
+        let media_time = u32::from_be_bytes(elst[20..24].try_into().unwrap());
+        assert_eq!(media_time, 30_000, "media_time = 1 秒（30k 时基）");
+        assert_eq!(segment, 2_000, "呈现时长 = 3 秒 − 铺垫 1 秒（movie 1000 时基）");
     }
 
     #[test]

@@ -1,4 +1,4 @@
-//! me-mux —— 合并层（多轨交织 + MPEG-TS / fMP4 封装）。
+//! me-mux —— 合并层（多轨交织 + MPEG-TS / MP4 / Matroska 封装）。
 //!
 //! 这一层**只搬字节，不重编码**：
 //!
@@ -6,7 +6,8 @@
 //! - [`convert`]：`Annex-B ↔ 长度前缀`、`extradata` 的两种形态互转；
 //! - [`ts`]：MPEG-TS 封装（PAT/PMT/PCR 周期、AAC 补 ADTS、关键帧重发参数集）；
 //! - [`mkv`]：Matroska 封装（`EBML + Segment{Info, Tracks, Cluster*}`）；
-//! - [`mp4`]：分片 fMP4 封装（`moov` + `[sidx + moof/mdat]*`）。
+//! - [`mp4`]：MP4 封装 —— 默认分片 fMP4（`[sidx + moof/mdat]*`，供 `stream`），
+//!   可切换为渐进式（`stbl` 采样表 + `moov` 前置，落盘产物走这条）。
 //!
 //! 约定（与全引擎一致）：
 //! - 时间一律**整数刻度 + 时基**，跨时基比较先换算成微秒；

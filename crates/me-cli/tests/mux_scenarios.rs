@@ -888,6 +888,23 @@ fn find_box(data: &[u8], kind: &[u8; 4]) -> Option<usize> {
     data.windows(4).position(|w| w == kind)
 }
 
+/// 顶层 box 类型序列（按出现顺序）。
+fn top_level_kinds(data: &[u8]) -> Vec<[u8; 4]> {
+    let mut out = Vec::new();
+    let mut off = 0usize;
+    while off + 8 <= data.len() {
+        let size = u32::from_be_bytes(data[off..off + 4].try_into().unwrap()) as usize;
+        if size < 8 || off + size > data.len() {
+            break;
+        }
+        let mut kind = [0u8; 4];
+        kind.copy_from_slice(&data[off + 4..off + 8]);
+        out.push(kind);
+        off += size;
+    }
+    out
+}
+
 /// 帧级裁剪：切点落在两个关键帧之间时，**看到的起点仍然是切点**。
 ///
 /// 素材：4 秒 / 30fps / 每秒一个关键帧；裁 `1.5s ~ 2.5s`。
@@ -1049,6 +1066,44 @@ fn clip_drops_the_fragment_preroll_before_the_landing_keyframe() {
     let packets = read_dts(&out);
     assert_eq!(packets.first().map(|(_, d)| *d), Some(-15_000));
     assert_eq!(packets.len(), 45, "1.0s~2.5s 是 45 帧；多出来就是预滚帧没丢");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 落盘的 `.mp4` 必须是**渐进式（普通）MP4**（issue #14）：
+/// `ftyp + moov + mdat`、`moov` 前置（faststart）、完整 `stbl` 采样表，没有 `moof`。
+///
+/// 分片形态（`moov(mvex) + [sidx+moof+mdat]*`）的索引在 `moof/trun` 里，
+/// 播放器/系统缩略图要扫全文件才能建索引 —— 用户看到的就是"打开慢、无缩略图"。
+#[test]
+fn mux_output_is_faststart_progressive_mp4() {
+    let dir = tmp_dir("mux-progressive");
+    let v = dir.join("v.mp4");
+    let a = dir.join("a.m4a");
+    write_fmp4(&v, &[h264_track(1)], &video_packets(1, 2.0, 0));
+    write_fmp4(&a, &[aac_track(2)], &audio_packets(2, 2.0, 0));
+    let out = dir.join("out.mp4");
+    mux_ok(&out, &[v.as_path(), a.as_path()]);
+
+    let data = std::fs::read(&out).expect("读产物");
+    let kinds = top_level_kinds(&data);
+    assert_eq!(kinds.first().map(|k| &k[..]), Some(&b"ftyp"[..]), "第一个 box 必须是 ftyp");
+    assert_eq!(
+        kinds.get(1).map(|k| &k[..]),
+        Some(&b"moov"[..]),
+        "moov 必须前置（faststart），实际：{kinds:?}"
+    );
+    assert!(kinds.iter().all(|k| k != b"moof"), "产物不能是分片形态：{kinds:?}");
+    assert!(kinds.iter().all(|k| k != b"mvex"), "渐进式产物不能有 mvex");
+    for kind in [b"stts", b"stsc", b"stsz", b"stco"] {
+        assert!(find_box(&data, kind).is_some(), "缺采样表 {kind:?}");
+    }
+
+    // 采样全部读得回来（60 视频 + 86 音频）
+    let packets = read_dts(&out);
+    assert_eq!(packets.len(), 60 + 86);
+    assert_eq!(packets.iter().filter(|(id, _)| *id == 1).count(), 60);
+    assert_eq!(packets.iter().filter(|(id, _)| *id == 2).count(), 86);
 
     let _ = std::fs::remove_dir_all(&dir);
 }

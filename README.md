@@ -103,7 +103,7 @@ fail explicitly instead of writing a broken file):
 
 | Extension | Container | Codecs |
 | --- | --- | --- |
-| `.mp4` `.m4s` `.mov` `.m4a` | fragmented MP4 | H.264 / H.265 / AV1 / VP9 + AAC / MP3 / FLAC / Opus / AC-3 |
+| `.mp4` `.m4s` `.mov` `.m4a` | progressive MP4 (`moov` up front / faststart) | H.264 / H.265 / AV1 / VP9 + AAC / MP3 / FLAC / Opus / AC-3 |
 | `.mkv` `.mka` | Matroska | all of the above |
 | `.webm` | WebM subset | VP8 / VP9 / AV1 + Opus |
 | `.ts` `.m2ts` | MPEG-TS | H.264 / H.265 + AAC / MP3 / AC-3 |

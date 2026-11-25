@@ -379,7 +379,8 @@ fn run(
 
     // 声明总时长：各输入 duration 之和（**不是 min**：多段串接的总时长是加起来）。
     // 它只作参考（分片源常常没有声明时长），但 MKV 的 `Info.Duration` 可以先用它 ——
-    // 播放器/探针就不用先扫全文件才知道有多长（fMP4 那边靠每段的 `sidx` 解决）。
+    // 播放器/探针就不用先扫全文件才知道有多长（MP4 产物收尾时会写真实
+    // `mvhd/tkhd/mdhd` 时长）。
     let mut declared_us: i64 = inputs.iter().filter_map(|(_, _, i)| i.duration_us).sum();
     // 裁剪后声明时长也要跟着缩，否则进度条按整条视频算，永远走不到 100%
     if let (Some(c), true) = (clip, declared_us > 0) {
@@ -391,11 +392,18 @@ fn run(
     let file = std::fs::File::create(output)?;
     // 1 MiB 缓冲：合并是顺序写，缓冲再大收益有限，而 1 MiB 已经能把 syscall 压到可忽略
     let writer = Box::new(std::io::BufWriter::with_capacity(1 << 20, file));
+    // 渐进式 MP4 的 mdat 载荷暂存在产物同目录：系统临时目录在 Linux 上常是
+    // tmpfs，大文件合并会把内存打满；同目录也避免收尾拷贝跨文件系统。
+    let temp_dir = std::path::Path::new(output)
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf());
     let mut muxer = Muxer::with_writer(
         container,
         &out_tracks,
         (declared_us > 0).then_some(declared_us),
         edit_onset_us,
+        temp_dir.as_deref(),
         writer,
     )?;
     if let Some(us) = opts.fragment_us {
@@ -413,7 +421,7 @@ fn run(
     // 三段声音、或画面 3 段 + 声音 2 段）用全片最大末尾会把少的那一方的后续段
     // 推到对方的末尾之后 —— 产物里那一轨中间整整一段是空的（用户听到的是
     // "合并完中间有几分钟没声音"）。按轨平移下，每条轨都接在自己的上一段末尾，
-    // 各自的 `tfdt` 仍然严格递增（fMP4 的硬要求是**每轨**递增，不是跨轨）。
+    // 各自的 `tfdt` 仍然严格递增（分片封装器的硬要求是**每轨**递增，不是跨轨）。
     let mut track_start_us: HashMap<u32, i64> = HashMap::new();
     let mut track_end_us: HashMap<u32, i64> = HashMap::new();
 
@@ -565,7 +573,7 @@ fn run(
 
         // 段末把剩下的一次性取完，然后**把每条轨各自推到自己的末尾**：
         // 这一段的每一轨都从自己上一段的末尾接着走，`tfdt` 因此严格递增
-        // （倒退会被 fMP4 封装器当场拒绝），而段数不等的那一方也不会被推走。
+        // （倒退会被 MP4 封装器当场拒绝），而段数不等的那一方也不会被推走。
         interleaver.flush();
         while let Some(p) = interleaver.pop() {
             muxer.write(&p)?;
@@ -612,7 +620,7 @@ fn run(
 
 /// 把源轨的一个刻度平移到输出时间轴（段起点 + 段内相对时间）。
 ///
-/// 时基相同时走**纯刻度**路径（最常见的路径：分片与产物都是 fMP4，
+/// 时基相同时走**纯刻度**路径（最常见的路径：分片输入与输出轨时基一模一样，
 /// 时基一模一样），一点精度都不丢；不同时基才经微秒换算。
 fn shift_ticks(
     src_tb: Timebase,
@@ -733,6 +741,7 @@ impl Muxer {
         tracks: &[Track],
         duration_hint_us: Option<i64>,
         edit_onset_us: i64,
+        temp_dir: Option<&std::path::Path>,
         writer: Box<dyn Write + Send>,
     ) -> Result<Self> {
         match container {
@@ -743,6 +752,14 @@ impl Muxer {
             }
             OutputContainer::Fmp4 => {
                 let mut m = Mp4Muxer::with_writer(writer);
+                // 落盘产物用渐进式（普通）MP4：完整 stbl 采样表 + moov 前置。
+                // 分片形态索引在 moof/trun 里，播放器/系统缩略图要扫全文件才能
+                // 建索引（issue #14：打开慢、缩略图不显示）。`stream`（MSE）仍用
+                // 默认的分片模式，不受这里影响。
+                m.set_progressive(true)?;
+                if let Some(dir) = temp_dir {
+                    m.set_temp_dir(dir);
+                }
                 // ⚠️ 必须在 `set_tracks`（写 moov）之前设：编辑列表是 moov 的一部分
                 m.set_edit_onset_us(edit_onset_us);
                 m.set_tracks(tracks)?;
@@ -832,7 +849,7 @@ impl Muxer {
 /// 进度行：`percent` + 已写字节 + 输入总字节 + 媒体时间。
 ///
 /// 分母优先用**输入总字节**：合并是"只搬字节"，产物字节量与输入字节量线性相关，
-/// 而媒体时长在分片式 fMP4 上常常探不出来（`mvhd.duration = 0`）——
+/// 而媒体时长在分片式输入上常常探不出来（`mvhd.duration = 0`）——
 /// 用时长当分母会让进度条永远停在 0。
 fn progress_line(
     media_us: i64,
