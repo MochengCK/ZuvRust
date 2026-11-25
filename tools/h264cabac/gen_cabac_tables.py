@@ -78,7 +78,8 @@ def main():
         rows = [f'    [{vals[2 * i]:4}, {vals[2 * i + 1]:4}]' for i in range(len(vals) // 2)]
         return f'pub const {name}: [[{ty}; 2]; {len(vals) // 2}] = [\n' + ',\n'.join(rows) + '\n];'
 
-    out_src = f'''//! CABAC 的**常量表**（§9.3.1.1 表 9-12 ~ 9-33、§9.3.1.2 表 9-36、§9.3.2.5 表 9-44）。
+    out_src = f'''//! CABAC 的**常量表**（§9.3.1.1 表 9-12 ~ 9-33、表 9-36 的状态转移、表 9-44 的
+//! rangeTabLPS、§9.3.2.5 的 8×8 ctxIdxInc）。
 //!
 //! 这个文件是**生成的**，别手改 —— 见 `tools/h264cabac/gen_cabac_tables.py`。
 //!
@@ -97,7 +98,8 @@ pub const INIT_PB: [[[i8; 2]; 1024]; 3] = [
 {chr(10).join("    [\n" + ",\n".join(f"        [{init_pb[k*2048+2*i]:4}, {init_pb[k*2048+2*i+1]:4}]" for i in range(1024)) + "\n    ]," for k in range(3))}
 ];
 
-/// §9.3.1.2.1 表 9-36 的 `rangeTabLPS[pStateIdx][(codIRange >> 6) & 3]`。
+/// §9.3.1.2.1 表 9-44 的 `rangeTabLPS[pStateIdx][(codIRange >> 6) & 3]`。
+/// 最后一行（pStateIdx 63）四个值都是 2 —— 规范里的特例，别按上一行递减去推。
 pub const RANGE_TAB_LPS: [[u8; 4]; 64] = [
 {chr(10).join("    [" + ", ".join(str(v) for v in range_lps[st]) + "]," for st in range(64))}
 ];
@@ -113,10 +115,10 @@ pub const SWITCH_LPS: [bool; 64] = [
 {chr(10).join("    " + ", ".join(switch[i:i+16]) + "," for i in range(0, 64, 16))}
 ];
 
-/// 表 9-44：8×8 块 `significant_coeff_flag` 的 `ctxIdxInc`（按扫描位置 0..62）。
+/// §9.3.2.5：8×8 块 `significant_coeff_flag` 的 `ctxIdxInc`（按扫描位置 0..62）。
 {table('SIG_OFF_8X8', sig_off_8x8, 16)}
 
-/// 8×8 块 `last_significant_coeff_flag` 的 `ctxIdxInc`（表 9-44 的后半段，按扫描位置 0..62）。
+/// 8×8 块 `last_significant_coeff_flag` 的 `ctxIdxInc`（同一张表的后半段，按扫描位置 0..62）。
 {table('LAST_OFF_8X8', last_off_8x8, 16)}
 '''
     open(out, 'w').write(out_src)

@@ -1,4 +1,5 @@
-//! CABAC 的**常量表**（§9.3.1.1 表 9-12 ~ 9-33、§9.3.1.2 表 9-36、§9.3.2.5 表 9-44）。
+//! CABAC 的**常量表**（§9.3.1.1 表 9-12 ~ 9-33、表 9-36 的状态转移、表 9-44 的
+//! rangeTabLPS、§9.3.2.5 的 8×8 ctxIdxInc）。
 //!
 //! 这个文件是**生成的**，别手改 —— 见 `tools/h264cabac/gen_cabac_tables.py`。
 //!
@@ -4119,7 +4120,8 @@ pub const INIT_PB: [[[i8; 2]; 1024]; 3] = [
     ],
 ];
 
-/// §9.3.1.2.1 表 9-36 的 `rangeTabLPS[pStateIdx][(codIRange >> 6) & 3]`。
+/// §9.3.1.2.1 表 9-44 的 `rangeTabLPS[pStateIdx][(codIRange >> 6) & 3]`。
+/// 最后一行（pStateIdx 63）四个值都是 2 —— 规范里的特例，别按上一行递减去推。
 pub const RANGE_TAB_LPS: [[u8; 4]; 64] = [
     [128, 176, 208, 240],
     [128, 167, 197, 227],
@@ -4215,7 +4217,7 @@ pub const SWITCH_LPS: [bool; 64] = [
     false, false, false, false, false, false, false, false, false, false, false, false, false, false, false, false,
 ];
 
-/// 表 9-44：8×8 块 `significant_coeff_flag` 的 `ctxIdxInc`（按扫描位置 0..62）。
+/// §9.3.2.5：8×8 块 `significant_coeff_flag` 的 `ctxIdxInc`（按扫描位置 0..62）。
 pub const SIG_OFF_8X8: [u8; 63] = [
     0, 1, 2, 3, 4, 5, 5, 4, 4, 3, 3, 4, 4, 4, 5, 5,
     4, 4, 4, 4, 3, 3, 6, 7, 7, 7, 8, 9, 10, 9, 8, 7,
@@ -4223,7 +4225,7 @@ pub const SIG_OFF_8X8: [u8; 63] = [
     12, 13, 11, 6, 9, 14, 10, 9, 11, 12, 13, 11, 14, 10, 12,
 ];
 
-/// 8×8 块 `last_significant_coeff_flag` 的 `ctxIdxInc`（表 9-44 的后半段，按扫描位置 0..62）。
+/// 8×8 块 `last_significant_coeff_flag` 的 `ctxIdxInc`（同一张表的后半段，按扫描位置 0..62）。
 pub const LAST_OFF_8X8: [u8; 63] = [
     0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
     2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2, 2,

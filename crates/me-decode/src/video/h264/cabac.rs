@@ -254,10 +254,14 @@ mod tests {
 
     #[test]
     fn p_state_tables_are_the_spec_ones() {
-        // 表 9-36 的头两行与最后一行，肉眼可查
+        // 表 9-44（rangeTabLPS）的头两行与最后两行，肉眼可查
         assert_eq!(RANGE_TAB_LPS[0], [128, 176, 208, 240]);
         assert_eq!(RANGE_TAB_LPS[1], [128, 167, 197, 227]);
-        assert_eq!(RANGE_TAB_LPS[63], [5, 6, 8, 9]);
+        assert_eq!(RANGE_TAB_LPS[62], [6, 7, 8, 9]);
+        // ⚠️ 最后一行（pStateIdx 63）是规范里的特例：四个 range 档全是 2，
+        // 不按上一行的递减规律走。ffmpeg 的 ff_h264_cabac_tables 也是 2,2,2,2
+        // —— 曾经按"5,6,8,9"写成测试期望，把正确的表判成了红的。
+        assert_eq!(RANGE_TAB_LPS[63], [2, 2, 2, 2]);
         assert_eq!(NEXT_MPS[0], 1);
         assert_eq!(NEXT_MPS[62], 62);
         assert_eq!(NEXT_LPS[0], 0);
