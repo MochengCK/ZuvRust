@@ -172,6 +172,7 @@ fn parse_decode_mode(me_decode: Option<&str>, no_hw: bool) -> DecodeMode {
 ///
 /// 宿主用它如实显示"硬件解码"开关：能硬解才点亮，只能软解就置灰。
 /// 不要拿编码名字去猜 —— AV1 在 Intel Mac 上没有硬解，猜会把开关做成假的。
+#[cfg(feature = "video")]
 pub fn hardware_decode_supported(codec: CodecId) -> bool {
     #[cfg(target_os = "macos")]
     {
