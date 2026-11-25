@@ -167,7 +167,7 @@ dependencies = [
 
 [[package]]
 name = "me-bt"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "getrandom 0.3.4",
  "me-core",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "me-capi"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "me-container",
  "me-core",
@@ -191,7 +191,7 @@ dependencies = [
 
 [[package]]
 name = "me-cli"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "me-container",
  "me-core",
@@ -206,7 +206,7 @@ dependencies = [
 
 [[package]]
 name = "me-container"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "me-core",
  "serde",
@@ -214,7 +214,7 @@ dependencies = [
 
 [[package]]
 name = "me-core"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "serde",
  "thiserror",
@@ -222,7 +222,7 @@ dependencies = [
 
 [[package]]
 name = "me-decode"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "me-core",
  "tracing",
@@ -230,7 +230,7 @@ dependencies = [
 
 [[package]]
 name = "me-mux"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "me-container",
  "me-core",
@@ -239,7 +239,7 @@ dependencies = [
 
 [[package]]
 name = "me-net"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "me-core",
  "serde",
@@ -249,7 +249,7 @@ dependencies = [
 
 [[package]]
 name = "me-stream"
-version = "0.2.1"
+version = "0.2.2"
 dependencies = [
  "me-container",
  "me-core",
