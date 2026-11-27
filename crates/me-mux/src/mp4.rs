@@ -153,6 +153,12 @@ struct EsTrack {
     sample_dts: Vec<i64>,
     /// 渐进式模式下攒的全部采样元数据（数据在暂存文件里）。
     prog_samples: Vec<ProgSample>,
+    /// 渐进式模式：本轨**第一条采样**的 dts（相对封装器基准，可能为负）。
+    ///
+    /// `stbl` 没有"轨起始偏移"字段：采样表天然从 0 开始，所以这条轨在电影时间轴
+    /// 上的真实起点只能靠 `edts/elst` 的**空编辑**补回来（见 `finish_progressive`）。
+    /// 少写这一步，晚开始的那条轨（通常是音频）会比画面早若干毫秒。
+    prog_first_dts: Option<i64>,
     /// 本分片第一条采样的 dts（写 `tfdt` 用）。
     frag_start_dts: Option<i64>,
     /// 本分片最后一条采样的结束时间（刻度）。分片边界按它算。
@@ -431,6 +437,7 @@ impl Mp4Muxer {
                 samples: Vec::new(),
                 sample_dts: Vec::new(),
                 prog_samples: Vec::new(),
+                prog_first_dts: None,
                 frag_start_dts: None,
                 frag_end_dts: 0,
                 next_dts: None,
@@ -501,6 +508,9 @@ impl Mp4Muxer {
             let offset = payload.len;
             payload.write(&data)?;
             let t = &mut self.tracks[idx];
+            if t.prog_first_dts.is_none() {
+                t.prog_first_dts = Some(dts);
+            }
             t.prog_samples.push(ProgSample {
                 offset,
                 size: data.len() as u32,
@@ -587,17 +597,30 @@ impl Mp4Muxer {
         let mdat_header = mdat_header_len(payload_len);
         let moov_base = self.sink.bytes_written();
 
+        // 电影时间轴的零点：所有轨里**最早的**第一条采样 dts。
+        //
+        // 为什么不用封装器基准（`base_us`）：它由第一条写进来的采样决定，而交织顺序
+        // 取决于 dts —— 带 B 帧的视频 dts 比音频早 80 ms，基准于是变成视频的 dts，
+        // 音频在电影时间轴上就"晚 80 ms 开始"。这个偏移必须由 `elst` 空编辑补回来，
+        // 否则 MP4 里画面比声音晚 80 ms（mkv / ts 因为如实保留时间戳不受影响）。
+        let start_ref = self
+            .tracks
+            .iter()
+            .filter_map(|t| t.prog_first_dts)
+            .min()
+            .unwrap_or(0);
+
         // 先按"不含 moov"的粗略上界判断是否必须用 co64，再用真实 moov 长度复核
         //（stco 只有 32 位，产物越过 4 GiB 时必须换 co64）。
         let mut co64 = moov_base + mdat_header + payload_len > u32::MAX as u64;
-        let mut moov_len = self.build_progressive_moov(co64, 0)?.len();
+        let mut moov_len = self.build_progressive_moov(co64, 0, start_ref)?.len();
         if !co64 && moov_base + moov_len as u64 + mdat_header + payload_len > u32::MAX as u64 {
             co64 = true;
-            moov_len = self.build_progressive_moov(true, 0)?.len();
+            moov_len = self.build_progressive_moov(true, 0, start_ref)?.len();
         }
 
         let chunk_base = moov_base + moov_len as u64 + mdat_header;
-        let moov = self.build_progressive_moov(co64, chunk_base)?;
+        let moov = self.build_progressive_moov(co64, chunk_base, start_ref)?;
         if moov.len() != moov_len {
             // stco/co64 都是定长表项，换数值不该改变盒子长度；变了说明某个字段
             // 被写成了变长 —— 宁可不写，也不产出一个索引错位的文件。
@@ -622,19 +645,38 @@ impl Mp4Muxer {
     ///
     /// `chunk_base` 是 mdat 载荷第一个字节的绝对文件偏移；每条采样各自成一个
     /// chunk（交织后的同轨采样通常不连续，按采样建 chunk 是唯一不会写错的形态）。
-    fn build_progressive_moov(&self, co64: bool, chunk_base: u64) -> Result<Vec<u8>> {
+    /// `start_ref` 是电影时间轴零点（所有轨里最早的第一条采样 dts），比它晚开始的
+    /// 轨靠 `edts/elst` 空编辑补齐偏移。
+    fn build_progressive_moov(
+        &self,
+        co64: bool,
+        chunk_base: u64,
+        start_ref: i64,
+    ) -> Result<Vec<u8>> {
         let movie_ts = 1000u32;
-        let durations: Vec<(i64, i64)> = self
+        let timings: Vec<TrackTiming> = self
             .tracks
             .iter()
             .map(|t| {
-                let media_end = t.prog_media_end_ticks();
-                let presented = (media_end - t.edit_onset_ticks).max(0);
-                let movie = ticks_to_movie(t.track.timebase, presented, movie_ts);
-                (media_end, movie)
+                let first = t.prog_first_dts.unwrap_or(0);
+                // 采样表从 0 开始：媒体时长必须按**本轨自己的**第一条采样量，
+                // 不能用封装器基准（差的就是 first − base 那一段）。
+                let media_len = (t.prog_media_end_ticks() - first).max(0);
+                let onset = t.edit_onset_ticks.clamp(0, media_len);
+                let delay_ticks = (first - start_ref).max(0);
+                TrackTiming {
+                    media_len,
+                    onset,
+                    delay_movie: ticks_to_movie(t.track.timebase, delay_ticks, movie_ts),
+                    presented_movie: ticks_to_movie(t.track.timebase, media_len - onset, movie_ts),
+                }
             })
             .collect();
-        let movie_duration = durations.iter().map(|(_, m)| *m).max().unwrap_or(0);
+        let movie_duration = timings
+            .iter()
+            .map(|t| t.delay_movie + t.presented_movie)
+            .max()
+            .unwrap_or(0);
 
         let mut w = ByteWriter::with_capacity(
             1024 + self.tracks.iter().map(|t| t.prog_samples.len()).sum::<usize>() * 24,
@@ -643,8 +685,7 @@ impl Mp4Muxer {
         write_mvhd_progressive(&mut w, movie_ts, movie_duration);
         for (i, t) in self.tracks.iter().enumerate() {
             let track_id = (i + 1) as u32;
-            let (media_end, movie_duration) = durations[i];
-            self.write_trak_progressive(&mut w, t, track_id, media_end, movie_duration, co64, chunk_base)?;
+            self.write_trak_progressive(&mut w, t, track_id, &timings[i], co64, chunk_base)?;
         }
         box_close(&mut w, moov_at);
         Ok(w.into_vec())
@@ -656,32 +697,15 @@ impl Mp4Muxer {
         w: &mut ByteWriter,
         t: &EsTrack,
         track_id: u32,
-        media_end_ticks: i64,
-        presented_movie_ticks: i64,
+        timing: &TrackTiming,
         co64: bool,
         chunk_base: u64,
     ) -> Result<()> {
         let trak_at = box_open(w, b"trak");
-        write_tkhd_progressive(w, t, track_id, presented_movie_ticks);
-        if t.edit_onset_ticks > 0 {
-            let edts_at = box_open(w, b"edts");
-            let big = presented_movie_ticks > u32::MAX as i64;
-            let elst_at = full_box_open(w, b"elst", if big { 1 } else { 0 }, 0);
-            w.u32_be(1);
-            if big {
-                w.u64_be(presented_movie_ticks as u64);
-                w.u64_be(t.edit_onset_ticks as u64);
-            } else {
-                w.u32_be(presented_movie_ticks.max(0) as u32);
-                w.u32_be(t.edit_onset_ticks as u32);
-            }
-            w.u16_be(1);
-            w.u16_be(0);
-            box_close(w, elst_at);
-            box_close(w, edts_at);
-        }
+        write_tkhd_progressive(w, t, track_id, timing.delay_movie + timing.presented_movie);
+        write_edts_progressive(w, timing);
         let mdia_at = box_open(w, b"mdia");
-        write_mdhd_progressive(w, t, media_end_ticks);
+        write_mdhd_progressive(w, t, timing.media_len);
         write_hdlr(w, t);
         let minf_at = box_open(w, b"minf");
         match t.track.kind {
@@ -1156,6 +1180,66 @@ fn write_mvhd_progressive(w: &mut ByteWriter, timescale: u32, duration: i64) {
     }
     w.u32_be(0xFFFF_FFFF); // next_track_ID
     box_close(w, at);
+}
+
+/// 渐进式产物里一条轨的时间信息（时长用电影时基，媒体时长用本轨时基）。
+struct TrackTiming {
+    /// 媒体时长（本轨刻度）：从这条轨**自己的**第一条采样算起。
+    media_len: i64,
+    /// 片段裁剪要跳过的媒体起点（本轨刻度）。
+    onset: i64,
+    /// 空编辑时长（电影刻度）：这条轨比时间轴零点晚开始多少。
+    delay_movie: i64,
+    /// 实际呈现时长（电影刻度）。
+    presented_movie: i64,
+}
+
+/// 渐进式的 `edts/elst`：**空编辑**（晚开始多少）+ 正片编辑（从媒体的哪一点开始播）。
+///
+/// 为什么需要空编辑：`stbl` 的采样表没有"轨起始偏移"字段，媒体天然从 0 开始。
+/// 合并时如果这条轨的第一条采样比别的轨晚（带 B 帧的视频 dts 为负，基准被它拉走，
+/// 音频于是"晚 80 ms 开始"），不写空编辑就会让音频在 MP4 里比画面早 80 ms ——
+/// 也就是用户听到的"声音比画面快半拍"。mkv / ts / flv 如实保留时间戳，没有这个问题。
+///
+/// ⚠️ 空编辑后面**必须**再跟一条正片编辑：编辑列表是这条轨在电影时间轴上的**完整**
+/// 描述，只写空编辑等于"这条轨什么都不播"（实测 PyAV/ffmpeg 直接解不出任何音频包）。
+fn write_edts_progressive(w: &mut ByteWriter, timing: &TrackTiming) {
+    let delay = timing.delay_movie > 0;
+    let trim = timing.onset > 0;
+    if !delay && !trim {
+        return;
+    }
+    let big = timing.delay_movie > u32::MAX as i64
+        || timing.presented_movie > u32::MAX as i64
+        // v0 的 media_time 是有符号 32 位：超过 i32 就得换 v1，否则写出来是负数
+        || timing.onset > i32::MAX as i64;
+    let edts_at = box_open(w, b"edts");
+    let elst_at = full_box_open(w, b"elst", if big { 1 } else { 0 }, 0);
+    w.u32_be(if delay { 2 } else { 1 });
+    if delay {
+        // media_time = -1（无符号位全 1）：这段时长里什么都不播
+        if big {
+            w.u64_be(timing.delay_movie as u64);
+            w.u64_be(u64::MAX);
+        } else {
+            w.u32_be(timing.delay_movie as u32);
+            w.u32_be(u32::MAX);
+        }
+        w.u16_be(1);
+        w.u16_be(0);
+    }
+    // 正片：从媒体的 `onset` 开始播 `presented_movie`
+    if big {
+        w.u64_be(timing.presented_movie as u64);
+        w.u64_be(timing.onset as u64);
+    } else {
+        w.u32_be(timing.presented_movie as u32);
+        w.u32_be(timing.onset as u32);
+    }
+    w.u16_be(1);
+    w.u16_be(0);
+    box_close(w, elst_at);
+    box_close(w, edts_at);
 }
 
 fn write_tkhd_progressive(w: &mut ByteWriter, t: &EsTrack, track_id: u32, duration: i64) {
@@ -2277,6 +2361,109 @@ mod tests {
         let mut d = Mp4Demuxer::new(src, "mem").unwrap();
         let p = d.next_packet().unwrap().unwrap();
         assert_eq!(p.pts, 2000, "ctts 的合成偏移必须还原");
+    }
+
+    #[test]
+    fn progressive_late_starting_track_gets_empty_edit() {
+        // 模拟真实合并：带 B 帧的视频 dts 是负的（-80 ms），基准被它拉走，
+        // 音频在电影时间轴上于是"晚 80 ms 开始"。stbl 表达不了这个偏移，
+        // 必须写 `elst` 空编辑 —— 否则 MP4 里声音比画面早 80 ms。
+        let mut m = Mp4Muxer::new();
+        m.set_progressive(true).unwrap();
+        m.set_tracks(&[video_track(), audio_track()]).unwrap();
+        for i in 0..5 {
+            let dts = -2400 + i * 1000; // 30_000 时基 → 80 ms 解码延迟
+            let mut p = video_packet(dts, i == 0);
+            p.pts = dts + 2400; // 首帧呈现时间 = 0
+            m.write_packet(&p).unwrap();
+        }
+        for i in 0..5 {
+            m.write_packet(&audio_packet(i * 1024)).unwrap();
+        }
+        let data = m.finish().unwrap();
+
+        // 只有音频轨需要空编辑（视频的 dts 就是基准）
+        let moov = {
+            let (_, at) = top_level_boxes(&data).into_iter().find(|(k, _)| k == b"moov").unwrap();
+            let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+            &data[at..at + size]
+        };
+        assert_eq!(
+            moov.windows(4).filter(|w| *w == b"edts").count(),
+            1,
+            "只有晚开始的那条轨才写编辑列表"
+        );
+
+        let elst = moov_box(&data, b"elst").expect("晚开始的轨必须有 elst");
+        let count = u32::from_be_bytes(elst[12..16].try_into().unwrap());
+        assert_eq!(count, 2, "空编辑 + 正片编辑（只写空编辑等于这条轨不播）");
+        let delay = u32::from_be_bytes(elst[16..20].try_into().unwrap());
+        let media_time = u32::from_be_bytes(elst[20..24].try_into().unwrap());
+        assert_eq!(delay, 80, "空编辑时长必须是 80 ms（电影时基 1000）");
+        assert_eq!(media_time, u32::MAX, "空编辑的 media_time 必须写 -1");
+        let play_media_time = u32::from_be_bytes(elst[32..36].try_into().unwrap());
+        assert_eq!(play_media_time, 0, "正片编辑从媒体的 0 开始播");
+
+        // 解回来：两轨的呈现起点必须都在 80 ms（源里视频 pts 0 / 音频 dts 0）
+        let src: Arc<dyn ReadAt> = Arc::new(Cursor::new(data));
+        let mut d = Mp4Demuxer::new(src, "mem").unwrap();
+        let mut first = std::collections::HashMap::new();
+        while let Some(p) = d.next_packet().unwrap() {
+            first.entry(p.track_id).or_insert(p.pts);
+        }
+        assert_eq!(first[&1], 2400, "视频首帧呈现时间（30_000 时基）= 80 ms");
+        assert_eq!(first[&2], 3528, "音频首帧呈现时间（44_100 时基）= 80 ms");
+
+        // 片段裁剪 + 晚开始：两条编辑，**空编辑必须在前**（先等 80 ms，再从切点播）
+        let mut m = Mp4Muxer::new();
+        m.set_progressive(true).unwrap();
+        m.set_edit_onset_us(1_000_000);
+        m.set_tracks(&[video_track(), audio_track()]).unwrap();
+        for i in 0..90 {
+            let dts = -2400 + i * 1000;
+            let mut p = video_packet(dts, i == 0);
+            p.pts = dts + 2400;
+            m.write_packet(&p).unwrap();
+        }
+        for i in 0..90 {
+            m.write_packet(&audio_packet(i * 1024)).unwrap();
+        }
+        let data = m.finish().unwrap();
+        let (_, at) = top_level_boxes(&data).into_iter().find(|(k, _)| k == b"moov").unwrap();
+        let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+        let moov = &data[at..at + size];
+        let mut combined = 0;
+        for (i, w) in moov.windows(4).enumerate() {
+            if w != b"elst" {
+                continue;
+            }
+            let count = u32::from_be_bytes(moov[i + 8..i + 12].try_into().unwrap());
+            if count == 2 {
+                // 第一条必须是空编辑（时长 80 ms、media_time = -1）
+                let d = u32::from_be_bytes(moov[i + 12..i + 16].try_into().unwrap());
+                let mt = u32::from_be_bytes(moov[i + 16..i + 20].try_into().unwrap());
+                assert_eq!((d, mt), (80, u32::MAX), "空编辑必须在裁剪编辑之前");
+                // 第二条从媒体的 1 秒处开始播
+                let mt2 = u32::from_be_bytes(moov[i + 28..i + 32].try_into().unwrap());
+                assert_eq!(mt2, 44_100);
+                combined += 1;
+            }
+        }
+        assert_eq!(combined, 1, "音频轨必须是「空编辑 + 裁剪」两条");
+    }
+
+    #[test]
+    fn progressive_tracks_starting_together_write_no_edts() {
+        // 两条轨都从 0 起：不该多写 edts（多余的空编辑会被某些播放器当成延迟）
+        let mut m = Mp4Muxer::new();
+        m.set_progressive(true).unwrap();
+        m.set_tracks(&[video_track(), audio_track()]).unwrap();
+        for i in 0..5 {
+            m.write_packet(&video_packet(i * 1000, i == 0)).unwrap();
+            m.write_packet(&audio_packet(i * 1024)).unwrap();
+        }
+        let data = m.finish().unwrap();
+        assert!(moov_box(&data, b"elst").is_none(), "没有偏移时不该写编辑列表");
     }
 
     #[test]
