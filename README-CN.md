@@ -101,8 +101,15 @@ ADTS、MPEG 音频。
 | `.mkv` `.mka` | Matroska | 上面全部 |
 | `.webm` | WebM 子集 | VP8 / VP9 / AV1 + Opus |
 | `.ts` `.m2ts` | MPEG-TS | H.264 / H.265 + AAC / MP3 / AC-3 |
+| `.flv` | FLV | H.264 + AAC / MP3 |
+| `.ogg` `.oga` `.opus` | Ogg | 仅 Opus |
+| `.mp3` | 裸 MPEG 音频 | 仅 MP3 |
 | `.flac` | 裸 FLAC | 仅 FLAC |
 | `.aac` | 裸 ADTS | 仅 AAC |
+
+FLV 目前**只能写**：`probe` / `play` 还不认它，产物可以用别的播放器打开，
+但引擎自己读不回来。Ogg 产物不做末帧裁剪（end trimming），解码出来的尾部
+最多比源多一个包的样本（≤ 120 ms）。
 
 **协议**：HTTP(S)、HLS、DASH。
 

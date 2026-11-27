@@ -5,7 +5,8 @@
 //!
 //! - **谁来当画面、谁来当声音由引擎探测决定**，不靠调用方传 `-map`，
 //!   也不靠文件名猜（`xxx-1-30080.m4s` 与 `xxx_1.m4s` 都得能用）；
-//! - **输出容器由文件扩展名决定**（`.ts` / `.mp4`），不支持就报错；
+//! - **输出容器由文件扩展名决定**（`.ts` / `.mp4` / `.mkv` / `.flv` / `.ogg` …），
+//!   不支持就报错；
 //! - 进度按"已写字节 / 输入总字节"上报（只搬字节的任务里这是最准的即时进度），
 //!   同时带上媒体时间，宿主画进度条用得上；
 //! - 只搬字节，**不重编码**：输入编解码器不被目标容器支持时报错，
@@ -38,7 +39,10 @@ use std::sync::Arc;
 
 use me_container::Demuxer;
 use me_core::{CodecId, MediaError, MediaInfo, MediaKind, Packet, ReadAt, Result, Timebase, Track};
-use me_mux::{AdtsMuxer, FlacMuxer, Interleaver, MkvMuxer, Mp4Muxer, TsMuxer};
+use me_mux::{
+    AdtsMuxer, FlacMuxer, FlvMuxer, Interleaver, MkvMuxer, Mp3Muxer, Mp4Muxer, OggOpusMuxer,
+    TsMuxer,
+};
 
 use crate::progress::Progress;
 
@@ -54,6 +58,12 @@ pub enum OutputContainer {
     Flac,
     /// `.aac`：裸 ADTS，只能装 AAC 声音。
     Adts,
+    /// `.ogg` / `.oga` / `.opus`：Ogg 容器，目前只装 Opus 声音。
+    Ogg,
+    /// `.mp3`：裸 MPEG 音频，只能装 MP3 声音。
+    Mp3,
+    /// `.flv`：FLV，H.264 画面 + AAC / MP3 声音。
+    Flv,
 }
 
 impl OutputContainer {
@@ -69,9 +79,12 @@ impl OutputContainer {
             "webm" => Ok(OutputContainer::WebM),
             "flac" => Ok(OutputContainer::Flac),
             "aac" | "adts" => Ok(OutputContainer::Adts),
+            "ogg" | "oga" | "opus" => Ok(OutputContainer::Ogg),
+            "mp3" => Ok(OutputContainer::Mp3),
+            "flv" => Ok(OutputContainer::Flv),
             other => Err(MediaError::Unsupported(format!(
                 "不认识的输出容器 `.{other}`（支持 .ts / .mp4 / .m4s / .mov / .mkv / .mka / \
-                 .webm / .flac / .aac）"
+                 .webm / .flv / .ogg / .opus / .mp3 / .flac / .aac）"
             ))),
         }
     }
@@ -84,15 +97,21 @@ impl OutputContainer {
             OutputContainer::WebM => "webm",
             OutputContainer::Flac => "flac",
             OutputContainer::Adts => "adts",
+            OutputContainer::Ogg => "ogg",
+            OutputContainer::Mp3 => "mp3",
+            OutputContainer::Flv => "flv",
         }
     }
 
-    /// 这个容器本身**只能装声音**（`.flac` / `.aac`）。
+    /// 这个容器本身**只能装声音**（`.flac` / `.aac` / `.ogg` / `.mp3`）。
     ///
     /// 裸音频流没有"轨"的概念，画面根本无处安放 ⇒ 遇到这类产物自动丢掉画面，
     /// 而不是要求调用方先传 `--audio-only`（宿主并没有暴露那个开关）。
     fn audio_only(self) -> bool {
-        matches!(self, OutputContainer::Flac | OutputContainer::Adts)
+        matches!(
+            self,
+            OutputContainer::Flac | OutputContainer::Adts | OutputContainer::Ogg | OutputContainer::Mp3
+        )
     }
 }
 
@@ -231,7 +250,8 @@ fn run(
     // 「只留声音 / 只留画面」：把不要的那一路整个摘掉 —— 下游（输出轨、分段、
     // 采样映射）都是按这两个列表推的，摘掉即生效；未被映射的采样会被自然跳过。
     //
-    // `.flac` / `.aac` 这类**裸音频流**容器本身装不下画面，这里直接按"只留声音"处理：
+    // `.flac` / `.aac` / `.ogg` / `.mp3` 这类**只能装声音的产物**本身装不下画面，
+    // 这里直接按"只留声音"处理：
     // 不这么做，用户选个 .aac 就会被 check_codec_support 以"装不下 video"拒掉，
     // 而"提取音轨"恰恰是他想要的。
     let tracks = if container.audio_only() {
@@ -695,6 +715,15 @@ fn check_codec_support(container: OutputContainer, tracks: &[Track]) -> Result<(
             // 裸流：只能装一条，且编码必须完全对得上
             OutputContainer::Flac => t.kind == MediaKind::Audio && t.codec == CodecId::Flac,
             OutputContainer::Adts => t.kind == MediaKind::Audio && t.codec == CodecId::Aac,
+            // Ogg 产物目前只接了 Opus（引擎没有 Vorbis/Theora 的封装）
+            OutputContainer::Ogg => t.kind == MediaKind::Audio && t.codec == CodecId::Opus,
+            OutputContainer::Mp3 => t.kind == MediaKind::Audio && t.codec == CodecId::Mp3,
+            // FLV：H.264 + AAC / MP3（H.265 要走 Enhanced FLV，没做；VP9/AV1 规范里也没有）
+            OutputContainer::Flv => match t.kind {
+                MediaKind::Video => t.codec == CodecId::H264,
+                MediaKind::Audio => matches!(t.codec, CodecId::Aac | CodecId::Mp3),
+                _ => false,
+            },
         };
         if !ok {
             return Err(MediaError::Unsupported(format!(
@@ -707,13 +736,21 @@ fn check_codec_support(container: OutputContainer, tracks: &[Track]) -> Result<(
                         "（WebM 只允许 VP8 / VP9 / AV1 画面与 Opus 声音，换 .mkv 或 .mp4）",
                     OutputContainer::Flac => "（裸 FLAC 只装 FLAC 声音，换 .mkv / .mp4 / .mka）",
                     OutputContainer::Adts => "（裸 ADTS 只装 AAC 声音，换 .m4a / .mkv）",
+                    OutputContainer::Ogg => "（Ogg 只装 Opus 声音，换 .mka / .mp4 / .m4a）",
+                    OutputContainer::Mp3 => "（裸 MP3 只装 MP3 声音，换 .m4a / .mka / .mp4）",
+                    OutputContainer::Flv =>
+                        "（FLV 只装 H.264 画面与 AAC / MP3 声音，换 .mkv / .mp4）",
                     _ => "",
                 }
             )));
         }
     }
     // 裸流装不下第二条轨（产物里没有"轨"的概念，第二条只会是坏文件）
-    if matches!(container, OutputContainer::Flac | OutputContainer::Adts) && tracks.len() > 1 {
+    if matches!(
+        container,
+        OutputContainer::Flac | OutputContainer::Adts | OutputContainer::Ogg | OutputContainer::Mp3
+    ) && tracks.len() > 1
+    {
         return Err(MediaError::Unsupported(format!(
             "{} 只能装一条声音轨，这里有 {} 条",
             container.name(),
@@ -731,6 +768,9 @@ enum Muxer {
     Ts(TsMuxer),
     Mp4(Mp4Muxer),
     Mkv(MkvMuxer),
+    Flv(FlvMuxer),
+    Ogg(OggOpusMuxer),
+    Mp3(Mp3Muxer),
     Flac(FlacMuxer),
     Adts(AdtsMuxer),
 }
@@ -786,13 +826,31 @@ impl Muxer {
                 m.set_tracks(tracks)?;
                 Ok(Muxer::Adts(m))
             }
+            OutputContainer::Ogg => {
+                let mut m = OggOpusMuxer::with_writer(writer);
+                m.set_tracks(tracks)?;
+                Ok(Muxer::Ogg(m))
+            }
+            OutputContainer::Mp3 => {
+                let mut m = Mp3Muxer::with_writer(writer);
+                m.set_tracks(tracks)?;
+                Ok(Muxer::Mp3(m))
+            }
+            OutputContainer::Flv => {
+                let mut m = FlvMuxer::with_writer(writer);
+                // ⚠️ 必须在 `set_tracks`（它会写出 `onMetaData`）之前设好
+                m.set_duration_hint_us(duration_hint_us);
+                m.set_tracks(tracks)?;
+                Ok(Muxer::Flv(m))
+            }
         }
     }
 
-    /// 分片/簇的目标时长（微秒）。TS 与裸音频流没有分片概念，忽略。
+    /// 分片/簇的目标时长（微秒）。TS、FLV 与裸音频流没有分片概念，忽略。
     fn set_fragment_us(&mut self, us: i64) {
         match self {
-            Muxer::Ts(_) | Muxer::Flac(_) | Muxer::Adts(_) => {}
+            Muxer::Ts(_) | Muxer::Flv(_) | Muxer::Ogg(_) | Muxer::Mp3(_) | Muxer::Flac(_)
+            | Muxer::Adts(_) => {}
             Muxer::Mp4(m) => m.set_fragment_duration_us(us),
             Muxer::Mkv(m) => m.set_cluster_duration_us(us),
         }
@@ -803,6 +861,9 @@ impl Muxer {
             Muxer::Ts(m) => m.write_packet(p),
             Muxer::Mp4(m) => m.write_packet(p),
             Muxer::Mkv(m) => m.write_packet(p),
+            Muxer::Flv(m) => m.write_packet(p),
+            Muxer::Ogg(m) => m.write_packet(p),
+            Muxer::Mp3(m) => m.write_packet(p),
             Muxer::Flac(m) => m.write_packet(p),
             Muxer::Adts(m) => m.write_packet(p),
         }
@@ -814,6 +875,9 @@ impl Muxer {
             Muxer::Ts(m) => m.bytes_written(),
             Muxer::Mp4(m) => m.bytes_written(),
             Muxer::Mkv(m) => m.bytes_written(),
+            Muxer::Flv(m) => m.bytes_written(),
+            Muxer::Ogg(m) => m.bytes_written(),
+            Muxer::Mp3(m) => m.bytes_written(),
             Muxer::Flac(m) => m.bytes_written(),
             Muxer::Adts(m) => m.bytes_written(),
         }
@@ -831,6 +895,18 @@ impl Muxer {
                 Ok(m.bytes_written())
             }
             Muxer::Mkv(mut m) => {
+                m.finish()?;
+                Ok(m.bytes_written())
+            }
+            Muxer::Flv(mut m) => {
+                m.finish()?;
+                Ok(m.bytes_written())
+            }
+            Muxer::Ogg(mut m) => {
+                m.finish()?;
+                Ok(m.bytes_written())
+            }
+            Muxer::Mp3(mut m) => {
                 m.finish()?;
                 Ok(m.bytes_written())
             }
@@ -1307,6 +1383,11 @@ mod tests {
         assert_eq!(OutputContainer::from_path("a.mp4").unwrap(), OutputContainer::Fmp4);
         assert_eq!(OutputContainer::from_path("a.M4S").unwrap(), OutputContainer::Fmp4);
         assert_eq!(OutputContainer::from_path("a.ts").unwrap(), OutputContainer::MpegTs);
+        assert_eq!(OutputContainer::from_path("a.flv").unwrap(), OutputContainer::Flv);
+        assert_eq!(OutputContainer::from_path("a.ogg").unwrap(), OutputContainer::Ogg);
+        assert_eq!(OutputContainer::from_path("a.OPUS").unwrap(), OutputContainer::Ogg);
+        assert_eq!(OutputContainer::from_path("a.oga").unwrap(), OutputContainer::Ogg);
+        assert_eq!(OutputContainer::from_path("a.mp3").unwrap(), OutputContainer::Mp3);
         assert!(OutputContainer::from_path("a.avi").is_err());
     }
 

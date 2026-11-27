@@ -9,7 +9,7 @@ use std::path::Path;
 use std::process::Command;
 
 use me_core::{CodecId, MediaKind, Packet, Timebase, Track};
-use me_mux::Mp4Muxer;
+use me_mux::{Mp3Muxer, Mp4Muxer, OggOpusMuxer};
 
 /// 引擎二进制（Cargo 为 bin target 注入的路径）。
 const BIN: &str = env!("CARGO_BIN_EXE_zuvrust");
@@ -395,6 +395,206 @@ fn a_single_input_is_a_valid_remux() {
     let (ok, stdout, stderr) = run(&["remux", out.to_str().unwrap(), v.to_str().unwrap(), "--json"]);
     assert!(ok, "单输入换容器应当成功，stderr={stderr}");
     assert!(stdout.contains("\"container\":\"mpeg-ts\""), "目标容器应当是 mpeg-ts：{stdout}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+// ───────────────────────── 新增容器：Ogg / MP3 / FLV ─────────────────────────
+
+fn opus_track() -> Track {
+    let mut t = Track::new(1, MediaKind::Audio, CodecId::Opus, Timebase::new(48_000));
+    t.sample_rate = 48_000;
+    t.channels = 2;
+    let mut ed = b"OpusHead".to_vec();
+    ed.push(1); // version
+    ed.push(2); // channels
+    ed.extend_from_slice(&312u16.to_le_bytes()); // pre-skip
+    ed.extend_from_slice(&48_000u32.to_le_bytes());
+    ed.extend_from_slice(&0i16.to_le_bytes());
+    ed.push(0); // mapping family
+    t.extradata = ed;
+    t
+}
+
+/// 20 ms 的 Opus 包（TOC：config 1 = SILK 20 ms、单帧）。
+fn opus_packet(dts: i64) -> Packet {
+    Packet::new(1, dts, dts, 960, vec![0x08, 0x11, 0x22, 0x33])
+}
+
+fn write_opus_ogg(path: &Path, frames: usize) {
+    let mut m = OggOpusMuxer::new();
+    m.set_tracks(&[opus_track()]).unwrap();
+    for i in 0..frames {
+        m.write_packet(&opus_packet(i as i64 * 960)).unwrap();
+    }
+    std::fs::write(path, m.finish().unwrap()).unwrap();
+}
+
+fn mp3_track() -> Track {
+    let mut t = Track::new(1, MediaKind::Audio, CodecId::Mp3, Timebase::new(44_100));
+    t.sample_rate = 44_100;
+    t.channels = 2;
+    t
+}
+
+fn mp3_frame(fill: u8) -> Vec<u8> {
+    let mut v = vec![0xFF, 0xFB, 0x90, 0x00];
+    v.resize(417, fill);
+    v
+}
+
+fn write_mp3(path: &Path, frames: usize) {
+    let mut m = Mp3Muxer::new();
+    m.set_tracks(&[mp3_track()]).unwrap();
+    for i in 0..frames {
+        let f = mp3_frame(i as u8);
+        m.write_packet(&Packet::new(1, i as i64 * 1152, i as i64 * 1152, 1152, f))
+            .unwrap();
+    }
+    std::fs::write(path, m.finish().unwrap()).unwrap();
+}
+
+/// 逐 Tag 走一遍 FLV（顺带断言 `PreviousTagSize` 与文件长度自洽）。
+fn flv_tags(data: &[u8]) -> Vec<(u8, Vec<u8>)> {
+    assert_eq!(&data[..3], b"FLV", "FLV 必须以魔数开头");
+    let mut pos = 13usize;
+    let mut out = Vec::new();
+    while pos < data.len() {
+        let ty = data[pos];
+        let size = ((data[pos + 1] as usize) << 16)
+            | ((data[pos + 2] as usize) << 8)
+            | data[pos + 3] as usize;
+        assert!(pos + 11 + size + 4 <= data.len(), "Tag 越界（结构坏了）");
+        let prev = u32::from_be_bytes(data[pos + 11 + size..pos + 15 + size].try_into().unwrap());
+        assert_eq!(prev as usize, 11 + size, "PreviousTagSize 必须 = 11 + DataSize");
+        out.push((ty, data[pos + 11..pos + 11 + size].to_vec()));
+        pos += 11 + size + 4;
+    }
+    assert_eq!(pos, data.len(), "产物末尾不该有悬空字节");
+    out
+}
+
+#[test]
+fn ogg_output_holds_opus_and_probes_back() {
+    let dir = tmp_dir("ogg-out");
+    let src = dir.join("src.opus");
+    write_opus_ogg(&src, 50);
+    let out = dir.join("out.ogg");
+
+    let (ok, stdout, stderr) = run(&[
+        "mux",
+        out.to_str().unwrap(),
+        src.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(ok, "重新封装成 .ogg 应当成功，stderr={stderr}");
+    assert!(stdout.contains("\"container\":\"ogg\""), "{stdout}");
+
+    // 产物必须能被引擎自己的 Ogg 解封装器认出来（读写出入对称）
+    let (ok2, probe, stderr2) = run(&["probe", out.to_str().unwrap(), "--json"]);
+    assert!(ok2, "probe 产物应当成功，stderr={stderr2}");
+    assert!(probe.contains("\"container\":\"ogg\""), "容器应当是 ogg：{probe}");
+    assert!(probe.contains("\"codec\":\"opus\""), "编码应当是 opus：{probe}");
+    assert!(!probe.contains("kindName\":\"video\""), "Ogg 产物里不该有画面：{probe}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn bare_mp3_output_is_frame_concatenation() {
+    let dir = tmp_dir("mp3-out");
+    let src = dir.join("src.mp3");
+    write_mp3(&src, 20);
+    let out = dir.join("out.mp3");
+
+    let (ok, stdout, stderr) = run(&[
+        "mux",
+        out.to_str().unwrap(),
+        src.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(ok, "重新封装成 .mp3 应当成功，stderr={stderr}");
+    assert!(stdout.contains("\"container\":\"mp3\""), "{stdout}");
+
+    let want = std::fs::read(&src).unwrap();
+    let got = std::fs::read(&out).unwrap();
+    assert_eq!(got, want, "裸 MP3 只搬字节，产物必须与来源逐字节相同");
+
+    let (ok2, probe, stderr2) = run(&["probe", out.to_str().unwrap(), "--json"]);
+    assert!(ok2, "probe 裸 MP3 应当成功，stderr={stderr2}");
+    assert!(probe.contains("\"container\":\"mpeg-audio\""), "{probe}");
+    assert!(probe.contains("\"codec\":\"mp3\""), "{probe}");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn mp3_output_refuses_aac_sources() {
+    // 引擎不转码：AAC 输入要 .mp3 只能明确拒绝，不能改个扩展名发出去
+    let dir = tmp_dir("mp3-aac");
+    let a = dir.join("a.m4s");
+    write_audio_only(&a, 1);
+    let out = dir.join("out.mp3");
+
+    let (ok, _stdout, stderr) = run(&[
+        "mux",
+        out.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(!ok, "AAC → MP3 必须失败");
+    assert!(stderr.contains("MP3"), "错误里要说清是 MP3 装不下：{stderr}");
+    assert!(!out.exists(), "失败时不许留下半截产物");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn flv_output_has_h264_and_aac_tags() {
+    let dir = tmp_dir("flv-out");
+    let v = dir.join("v.mp4");
+    let a = dir.join("a.m4s");
+    write_video_only(&v, 1);
+    write_audio_only(&a, 1);
+    let out = dir.join("out.flv");
+
+    let (ok, stdout, stderr) = run(&[
+        "mux",
+        out.to_str().unwrap(),
+        v.to_str().unwrap(),
+        a.to_str().unwrap(),
+        "--json",
+    ]);
+    assert!(ok, "合并成 .flv 应当成功，stderr={stderr}");
+    assert!(stdout.contains("\"container\":\"flv\""), "{stdout}");
+
+    let bytes = std::fs::read(&out).unwrap();
+    assert_eq!(bytes[4], 0x05, "音视频标志位都要置上");
+    let tags = flv_tags(&bytes);
+    // 元数据 + 画面/声音 sequence header + 采样
+    assert_eq!(tags[0].0, 18, "第一个 Tag 是 onMetaData");
+    assert!(String::from_utf8_lossy(&tags[0].1).contains("onMetaData"));
+    assert!(tags.iter().any(|(ty, b)| *ty == 9 && b.first() == Some(&0x17)
+        && b.get(1) == Some(&0x00)), "缺少 H.264 的 sequence header");
+    assert!(tags.iter().any(|(ty, b)| *ty == 8 && b.first() == Some(&0xAF)
+        && b.get(1) == Some(&0x00)), "缺少 AAC 的 sequence header");
+    assert!(tags.iter().filter(|(ty, _)| *ty == 9).count() > 2, "要有画面采样 Tag");
+    assert!(tags.iter().filter(|(ty, _)| *ty == 8).count() > 2, "要有声音采样 Tag");
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn flv_refuses_non_h264_video_before_writing_anything() {
+    let dir = tmp_dir("flv-av1");
+    let v = dir.join("v.mp4");
+    write_av1_only(&v, 1);
+    let out = dir.join("out.flv");
+
+    let (ok, _stdout, stderr) = run(&["mux", out.to_str().unwrap(), v.to_str().unwrap(), "--json"]);
+    assert!(!ok, "AV1 → FLV 必须失败");
+    assert!(stderr.contains("FLV"), "错误里要说清是 FLV 装不下：{stderr}");
+    assert!(!out.exists(), "失败时不许留下半截产物");
 
     let _ = std::fs::remove_dir_all(&dir);
 }

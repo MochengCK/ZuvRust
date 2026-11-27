@@ -107,8 +107,16 @@ fail explicitly instead of writing a broken file):
 | `.mkv` `.mka` | Matroska | all of the above |
 | `.webm` | WebM subset | VP8 / VP9 / AV1 + Opus |
 | `.ts` `.m2ts` | MPEG-TS | H.264 / H.265 + AAC / MP3 / AC-3 |
+| `.flv` | FLV | H.264 + AAC / MP3 |
+| `.ogg` `.oga` `.opus` | Ogg | Opus only |
+| `.mp3` | raw MPEG audio | MP3 only |
 | `.flac` | raw FLAC | FLAC only |
 | `.aac` | raw ADTS | AAC only |
+
+FLV is output-only for now: `probe` / `play` still do not parse FLV, so an FLV
+file can be produced and played elsewhere but not re-opened by the engine.
+Ogg output does not apply end trimming, so the decoded tail can be up to one
+packet (≤ 120 ms) longer than the source.
 
 **Protocols:** HTTP(S), HLS, DASH.
 

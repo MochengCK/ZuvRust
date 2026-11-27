@@ -1,4 +1,4 @@
-//! me-mux —— 合并层（多轨交织 + MPEG-TS / MP4 / Matroska 封装）。
+//! me-mux —— 合并层（多轨交织 + MPEG-TS / MP4 / Matroska / FLV / Ogg / 裸流封装）。
 //!
 //! 这一层**只搬字节，不重编码**：
 //!
@@ -6,6 +6,9 @@
 //! - [`convert`]：`Annex-B ↔ 长度前缀`、`extradata` 的两种形态互转；
 //! - [`ts`]：MPEG-TS 封装（PAT/PMT/PCR 周期、AAC 补 ADTS、关键帧重发参数集）；
 //! - [`mkv`]：Matroska 封装（`EBML + Segment{Info, Tracks, Cluster*}`）；
+//! - [`flv`]：FLV 封装（`FLV header + [Tag]*`，H.264 + AAC / MP3）；
+//! - [`ogg`]：Ogg Opus 封装（`OpusHead` / `OpusTags` + 音频页，granule = 48 kHz 采样数）；
+//! - [`mp3`]：裸 MPEG 音频（帧原样串接）；
 //! - [`mp4`]：MP4 封装 —— 默认分片 fMP4（`[sidx + moof/mdat]*`，供 `stream`），
 //!   可切换为渐进式（`stbl` 采样表 + `moov` 前置，落盘产物走这条）。
 //!
@@ -26,11 +29,17 @@ pub mod adts;
 #[cfg(feature = "mux")]
 pub mod flac;
 #[cfg(feature = "mux")]
+pub mod flv;
+#[cfg(feature = "mux")]
 pub mod interleave;
 #[cfg(feature = "mux")]
 pub mod mkv;
 #[cfg(feature = "mux")]
+pub mod mp3;
+#[cfg(feature = "mux")]
 pub mod mp4;
+#[cfg(feature = "mux")]
+pub mod ogg;
 #[cfg(feature = "mux")]
 pub mod sink;
 #[cfg(feature = "mux")]
@@ -45,11 +54,17 @@ pub use convert::{
 #[cfg(feature = "mux")]
 pub use flac::FlacMuxer;
 #[cfg(feature = "mux")]
+pub use flv::FlvMuxer;
+#[cfg(feature = "mux")]
 pub use interleave::{interleave_all, Interleaver};
 #[cfg(feature = "mux")]
 pub use mkv::{DocType, MkvMuxer};
 #[cfg(feature = "mux")]
+pub use mp3::Mp3Muxer;
+#[cfg(feature = "mux")]
 pub use mp4::Mp4Muxer;
+#[cfg(feature = "mux")]
+pub use ogg::OggOpusMuxer;
 #[cfg(feature = "mux")]
 pub use sink::Sink;
 #[cfg(feature = "mux")]

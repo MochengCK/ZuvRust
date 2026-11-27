@@ -77,7 +77,7 @@
 | `me-core` | 时间基/轨道/采样/字节读写/随机访问字节源 | 只有"数据形状"，没有算法与 IO |
 | `me-container` | MPEG-TS / ISO BMFF / **Matroska（`.mkv` `.webm`）** / Ogg / 裸流（MPEG 音频、ADTS AAC、FLAC）的探测与解封装 | 探测只读头部，绝不读 `mdat`；封面这类大元数据块只跳块头不读载荷 |
 | `me-decode` | 自研解码（AAC / MP3 / FLAC / Opus / **AV1 软解**）+ 平台硬解（H.264：macOS VideoToolbox / Windows Media Foundation / Linux VA-API；AV1 另有 macOS 硬解）| 硬解优先、自研软解兜底；完全不依赖任何第三方解码库 |
-| `me-mux` | 多轨交织 + TS / fMP4 封装 + 形态转换 | 只搬字节，不重编码 |
+| `me-mux` | 多轨交织 + TS / fMP4 / Matroska / FLV / Ogg / 裸流封装 + 形态转换 | 只搬字节，不重编码 |
 | `me-net` | HLS / DASH / HTTP / 自研 AES / URL / XML | 不碰容器解析 |
 | `me-bt` | bencode / 元信息 / 片选择 / 片存储 / 线协议 / tracker | **预留层**：只做协议编解码与调度，不做网络 IO（见 6.4 的边界） |
 | `me-stream` | 把文件/协议的字节接进容器，提供播放缓冲与寻址 | 读哪里就上报播放头；BT 下载不在这里 |
@@ -93,7 +93,7 @@
 | `me-core` | 完成 | 47 |
 | `me-container` | 完成（TS 188/192/204、ISO BMFF、fMP4 分片、**Matroska / WebM**、Ogg/Opus、裸 MP3 / ADTS AAC / FLAC） | 133 |
 | `me-decode` | 完成（AAC / MP3 / FLAC / **Opus 全链**：CELT 与 SILK 两条编码路径 + 混合模式 + 冗余帧 + 两侧丢包隐藏与舒适噪声）；**AV1 硬解已接、自研软解已能出像素**（OBU / 序列头 / 颜色配置 / **整段非压缩帧头** / **瓦片切分与算术解码器（§8.2）** / **分区树（§5.11.4）** / **块级语法（§5.11.1/§5.11.5 + 系数）** ✅ 14 条真实参照流逐位精确 / **帧内预测（§7.11.2）** / **反量化 + 反变换（§7.12.4/§7.13）** / **环路滤波：去块（§7.14）+ CDEF（§7.15）+ 环路恢复（§7.17）** / **超分上采样（§7.16）** / **帧间预测（含复合、局部仿射与全局 warp、OBMC、interintra）** / **胶片颗粒合成（§7.18.3）** / **屏幕内容流：`intrabc`（§5.11.5）与 palette（§5.11.18/19）** ✅ 与 dav1d 逐像素一致）；**H.264 三平台硬解已接**（macOS VideoToolbox / Windows Media Foundation + D3D11 / Linux VA-API，共用 `h264.rs` 的解析层） | 419 |
-| `me-mux` | 完成（交织、TS、fMP4、**Matroska/.mkv 封装**、Annex-B↔AVCC、Opus/VP9 配置盒） | 61 |
+| `me-mux` | 完成（交织、TS、fMP4、**Matroska/.mkv 封装**、**FLV**、**Ogg/Opus**、**裸 MP3**、Annex-B↔AVCC、Opus/VP9 配置盒） | 89 |
 | `me-net` | 完成（HLS 全标签+LL-HLS、DASH+自研 XML、HTTP、自研 AES） | 104 + 2 |
 | `me-bt` | 完成但**不在播放路径上**（见 6.4） | 88 |
 | `me-stream` | 完成（增长文件源、HLS/DASH 接入、播放器） | 31 |
@@ -452,7 +452,8 @@ await engine.close()
 - `remux` 需要目标容器支持该编解码器：TS 里 AAC 要带 ADTS、fMP4 里是裸帧，
   这个转换由 muxer 负责（已实现，TS→fMP4→TS 往返有测试）。
 - 合并/转封装的输出容器：**fMP4（`.mp4/.m4s/.mov/.m4a`）、MPEG-TS（`.ts`）、
-  Matroska（`.mkv/.mka`）、WebM（`.webm`）、裸 FLAC（`.flac`）、裸 ADTS（`.aac`）**；
+  Matroska（`.mkv/.mka`）、WebM（`.webm`）、FLV（`.flv`）、Ogg（`.ogg/.oga/.opus`）、
+  裸 MPEG 音频（`.mp3`）、裸 FLAC（`.flac`）、裸 ADTS（`.aac`）**；
   `mux` 支持 `--fragment-ms=<毫秒>`（分片/簇时长）与 `--audio-only` / `--video-only`
   （轨选择：提取音轨 / 丢掉音轨）。宿主侧对应「设置 → 视频」的四项（合并格式 /
   分片时长 / 解码线程数 / **解码方式**三档：自适应 / 仅硬解 / 仅软解 → `ME_DECODE`，
@@ -460,8 +461,33 @@ await engine.close()
   - **WebM 是 Matroska 的受限子集**：只允许 VP8 / VP9 / AV1 画面与 Opus 声音，
     其它编码在 `set_tracks` 阶段就明确报错（否则会产出"扩展名是 webm、浏览器
     打不开"的文件）。`DocType` 写 `webm`、版本号 2/2。
-  - **`.flac` / `.aac` 是裸音频流**：容器本身没有"轨"的概念 ⇒ 引擎自动只留声音
-    （调用方不必再传 `--audio-only`），且只能装一条轨。
+  - **`.flac` / `.aac` / `.ogg` / `.mp3` 只能装声音**：容器本身没有"轨"的概念 ⇒
+    引擎自动只留声音（调用方不必再传 `--audio-only`），且只能装一条轨。
+  - **`.flv`（`me-mux/src/flv.rs`）**：H.264 + AAC / MP3。
+    - Tag 头里的**时间戳是 24 位大端毫秒 + 8 位扩展**（不是小端：这个字段的字节序
+      曾经写反，用真实 FLV 逐 Tag 对过才定下来），视频 Tag 写 **DTS**，`pts - dts`
+      放进 `CompositionTime`（SI24 毫秒）。
+    - **每个 Tag 末尾的 `PreviousTagSize` 必须 = 11 + DataSize**，写错一个后面全乱。
+    - H.264 采样要长度前缀布局，**采样里的 SPS/PPS 要剔掉**（只放在 sequence header
+      的 `avcC` 里；重复出现会让部分解码器报"参数集不一致"）。
+    - AAC 的 sequence header 是 `AudioSpecificConfig`，采样从 TS 来时要**剥 ADTS**；
+      MP3 没有 sequence header，首字节只描述格式/采样率/声道。
+    - `onMetaData` 的 `duration` 只能取调用方声明的时长（分片输入的 `mvhd` 常是 0，
+      没有声明就不写这一项，写 0 会让播放器显示 0 秒）。
+    - ⚠️ **只能写、不能读**：引擎没有 FLV 解封装，`probe` / `play` 不认 `.flv`。
+      产物用 PyAV（FFmpeg）独立验证过：真实 H.264 + AAC 素材 3 秒 → 解出 75 帧画面、
+      132 帧音频，两段素材串接后 Tag 时间戳仍单调。
+  - **Ogg（`me-mux/src/ogg.rs`）只有 Opus**：granule = **累计 48 kHz 采样数**，
+    包的时长只看 TOC（`me_container::ogg::toc_duration`），**不看 `Packet::duration`**
+    （跨容器重封装时它可能已被换算取整）；页 CRC 用 Ogg 自己的多项式
+    （`0x04C11DB7`、不反射、初值 0），实现复用读侧那份；
+    包长正好是 255 的整数倍时要补一个 0 段收尾；最后一页必须带 EOS ⇒ 写侧永远
+    "压着上一页"，等下一批数据到了再落盘（内存里最多两页）。
+    - 不做 **end trimming**：源文件末尾那点裁剪信息不在包时长里，产物解码出来
+      最多多一个包的样本（≤ 120 ms）。对拍：3.000 s 的 Opus 源 → 产物解出 144648
+      个样本（= 151 包 × 960 − pre-skip 312），比源多 648 个。
+  - **裸 MP3（`me-mux/src/mp3.rs`）**：逐帧校验帧头后原样写出，**不加 ID3v2**。
+    产物与输入的帧序列逐字节相同（CLI 测试按这个判）。
   - **FLAC in MKV 已支持**：`CodecPrivate` 要 `fLaC` 头形态，引擎内部是 `dfLa` 载荷，
     转换收在 `me-container/src/flac_config.rs`（唯一转换处，与 Opus 的
     `OpusHead`/`dOps` 同一条纪律），读入时规范化、写出时转回去。
