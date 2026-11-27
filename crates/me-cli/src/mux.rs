@@ -449,9 +449,21 @@ fn run(
         cancel.check()?;
         let mut interleaver = Interleaver::new(&out_tracks);
 
-        // 每条源轨各自的零点（同一个输入里音视频的相对偏移是真实信息，不能抹掉）。
-        // key 带上输入下标：段里两个输入的轨道号可能相同。
-        let mut first_dts: HashMap<(usize, u32), i64> = HashMap::new();
+        // 时间轴零点**按输入**取输入里第一条采样的 **pts**（不是每条轨各取 dts）。
+        //
+        // 为什么不能按轨各取 dts：带 B 帧的 H.264 第一帧 dts 是**负的**（解码延迟），
+        // 而 pts 是 0。按轨减自己的 dts 会把视频整条推后一个延迟，音频不受影响 ⇒
+        // 产物音画错开（实测 ffmpeg 造的四条容器素材一律是 80 ms）。
+        // 同一个输入里的两条轨减**同一个**零点，相对偏移原样保住。
+        //
+        // 为什么也不能全片共用一个零点：多输入串接时各输入的时间轴互相独立
+        // （HLS 的音频分片可能从 12.5 s 开始），必须各自归零，否则那一路会被整体推走。
+        //
+        // 零点按**微秒**记：同一个输入里的两条轨时基不同（视频 15360、音频 44100），
+        // 拿一条轨的刻度去减另一条是在减两个不同单位。每个 (输入, 时基) 第一次用到时
+        // 换算一次并缓存，同一条轨后续采样因此仍是纯刻度平移。
+        let mut seg_base_us: HashMap<usize, i64> = HashMap::new();
+        let mut seg_base_ticks: HashMap<(usize, u32), i64> = HashMap::new();
         let mut done: Vec<bool> = vec![false; seg.len()];
 
         // 段内**轮流**从每个输入各取一条采样 —— 这是让多条轨的时间轴同步推进的唯一办法。
@@ -533,9 +545,24 @@ fn run(
                             }
                         }
 
-                        let base = *first_dts
-                            .entry((si.input_index, p.track_id))
-                            .or_insert(p.dts);
+                        // 本输入的零点（每个时基换算一次并缓存；第一条采样原样用它的 pts）
+                        let base =
+                            match seg_base_ticks.get(&(si.input_index, src_tb.ticks_per_second)) {
+                                Some(b) => *b,
+                                None => {
+                                    let b = match seg_base_us.get(&si.input_index) {
+                                        Some(us) => src_tb.us_to_ticks(*us),
+                                        None => {
+                                            let us = src_tb.ticks_to_us(p.pts);
+                                            seg_base_us.insert(si.input_index, us);
+                                            p.pts
+                                        }
+                                    };
+                                    seg_base_ticks
+                                        .insert((si.input_index, src_tb.ticks_per_second), b);
+                                    b
+                                }
+                            };
                         // 这一段里**这条轨**的起点（别的轨走到哪了与它无关）
                         let seg_start_us = *track_start_us.get(&out_id).unwrap_or(&0);
 
